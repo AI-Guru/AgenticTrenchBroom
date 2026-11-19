@@ -17,22 +17,28 @@
  along with TrenchBroom. If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <QApplication>
 #include <QDir>
+#include <QEventLoop>
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonArray>
 #include <QTemporaryDir>
+#include <QTimer>
 
 #include "McpAppTestUtils.h"
 #include "McpTestUtils.h"
+#include "gl/PerspectiveCamera.h"
 #include "mdl/Map.h"
 #include "ui/AppController.h"
+#include "ui/CompilationDialog.h"
 #include "ui/MapDocument.h"
 #include "ui/MapWindow.h"
 #include "ui/MapWindowManager.h"
 #include "ui/McpToolDispatcher.h"
 
 #include <algorithm>
+#include <memory>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -387,9 +393,162 @@ TEST_CASE("McpAppTools")
       auto& window = f.newMap();
       f.ok("create_box_brush", Box);
 
-      CHECK(f.err("close_map") == "unsaved_changes");
-      CHECK(f.err("close_map", R"({"discard_changes":true})") == "not_supported");
+      const auto error = f.error("close_map");
+      CHECK(error.value("code") == "unsaved_changes");
+      CHECK(error.value("hint").toString().contains("discard_changes"));
+      CHECK(f.err("close_map", R"({"discard_changes":false})") == "unsaved_changes");
       CHECK(mapWindowManager.mapWindows() == std::vector<MapWindow*>{&window});
+      CHECK(window.document().map().modified());
+    }
+
+    SECTION("discards unsaved changes without asking")
+    {
+      auto& window = f.newMap();
+      f.ok("create_box_brush", Box);
+      const auto path = dir.filePath("saved.map");
+      f.ok("save_map", QJsonObject{{"path", path}});
+      const auto savedText = readFile(path);
+
+      f.ok("create_box_brush", R"({"bounds":{"min":[32,0,0],"max":[48,16,16]}})");
+      REQUIRE(window.document().map().modified());
+
+      // A local watchdog, so that a save prompt is attributed to this call
+      const auto closeWatchdog = McpModalWatchdog{};
+      const auto result = f.ok("close_map", R"({"discard_changes":true})");
+      CHECK(closeWatchdog.modalCount() == 0);
+
+      CHECK(result.value("closed") == true);
+      CHECK(result.value("remaining_documents") == 0);
+      CHECK(mapWindowManager.allMapWindowsClosed());
+      CHECK(isWelcomeWindowVisible());
+      CHECK(f.err("get_map_info") == "no_document");
+
+      // the file on disk is not touched
+      CHECK(readFile(path) == savedText);
+
+      // and the discarded brush is gone when the map is opened again
+      f.ok("open_map", QJsonObject{{"path", path}});
+      CHECK(f.ok("get_map_stats").value("counts")["world_brushes"] == 2);
+    }
+
+    SECTION("discards the changes of a map that was never saved")
+    {
+      f.newMap();
+      f.ok("create_box_brush", Box);
+
+      const auto closeWatchdog = McpModalWatchdog{};
+      CHECK(f.ok("close_map", R"({"discard_changes":true})").value("closed") == true);
+      CHECK(closeWatchdog.modalCount() == 0);
+      CHECK(mapWindowManager.allMapWindowsClosed());
+      CHECK(isWelcomeWindowVisible());
+    }
+
+    SECTION("discard_changes closes an unmodified map")
+    {
+      auto& window = f.newMap();
+      REQUIRE(!window.document().map().modified());
+
+      CHECK(f.ok("close_map", R"({"discard_changes":true})").value("closed") == true);
+      CHECK(mapWindowManager.allMapWindowsClosed());
+    }
+
+    SECTION("discards only the changes of the target")
+    {
+      auto& first = f.newMap();
+      f.ok("create_box_brush", Box);
+      auto& second = f.newMap();
+      f.ok("create_box_brush", Box);
+      REQUIRE(f.ok("get_map_info").value("document") == "d2");
+
+      CHECK(
+        f.ok("close_map", R"({"discard_changes":true})").value("remaining_documents")
+        == 1);
+      CHECK(!isWelcomeWindowVisible());
+      CHECK(mapWindowManager.mapWindows() == std::vector<MapWindow*>{&first});
+      CHECK(&second != &first);
+
+      // the remaining map keeps its changes and still refuses a plain close
+      CHECK(first.document().map().modified());
+      CHECK(f.ok("get_map_info").value("document") == "d1");
+      CHECK(f.err("close_map") == "unsaved_changes");
+
+      CHECK(f.ok("close_map", R"({"discard_changes":true})").value("closed") == true);
+      CHECK(mapWindowManager.allMapWindowsClosed());
+      CHECK(isWelcomeWindowVisible());
+    }
+
+    SECTION("refuses while the compilation dialog is open")
+    {
+      auto& window = f.newMap();
+      f.ok("create_box_brush", Box);
+
+      auto camera = gl::PerspectiveCamera{};
+      auto compilationDialog = std::make_unique<CompilationDialog>(
+        f.appController, window.document(), camera, &window);
+      compilationDialog->show();
+      QApplication::processEvents();
+      REQUIRE(compilationDialog->isVisible());
+
+      const auto error = f.error("close_map", R"({"discard_changes":true})");
+      CHECK(error.value("code") == "editor_busy");
+      CHECK(error.value("details")["reason"] == "compile_running");
+      CHECK(mapWindowManager.mapWindows() == std::vector<MapWindow*>{&window});
+      CHECK(window.document().map().modified());
+
+      compilationDialog.reset();
+      CHECK(f.ok("close_map", R"({"discard_changes":true})").value("closed") == true);
+    }
+
+    SECTION("refuses while a nested event loop runs")
+    {
+      // QDrag::exec (e.g. dragging from the entity browser) runs a nested event loop,
+      // and the MCP server is served from it. A window deleted there would be deleted
+      // while the drag code that started the loop still uses it.
+      auto& window = f.newMap();
+      f.ok("create_box_brush", Box);
+
+      // The outer loop stands in for the application's main event loop
+      auto outerLoop = QEventLoop{};
+      auto innerLoop = QEventLoop{};
+      auto nestedResult = QJsonObject{};
+      QTimer::singleShot(0, [&]() {
+        QTimer::singleShot(0, [&]() {
+          nestedResult = f.call("close_map", R"({"discard_changes":true})");
+          innerLoop.quit();
+        });
+        innerLoop.exec();
+        outerLoop.quit();
+      });
+      outerLoop.exec();
+
+      const auto error = nestedResult.value("structuredContent")["error"].toObject();
+      CHECK(nestedResult.value("isError") == true);
+      CHECK(error.value("code") == "editor_busy");
+      CHECK(error.value("details")["reason"] == "nested_event_loop");
+      CHECK(mapWindowManager.mapWindows() == std::vector<MapWindow*>{&window});
+      CHECK(!isWelcomeWindowVisible());
+      CHECK(window.document().map().modified());
+
+      // Called from the main event loop, close_map closes the map
+      auto mainLoop = QEventLoop{};
+      auto mainResult = QJsonObject{};
+      QTimer::singleShot(0, [&]() {
+        mainResult = f.call("close_map", R"({"discard_changes":true})");
+        mainLoop.quit();
+      });
+      mainLoop.exec();
+
+      CHECK(mainResult.value("isError") != true);
+      CHECK(mapWindowManager.allMapWindowsClosed());
+    }
+
+    SECTION("rejects a non-boolean discard_changes")
+    {
+      f.newMap();
+      f.ok("create_box_brush", Box);
+      CHECK(f.err("close_map", R"({"discard_changes":"yes"})") == "invalid_argument");
+      CHECK(f.err("close_map", R"({"discard_changes":1})") == "invalid_argument");
+      CHECK(mapWindowManager.mapWindows().size() == 1);
     }
 
     SECTION("closes the last map and shows the welcome window")

@@ -119,6 +119,9 @@ private:
 
   NotifierConnection m_notifierConnection;
 
+  /** Set while closeDocumentDiscardingChanges() closes the window. */
+  bool m_discardChangesOnClose = false;
+
 private: // shortcuts
   using ActionMap = std::unordered_map<const Action*, QAction*>;
   ActionMap m_actionMap;
@@ -215,6 +218,17 @@ public:
   bool exportDocumentAsObj();
   bool exportDocumentAsMap();
   bool exportDocument(const mdl::ExportOptions& options);
+
+  /**
+   * Closes this window like close(), but discards any unsaved changes instead of asking
+   * the user whether to save them. The window can still refuse to close, e.g. if the
+   * compilation dialog refuses to close.
+   *
+   * Like close(), the window is deleted later because it uses Qt::WA_DeleteOnClose.
+   *
+   * @return true if the window was closed
+   */
+  bool closeDocumentDiscardingChanges();
 
 private:
   bool confirmOrDiscardChanges();

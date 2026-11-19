@@ -62,7 +62,8 @@ const auto Instructions = QStringLiteral(
 - Entity "angle" is yaw around +Z (0 = +X, 90 = +Y). Nothing is snapped to the grid unless you ask; keep brush vertices
   on integers (validate_map reports non-integer vertices).
 - Start with list_games and new_map (game "Generic" needs no game files) or open_map; list_documents and
-  set_active_document choose the map that the map tools act on. save_map writes .map files; close_map closes a saved map.
+  set_active_document choose the map that the map tools act on. save_map writes .map files; close_map closes a saved map
+  (close_map with discard_changes:true throws unsaved changes away without asking).
 - Ids: world, default_layer, L<n> layer, G<n> group, E<n> entity, B<n> brush, P<n> patch; "@selection" = what the user
   selected. Ids are stable across transforms, property/face edits, grouping and layer moves. They CHANGE after
   delete+undo, CSG, clip and paste; old ids return stale_node. New maps may contain a starter brush.

@@ -22,6 +22,7 @@
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QStringList>
+#include <QThread>
 
 #include "base/PreferenceManager.h"
 #include "base/Result.h"
@@ -683,12 +684,13 @@ McpToolDef closeMapTool(McpAppHost& host)
     .title = "Close Map",
     .description =
       "Closes the target map's window. Refuses with unsaved_changes if the map was "
-      "modified since it was last saved; call save_map first. discard_changes is not "
-      "supported yet.",
+      "modified since it was last saved; call save_map first, or pass "
+      "discard_changes:true to throw the changes away. Never shows a save prompt. "
+      "Closing the last map shows the welcome window; the server keeps running.",
     .inputSchema = schema::object({
       {"discard_changes",
        schema::boolean(
-         "Close without saving. Not supported yet; must be false or omitted.")},
+         "Close without saving and lose all unsaved changes (default false).")},
     }),
     .kind = McpToolKind::App,
     .annotations = Destructive,
@@ -698,19 +700,13 @@ McpToolDef closeMapTool(McpAppHost& host)
                  auto* window = target.window;
                  const auto& map = window->document().map();
 
-                 if (args.value("discard_changes").toBool(false))
-                 {
-                   return toolError(
-                     "not_supported",
-                     "closing without saving is not supported yet",
-                     "call save_map first, or undo your changes");
-                 }
-                 if (map.modified())
+                 const auto discardChanges = args.value("discard_changes").toBool(false);
+                 if (map.modified() && !discardChanges)
                  {
                    return toolError(
                      "unsaved_changes",
                      "the map has unsaved changes",
-                     "call save_map first");
+                     "call save_map first or pass discard_changes:true");
                  }
                  if (const auto* compilationDialog =
                        window->findChild<CompilationDialog*>();
@@ -721,6 +717,18 @@ McpToolDef closeMapTool(McpAppHost& host)
                      "a compilation dialog is open",
                      "ask the user to close the compilation dialog",
                      {{"reason", "compile_running"}});
+                 }
+
+                 // A nested event loop such as QDrag::exec in the entity browser serves
+                 // this call too. The window would be deleted from that loop, while the
+                 // code that started the loop still uses it.
+                 if (QThread::currentThread()->loopLevel() > 1)
+                 {
+                   return toolError(
+                     "editor_busy",
+                     "the user is in the middle of an operation, such as drag and drop",
+                     "retry in a moment",
+                     {{"reason", "nested_event_loop"}});
                  }
 
                  auto& appController = host.appController();
@@ -734,7 +742,12 @@ McpToolDef closeMapTool(McpAppHost& host)
                  }
 
                  host.forgetDocumentState(*window);
-                 if (!window->close())
+                 // Neither variant shows the save prompt: an unmodified map has nothing
+                 // to save, and closeDocumentDiscardingChanges skips the prompt
+                 const auto closed = discardChanges
+                                       ? window->closeDocumentDiscardingChanges()
+                                       : window->close();
+                 if (!closed)
                  {
                    return toolError(
                      "operation_failed",

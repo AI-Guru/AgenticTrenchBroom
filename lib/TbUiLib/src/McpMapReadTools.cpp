@@ -955,30 +955,7 @@ McpToolDef findNodesTool()
 
 McpResult<QJsonObject> getSelection(McpCallContext& context, const QJsonObject&)
 {
-  const auto& doc = context.doc;
-  const auto& map = doc.map;
-  const auto& selection = map.selection();
-
-  auto faces = QJsonArray{};
-  for (const auto& handle : selection.brushFaces)
-  {
-    auto face = QJsonObject{
-      {"brush", doc.nodes.idOf(handle.node())},
-      {"index", qint64(handle.faceIndex())},
-    };
-    if (const auto side = sideName(handle.face().normal()))
-    {
-      face["side"] = *side;
-    }
-    faces.append(face);
-  }
-
-  const auto& selectionBounds = map.selectionBounds();
-  return QJsonObject{
-    {"nodes", idArray(doc.nodes, selection.nodes)},
-    {"faces", faces},
-    {"bounds", selectionBounds ? QJsonValue{toJson(*selectionBounds)} : QJsonValue{}},
-  };
+  return selectionJson(context.doc.nodes, context.doc.map);
 }
 
 McpToolDef getSelectionTool()

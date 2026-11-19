@@ -581,6 +581,31 @@ TEST_CASE("McpNodeRegistry")
     // the stress run must have exercised removals and re-additions
     CHECK(registry.tombstoneCount() > 10);
   }
+
+  SECTION("currentChanges")
+  {
+    auto registry = McpNodeRegistry{map};
+    auto* brush = addBrush(map, vm::bbox3d{{0, 0, 0}, {16, 16, 16}});
+
+    CHECK(registry.currentChanges().created.empty());
+
+    registry.beginRecording();
+    addBrush(map, vm::bbox3d{{32, 0, 0}, {48, 16, 16}});
+    const auto first = registry.currentChanges();
+    CHECK(first.created == ids({"B3"}));
+    CHECK(registry.isRecording());
+
+    mdl::removeNodes(map, {brush});
+    const auto second = registry.currentChanges();
+    CHECK(second.created == ids({"B3"}));
+    CHECK(second.removed == ids({"B2"}));
+
+    // currentChanges does not stop or reset the recording
+    const auto changes = registry.endRecording();
+    CHECK(changes.created == second.created);
+    CHECK(changes.removed == second.removed);
+    CHECK(changes.modified == second.modified);
+  }
 }
 
 } // namespace tb::ui

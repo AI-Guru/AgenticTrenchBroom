@@ -538,6 +538,70 @@ TEST_CASE("McpPreconditions")
     CHECK(globMatch(u"a.b[c]", u"a.b[c]"));
     CHECK_FALSE(globMatch(u"a.b", u"axb"));
   }
+
+  SECTION("requireNotLinked")
+  {
+    auto* group = groupNodes(map, {brush}, "group");
+    CHECK(requireNotLinked(doc, *group).is_success());
+    CHECK(requireNotLinked(doc, *brush).is_success());
+    CHECK(requireNotLinked(doc, *light).is_success());
+
+    auto* linked = mdl::createLinkedDuplicate(map);
+    REQUIRE(linked != nullptr);
+    CHECK(codeOf(requireNotLinked(doc, *group)) == "not_supported");
+    CHECK(codeOf(requireNotLinked(doc, *brush)) == "not_supported");
+    CHECK(codeOf(requireNotLinked(doc, *linked->children().front())) == "not_supported");
+    CHECK(
+      detailsOf(requireNotLinked(doc, *brush)).value("linked_group")
+      == QJsonValue{id(*group)});
+    CHECK(requireNotLinked(doc, *light).is_success());
+  }
+
+  SECTION("propValueText")
+  {
+    const auto text = [](const char* json) {
+      return propValueText(parseObject(json).value("v"), "/set/k");
+    };
+
+    CHECK(text(R"({"v":"300"})").value() == "300");
+    CHECK(text(R"({"v":""})").value() == "");
+    CHECK(text(R"({"v":300})").value() == "300");
+    CHECK(text(R"({"v":-2})").value() == "-2");
+    CHECK(text(R"({"v":0.5})").value() == "0.5");
+    CHECK(text(R"({"v":0.1})").value() == "0.1");
+    CHECK(text(R"({"v":-0.0})").value() == "0");
+    CHECK(text(R"({"v":1e20})").value() == "1e+20");
+    CHECK(text(R"({"v":true})").value() == "1");
+    CHECK(text(R"({"v":false})").value() == "0");
+    CHECK(text(R"({"v":[1, 0.5, -3]})").value() == "1 0.5 -3");
+
+    CHECK(codeOf(text(R"({"v":[1, 2]})")) == "invalid_argument");
+    CHECK(codeOf(text(R"({"v":[1, 2, "3"]})")) == "invalid_argument");
+    CHECK(codeOf(text(R"({"v":null})")) == "invalid_argument");
+    CHECK(codeOf(text(R"({"v":{"a":1}})")) == "invalid_argument");
+    CHECK(codeOf(text(R"({"v":"a\"b"})")) == "invalid_argument");
+    CHECK(detailsOf(text(R"({"v":"a\nb"})")).value("pointer") == QJsonValue{"/set/k"});
+    CHECK(detailsOf(text(R"({"v":null})")).value("pointer") == QJsonValue{"/set/k"});
+  }
+
+  SECTION("checkMaterialName")
+  {
+    CHECK(checkMaterialName("base/wall1", "/material").is_success());
+    CHECK(checkMaterialName("*water", "/material").is_success());
+    CHECK(checkMaterialName(QString(256, 'x'), "/material").is_success());
+
+    CHECK(codeOf(checkMaterialName("", "/material")) == "invalid_argument");
+    CHECK(
+      codeOf(checkMaterialName(QString(257, 'x'), "/material")) == "invalid_argument");
+    CHECK(codeOf(checkMaterialName("a b", "/material")) == "invalid_argument");
+    CHECK(codeOf(checkMaterialName("a\tb", "/material")) == "invalid_argument");
+    CHECK(codeOf(checkMaterialName("a\"b", "/material")) == "invalid_argument");
+    CHECK(codeOf(checkMaterialName("a(b", "/material")) == "invalid_argument");
+    CHECK(codeOf(checkMaterialName("a)b", "/material")) == "invalid_argument");
+    CHECK(
+      detailsOf(checkMaterialName("a b", "/side_materials/+x")).value("pointer")
+      == QJsonValue{"/side_materials/+x"});
+  }
 }
 
 } // namespace tb::ui

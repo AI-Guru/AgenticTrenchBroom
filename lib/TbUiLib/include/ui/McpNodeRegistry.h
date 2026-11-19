@@ -153,6 +153,12 @@ public:
   /** Stops recording and returns the net changes since beginRecording(). */
   McpChangeSet endRecording();
 
+  /**
+   * Returns the net changes recorded so far without stopping the recording, or an empty
+   * change set if no recording is running.
+   */
+  McpChangeSet currentChanges() const;
+
   bool isRecording() const;
 
   /**

@@ -264,14 +264,19 @@ void McpNodeRegistry::beginRecording()
 
 McpChangeSet McpNodeRegistry::endRecording()
 {
+  auto result = currentChanges();
+  m_recording = std::nullopt;
+  return result;
+}
+
+McpChangeSet McpNodeRegistry::currentChanges() const
+{
   if (!m_recording)
   {
     return {};
   }
 
-  const auto recording = std::move(*m_recording);
-  m_recording = std::nullopt;
-
+  const auto& recording = *m_recording;
   const auto live = [&](const uint64_t number) { return m_nodeById.contains(number); };
 
   auto result = McpChangeSet{};

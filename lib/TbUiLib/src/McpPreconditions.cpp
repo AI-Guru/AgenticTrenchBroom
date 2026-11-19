@@ -19,13 +19,18 @@
 
 #include "ui/McpPreconditions.h"
 
+#include <QLocale>
+#include <QRegularExpression>
+
 #include "mdl/Brush.h"
 #include "mdl/BrushFace.h"
 #include "mdl/BrushFaceHandle.h"
 #include "mdl/BrushNode.h"
 #include "mdl/CommandProcessor.h"
 #include "mdl/EditorContext.h"
+#include "mdl/Entity.h"
 #include "mdl/EntityNode.h"
+#include "mdl/Group.h"
 #include "mdl/GroupNode.h"
 #include "mdl/LayerNode.h"
 #include "mdl/LinkedGroupUtils.h"
@@ -41,6 +46,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -759,6 +765,262 @@ McpResult<void> checkMapText(const QString& text, const McpMapText kind)
 bool isLinkedGroup(mdl::Map& map, const mdl::GroupNode& groupNode)
 {
   return mdl::collectGroupsWithLinkId({&map.worldNode()}, groupNode.linkId()).size() > 1;
+}
+
+McpResult<void> requireNotLinked(const McpDocumentState& doc, const mdl::Node& node)
+{
+  auto linkedGroups = LinkedGroupCache{doc.map};
+  if (const auto* linkedGroup = linkedGroups.linkedGroupOf(node))
+  {
+    return linkedGroupError(doc, node, *linkedGroup);
+  }
+  return kdl::void_success;
+}
+
+namespace
+{
+
+QString formatPropertyNumber(const double value)
+{
+  if (value == 0.0)
+  {
+    return QStringLiteral("0");
+  }
+  if (std::trunc(value) == value && std::abs(value) < 9007199254740992.0)
+  {
+    return QString::number(qint64(value));
+  }
+  return QString::number(value, 'g', QLocale::FloatingPointShortest);
+}
+
+} // namespace
+
+McpResult<QString> propValueText(const QJsonValue& value, const QString& pointer)
+{
+  auto text = std::optional<QString>{};
+  if (value.isString())
+  {
+    text = value.toString();
+  }
+  else if (value.isBool())
+  {
+    text = value.toBool() ? QStringLiteral("1") : QStringLiteral("0");
+  }
+  else if (value.isDouble() && std::isfinite(value.toDouble()))
+  {
+    text = formatPropertyNumber(value.toDouble());
+  }
+  else if (value.isArray())
+  {
+    const auto array = value.toArray();
+    if (array.size() == 3 && std::ranges::all_of(array, [](const auto& v) {
+          return v.isDouble() && std::isfinite(v.toDouble());
+        }))
+    {
+      text = QString{"%1 %2 %3"}.arg(
+        formatPropertyNumber(array[0].toDouble()),
+        formatPropertyNumber(array[1].toDouble()),
+        formatPropertyNumber(array[2].toDouble()));
+    }
+  }
+
+  if (!text)
+  {
+    return toolError(
+      "invalid_argument",
+      QString{"%1 must be a string, a number, a boolean or an array of 3 numbers"}.arg(
+        pointer),
+      "e.g. \"300\", 300, true or [0, 0, 90]",
+      {{"pointer", pointer}});
+  }
+
+  if (auto check = checkMapText(*text, McpMapText::Value); check.is_error())
+  {
+    auto error = errorOf(check);
+    error.details["pointer"] = pointer;
+    return error;
+  }
+  return *text;
+}
+
+McpResult<void> checkEntityPropertyValue(
+  const QString& key, const QString& value, const QString& pointer)
+{
+  if (key != u"origin" && key != u"angle" && key != u"angles" && key != u"mangle")
+  {
+    return kdl::void_success;
+  }
+
+  // TrenchBroom parses these values with std::from_chars, which accepts inf and nan
+  static const auto separators = QRegularExpression{R"([\s()]+)"};
+  for (const auto& token : value.split(separators, Qt::SkipEmptyParts))
+  {
+    const auto text = token.toStdString();
+    char* end = nullptr;
+    const auto number = std::strtod(text.c_str(), &end);
+    const auto isNumber = !text.empty() && end == text.c_str() + text.size();
+    if (
+      isNumber
+      && (!std::isfinite(number) || std::abs(number) > McpMaxEntityPropertyNumber))
+    {
+      return toolError(
+        "invalid_argument",
+        QString{"%1: every number in %2 must be finite and at most %3 in magnitude"}
+          .arg(pointer, key)
+          .arg(McpMaxEntityPropertyNumber),
+        "e.g. \"0 90 0\" for angles or \"0 0 24\" for origin",
+        {{"pointer", pointer}});
+    }
+  }
+  return kdl::void_success;
+}
+
+namespace
+{
+
+template <typename M>
+bool isFiniteMatrix(const M& matrix)
+{
+  for (size_t c = 0; c < M::cols; ++c)
+  {
+    for (size_t r = 0; r < M::rows; ++r)
+    {
+      if (!std::isfinite(matrix[c][r]))
+      {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+bool hasBoundedCoordinates(const vm::bbox3d& box)
+{
+  for (size_t i = 0; i < 3; ++i)
+  {
+    for (const auto value : {box.min[i], box.max[i]})
+    {
+      if (!std::isfinite(value) || std::abs(value) > McpMaxEntityPropertyNumber)
+      {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+} // namespace
+
+McpResult<void> checkTransformableNodes(
+  const McpNodeRegistry& registry, const std::vector<const mdl::Node*>& nodes)
+{
+  const auto describe = [&](const mdl::Node& node) {
+    const auto id = registry.idOf(node);
+    if (!id.isEmpty())
+    {
+      return id;
+    }
+    if (const auto* entityNode = dynamic_cast<const mdl::EntityNode*>(&node))
+    {
+      return QString{"an entity '%1'"}.arg(
+        QString::fromStdString(entityNode->entity().classname()));
+    }
+    return QString{"a %1"}.arg(nodeTypeName(node));
+  };
+
+  auto result = McpResult<void>{kdl::void_success};
+  const auto check = [&](const auto& self, const mdl::Node& node) -> void {
+    if (result.is_error())
+    {
+      return;
+    }
+    if (
+      !dynamic_cast<const mdl::LayerNode*>(&node)
+      && !dynamic_cast<const mdl::WorldNode*>(&node)
+      && (!hasBoundedCoordinates(node.logicalBounds()) || !hasBoundedCoordinates(node.physicalBounds())))
+    {
+      const auto what = describe(node);
+      result = toolError(
+        "out_of_world_bounds",
+        QString{"%1 has coordinates that are not finite or larger than %2"}.arg(what).arg(
+          McpMaxEntityPropertyNumber),
+        "keep nodes inside the world bounds; fix entity origins with "
+        "set_entity_properties",
+        {{"node", what}});
+      return;
+    }
+    if (const auto* entityNode = dynamic_cast<const mdl::EntityNode*>(&node);
+        entityNode && !isFiniteMatrix(entityNode->entity().rotation()))
+    {
+      const auto what = describe(node);
+      result = toolError(
+        "invalid_argument",
+        QString{"%1 has an angle, angles or mangle property that is not finite"}.arg(
+          what),
+        "fix the rotation property with set_entity_properties",
+        {{"node", what}});
+      return;
+    }
+    if (const auto* groupNode = dynamic_cast<const mdl::GroupNode*>(&node);
+        groupNode && !isFiniteMatrix(groupNode->group().transformation()))
+    {
+      const auto what = describe(node);
+      result = toolError(
+        "invalid_argument",
+        QString{"%1 has a transformation that is not finite"}.arg(what),
+        {},
+        {{"node", what}});
+      return;
+    }
+    for (const auto* child : node.children())
+    {
+      self(self, *child);
+    }
+  };
+
+  for (const auto* node : nodes)
+  {
+    // brush entities are transformed with their brushes
+    if (const auto* entityNode = dynamic_cast<const mdl::EntityNode*>(node->parent()))
+    {
+      check(check, *entityNode);
+    }
+    else
+    {
+      check(check, *node);
+    }
+  }
+  return result;
+}
+
+McpResult<void> checkMaterialName(const QString& name, const QString& pointer)
+{
+  const auto invalid = [&](const QString& reason) {
+    return toolError(
+      "invalid_argument",
+      QString{"%1: invalid material name '%2': %3"}.arg(pointer, name.left(64), reason),
+      "material names look like base/wall1 or e1u1/floor; see list_materials",
+      {{"pointer", pointer}});
+  };
+
+  if (name.isEmpty())
+  {
+    return invalid("must not be empty");
+  }
+  if (name.size() > 256)
+  {
+    return invalid("must be at most 256 characters long");
+  }
+  for (const auto c : name)
+  {
+    if (
+      c.isSpace() || c.category() == QChar::Other_Control || c == u'"' || c == u'('
+      || c == u')')
+    {
+      return invalid("must not contain whitespace, quotes or parentheses");
+    }
+  }
+  return kdl::void_success;
 }
 
 size_t sizeArgument(

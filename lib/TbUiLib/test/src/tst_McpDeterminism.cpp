@@ -131,6 +131,25 @@ TEST_CASE("McpDeterminism")
     Call{"find_nodes", R"({"inside":{"min":[1,0,0],"max":[0,1,1]}})"},
     Call{"get_map_info", "{}"},
     Call{"get_scene_tree", R"({"include_brushes":true})"},
+    // mutating and history tools
+    Call{"create_box_brush", R"({"bounds":{"min":[0,0,256],"max":[64,64,320]}})"},
+    Call{
+      "create_entity",
+      R"({"classname":"light","origin":[8,8,8],"properties":{"light":1}})"},
+    Call{"create_entity", R"({"classname":"func_wall","brush_ids":["B2"]})"},
+    Call{"paste_map_text", R"({"text":"{\n\"classname\" \"info_null\"\n}\n"})"},
+    Call{
+      "transform_nodes",
+      R"({"ids":["E3","B7"],"rotate":{"axis":"z","angle_degrees":33}})"},
+    Call{"transform_nodes", R"({"ids":["G8"],"scale":{"factors":[1.5,1,1]}})"},
+    Call{"set_entity_properties", R"({"ids":["E3"],"set":{"light":0.5}})"},
+    Call{"set_face_attributes", R"({"brushes":["B2"],"rotation":17,"fit":true})"},
+    Call{"select_nodes", R"({"ids":["E3"]})"},
+    Call{"delete_nodes", R"({"ids":["@selection","P9"]})"},
+    Call{"undo", R"({"count":3})"},
+    Call{"redo", "{}"},
+    Call{"undo", R"({"count":50})"},
+    Call{"get_scene_tree", R"({"include_brushes":true})"},
   };
 
   const auto callCount = std::ranges::count_if(

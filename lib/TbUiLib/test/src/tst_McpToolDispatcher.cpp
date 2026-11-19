@@ -23,9 +23,16 @@
 #include "McpTestUtils.h"
 #include "mcp/JsonSchema.h"
 #include "mdl/BrushNode.h"
+#include "mdl/CommandProcessor.h"
+#include "mdl/EntityNode.h"
 #include "mdl/Map.h"
+#include "mdl/Map_Geometry.h"
+#include "mdl/Map_Nodes.h"
 #include "mdl/Map_Selection.h"
+#include "mdl/PatchNode.h"
+#include "mdl/TransactionScope.h"
 #include "ui/CatchConfig.h"
+#include "ui/McpCheckpoints.h"
 #include "ui/McpSchemas.h"
 #include "ui/McpToolDispatcher.h"
 
@@ -50,6 +57,32 @@ McpToolDef readTool(
       schema::object({{"count", schema::integer(0, 10)}, {"ids", schema::nodeIds(5)}}),
     .kind = McpToolKind::Read,
     .annotations = {.readOnly = true, .destructive = false, .idempotent = true},
+    .allowedInBatch = true,
+    .run = std::move(run),
+  };
+}
+
+McpToolDef mutateTool(
+  const QString& name,
+  std::function<McpResult<QJsonObject>(McpCallContext&, const QJsonObject&)> run)
+{
+  auto title = name;
+  title.replace('_', ' ');
+  for (qsizetype i = 0; i < title.size(); ++i)
+  {
+    if (i == 0 || title[i - 1] == u' ')
+    {
+      title[i] = title[i].toUpper();
+    }
+  }
+
+  return {
+    .name = name,
+    .title = title,
+    .description = "test tool",
+    .inputSchema = schema::object({}),
+    .kind = McpToolKind::Mutate,
+    .annotations = {.readOnly = false, .destructive = false, .idempotent = false},
     .allowedInBatch = true,
     .run = std::move(run),
   };
@@ -316,17 +349,310 @@ TEST_CASE("McpToolDispatcher")
       CHECK(f.providerCalls.empty());
     }
 
-    SECTION("mutating tools are not supported yet")
+    SECTION("mutating tools run in one transaction")
     {
-      f.dispatcher.add({
-        .name = "mutate_tool",
-        .title = "Mutate Tool",
-        .description = "test",
-        .inputSchema = schema::object({}),
-        .kind = McpToolKind::Mutate,
-        .run = [](auto&, const auto&) -> McpResult<QJsonObject> { return QJsonObject{}; },
+      populateTestScene(f);
+      const auto modificationCount = f.map.modificationCount();
+      const auto undoDepth = f.doc->history.undoStack().size();
+
+      f.dispatcher.add(
+        mutateTool("mutate_tool", [&](McpCallContext& context, const auto&) {
+          CHECK(f.map.commandProcessor().isTransactionActive());
+          CHECK_FALSE(f.map.isCommandCollationEnabled());
+          addBrush(f.map, vm::bbox3d{{256, 0, 0}, {272, 16, 16}});
+          addBrush(f.map, vm::bbox3d{{288, 0, 0}, {304, 16, 16}});
+          context.warnings.push_back("a warning");
+          return McpResult<QJsonObject>{QJsonObject{{"value", 1}}};
+        }));
+
+      const auto result = f.ok("mutate_tool");
+      CHECK(result.value("value") == QJsonValue{1});
+      CHECK(
+        result.value("changes")
+        == QJsonValue{QJsonObject{
+          {"created", QJsonArray{"B12", "B13"}},
+          {"removed", QJsonArray{}},
+          {"modified", QJsonArray{}},
+        }});
+      CHECK(result.value("undo_label") == QJsonValue{"MCP: Mutate Tool"});
+      CHECK(result.value("warnings") == QJsonValue{QJsonArray{"a warning"}});
+      CHECK(result.value("log") == QJsonValue{QJsonArray{}});
+
+      const auto nodes = result.value("nodes").toArray();
+      REQUIRE(nodes.size() == 2);
+      CHECK(nodes[0].toObject().value("id") == QJsonValue{"B12"});
+      CHECK(nodes[1].toObject().value("id") == QJsonValue{"B13"});
+      CHECK(result.value("nodes_truncated") == QJsonValue{false});
+
+      const auto issues = result.value("issues").toObject();
+      CHECK(issues.value("items").isArray());
+      CHECK(issues.value("total").isDouble());
+
+      CHECK(f.map.modificationCount() > modificationCount);
+      CHECK(f.doc->history.undoStack().size() == undoDepth + 1);
+      CHECK(*f.map.undoCommandName() == "MCP: Mutate Tool");
+      CHECK_FALSE(f.map.commandProcessor().isTransactionActive());
+      CHECK_FALSE(f.doc->nodes.isRecording());
+
+      // one undo reverts the whole call
+      f.map.undoCommand();
+      CHECK(f.map.modificationCount() == modificationCount);
+      CHECK(f.doc->history.undoStack().size() == undoDepth);
+    }
+
+    SECTION("a failing mutating tool is rolled back")
+    {
+      const auto scene = populateTestScene(f);
+      mdl::selectNodes(f.map, {scene.light});
+      const auto before = snapshot(f.map);
+      const auto digest = contentDigest(f.doc->nodes, f.map);
+
+      auto createdId = QString{};
+      f.dispatcher.add(mutateTool("failing", [&](McpCallContext& context, const auto&) {
+        auto* brush = addBrush(f.map, vm::bbox3d{{256, 0, 0}, {272, 16, 16}});
+        createdId = context.doc.nodes.idOf(*brush);
+        mdl::deselectAll(f.map);
+        mdl::selectNodes(f.map, {brush});
+        REQUIRE(mdl::translateSelection(f.map, {16, 0, 0}));
+        mdl::removeNodes(f.map, {scene.wall});
+        return McpResult<QJsonObject>{toolError("operation_failed", "it failed")};
+      }));
+
+      CHECK(f.err("failing") == "operation_failed");
+      // the order of the layer's children may change because the wall is re-added
+      const auto after = snapshot(f.map);
+      CHECK(after.modificationCount == before.modificationCount);
+      CHECK(after.selectedNodes == before.selectedNodes);
+      CHECK(after.undoLabel == before.undoLabel);
+      CHECK(after.redoLabel == before.redoLabel);
+      CHECK(contentDigest(f.doc->nodes, f.map) == digest);
+      CHECK_FALSE(f.map.commandProcessor().isTransactionActive());
+      CHECK_FALSE(f.doc->nodes.isRecording());
+      CHECK(f.doc->nodes.verifyBijection());
+
+      // the brush created during the call is gone, the wall is back
+      CHECK(
+        f.doc->nodes.lookup(createdId).status == McpNodeRegistry::LookupStatus::Stale);
+      CHECK(f.doc->nodes.isLive(scene.wall));
+    }
+
+    SECTION("exceptions roll back mutating tools")
+    {
+      populateTestScene(f);
+      const auto before = snapshot(f.map);
+
+      f.dispatcher.add(mutateTool(
+        "throwing", [&](McpCallContext&, const auto&) -> McpResult<QJsonObject> {
+          addBrush(f.map, vm::bbox3d{{256, 0, 0}, {272, 16, 16}});
+          throw std::runtime_error{"boom"};
+        }));
+
+      CHECK_THROWS_AS(f.dispatcher.call("throwing", {}), std::runtime_error);
+      CHECK(snapshot(f.map) == before);
+      CHECK_FALSE(f.dispatcher.isInCall());
+      CHECK_FALSE(f.doc->nodes.isRecording());
+      CHECK(f.map.isCommandCollationEnabled() == false);
+    }
+
+    SECTION("the user's selection is restored")
+    {
+      const auto scene = populateTestScene(f);
+      mdl::selectNodes(f.map, {scene.light, scene.wall});
+
+      f.dispatcher.add(mutateTool("selecting", [&](McpCallContext&, const auto&) {
+        mdl::deselectAll(f.map);
+        mdl::selectNodes(f.map, {scene.patch});
+        REQUIRE(mdl::translateSelection(f.map, {16, 0, 0}));
+        mdl::removeNodes(f.map, {scene.light});
+        return McpResult<QJsonObject>{QJsonObject{}};
+      }));
+
+      f.ok("selecting");
+      // the removed light cannot be selected again
+      CHECK(f.map.selection().nodes == std::vector<mdl::Node*>{scene.wall});
+
+      // undo restores the light and the selection before the call
+      f.map.undoCommand();
+      auto selected = f.map.selection().nodes;
+      CHECK(selected.size() == 2);
+    }
+
+    SECTION("tools that keep their selection")
+    {
+      const auto scene = populateTestScene(f);
+      mdl::selectNodes(f.map, {scene.light});
+
+      auto def = mutateTool("keeping", [&](McpCallContext&, const auto&) {
+        mdl::deselectAll(f.map);
+        mdl::selectNodes(f.map, {scene.wall});
+        return McpResult<QJsonObject>{QJsonObject{}};
       });
-      CHECK(f.err("mutate_tool") == "not_supported");
+      def.keepsSelection = true;
+      f.dispatcher.add(std::move(def));
+
+      f.ok("keeping");
+      CHECK(f.map.selection().nodes == std::vector<mdl::Node*>{scene.wall});
+    }
+
+    SECTION("calls that change nothing add no undo step")
+    {
+      populateTestScene(f);
+      const auto undoLabel = *f.map.undoCommandName();
+      f.dispatcher.add(mutateTool("noop", [](McpCallContext&, const auto&) {
+        return McpResult<QJsonObject>{QJsonObject{}};
+      }));
+
+      const auto result = f.ok("noop");
+      CHECK(result.value("undo_label").isNull());
+      CHECK(
+        result.value("warnings")
+        == QJsonValue{QJsonArray{"nothing changed; no undo step was added"}});
+      CHECK(*f.map.undoCommandName() == undoLabel);
+    }
+
+    SECTION("collation is disabled during calls")
+    {
+      f.map.setIsCommandCollationEnabled(true);
+      f.ok("create_box_brush", R"({"bounds":{"min":[0,0,0],"max":[16,16,16]}})");
+      f.ok("create_box_brush", R"({"bounds":{"min":[32,0,0],"max":[48,16,16]}})");
+      CHECK(f.map.isCommandCollationEnabled());
+
+      // two calls are two undo steps although the GUI collates commands
+      CHECK(*f.map.undoCommandName() == "MCP: Create Box Brush");
+      f.map.undoCommand();
+      CHECK(*f.map.undoCommandName() == "MCP: Create Box Brush");
+      CHECK(f.doc->nodes.lookup(u"B2").status == McpNodeRegistry::LookupStatus::Live);
+      f.map.undoCommand();
+      CHECK(f.doc->nodes.lookup(u"B2").status == McpNodeRegistry::LookupStatus::Stale);
+    }
+
+    SECTION("mutating and history tools are refused during a transaction")
+    {
+      f.map.startTransaction("drag", mdl::TransactionScope::LongRunning);
+      auto called = false;
+      f.dispatcher.add(mutateTool("mutate_tool", [&](McpCallContext&, const auto&) {
+        called = true;
+        return McpResult<QJsonObject>{QJsonObject{}};
+      }));
+
+      const auto mutate = f.error("mutate_tool");
+      CHECK(mutate.value("code") == QJsonValue{"editor_busy"});
+      CHECK(
+        mutate.value("details").toObject().value("reason")
+        == QJsonValue{"transaction_active"});
+      CHECK(f.err("undo") == "editor_busy");
+      CHECK(f.err("redo") == "editor_busy");
+      CHECK_FALSE(called);
+      CHECK(f.map.commandProcessor().isTransactionActive());
+      f.map.cancelTransaction();
+
+      // the read tools still work
+      f.ok("get_map_info");
+    }
+
+    SECTION("history tools run without a transaction")
+    {
+      populateTestScene(f);
+      auto def = mutateTool("history_tool", [&](McpCallContext&, const auto&) {
+        CHECK_FALSE(f.map.commandProcessor().isTransactionActive());
+        CHECK_FALSE(f.map.isCommandCollationEnabled());
+        f.map.undoCommand();
+        return McpResult<QJsonObject>{QJsonObject{{"value", 1}}};
+      });
+      def.kind = McpToolKind::History;
+      f.dispatcher.add(std::move(def));
+
+      const auto result = f.ok("history_tool");
+      CHECK(result.value("value") == QJsonValue{1});
+      // undoing the creation of E11 removes it
+      CHECK(
+        result.value("changes").toObject().value("removed")
+        == QJsonValue{QJsonArray{"E11"}});
+      CHECK(f.map.redoCommandName() != nullptr);
+    }
+
+    SECTION("transaction invariants")
+    {
+      // every mutating tool: one undo step that undo reverts and redo repeats; the
+      // failing variant changes nothing
+      struct Row
+      {
+        const char* tool;
+        const char* args;
+        const char* failingArgs;
+        const char* failingCode;
+      };
+
+      const auto rows = std::vector<Row>{
+        {"create_box_brush",
+         R"({"bounds":{"min":[256,0,0],"max":[320,64,64]},"material":"stone"})",
+         R"({"bounds":{"min":[256,0,0],"max":[256,64,64]}})",
+         "invalid_argument"},
+        {"create_entity",
+         R"({"classname":"light","origin":[0,0,256],"properties":{"light":200}})",
+         R"({"classname":"light"})",
+         "invalid_argument"},
+        {"paste_map_text",
+         R"({"text":"{\n\"classname\" \"info_null\"\n\"origin\" \"8 8 8\"\n}\n"})",
+         R"({"text":"this is not a map"})",
+         "parse_failed"},
+        {"transform_nodes",
+         R"({"ids":["B2","E3"],"translate":[16,0,0]})",
+         R"({"ids":["B2","E3"],"translate":[100000,0,0]})",
+         "out_of_world_bounds"},
+        {"delete_nodes",
+         R"({"ids":["B2","E4"]})",
+         R"({"ids":["B2","L1"]})",
+         "not_supported"},
+        {"set_entity_properties",
+         R"({"ids":["E3","E4"],"set":{"target":"t1"}})",
+         R"({"ids":["E3","E4"],"remove":["light"]})",
+         "invalid_argument"},
+        {"set_face_attributes",
+         R"({"faces":[{"brush":"B2","side":"+z"}],"material":"grass"})",
+         R"({"faces":[{"brush":"B2","normal":[1,1,0]}],"material":"grass"})",
+         "face_not_found"},
+      };
+
+      for (const auto& row : rows)
+      {
+        auto g = McpMapToolsFixture{};
+        const auto scene = populateTestScene(g);
+        mdl::selectNodes(g.map, {scene.patch});
+        CAPTURE(row.tool);
+
+        const auto d0 = contentDigest(g.doc->nodes, g.map);
+        const auto selection0 = g.map.selection().nodes;
+        const auto undoDepth = g.doc->history.undoStack().size();
+        const auto modificationCount = g.map.modificationCount();
+
+        // the failing variant changes nothing
+        CHECK(g.err(row.tool, row.failingArgs) == row.failingCode);
+        CHECK(contentDigest(g.doc->nodes, g.map) == d0);
+        CHECK(g.map.modificationCount() == modificationCount);
+        CHECK(g.map.selection().nodes == selection0);
+        CHECK(g.doc->history.undoStack().size() == undoDepth);
+
+        const auto result = g.ok(row.tool, row.args);
+        const auto d1 = contentDigest(g.doc->nodes, g.map);
+        CHECK(d1 != d0);
+        CHECK(g.map.selection().nodes == selection0);
+        CHECK(g.doc->history.undoStack().size() == undoDepth + 1);
+        REQUIRE(g.map.undoCommandName() != nullptr);
+        CHECK(McpHistoryTracker::isMcpLabel(*g.map.undoCommandName()));
+        CHECK(
+          result.value("undo_label")
+          == QJsonValue{QString::fromStdString(*g.map.undoCommandName())});
+
+        g.map.undoCommand();
+        CHECK(contentDigest(g.doc->nodes, g.map) == d0);
+        CHECK(g.map.selection().nodes == selection0);
+        CHECK(g.map.modificationCount() == modificationCount);
+
+        g.map.redoCommand();
+        CHECK(contentDigest(g.doc->nodes, g.map) == d1);
+        CHECK(g.doc->nodes.verifyBijection());
+      }
     }
   }
 

@@ -227,6 +227,39 @@ TEST_CASE("McpJson")
     CHECK(patchSummary.value("material") == QJsonValue{"patch_material"});
     CHECK(patchSummary.value("entity") == QJsonValue{"world"});
   }
+
+  SECTION("selectionJson")
+  {
+    auto fixture = mdl::MapFixture{};
+    auto& map = fixture.create(mdl::QuakeFixtureConfig);
+    auto* brush = addBrush(map, vm::bbox3d{{0, 0, 0}, {16, 16, 16}});
+    auto* light = addPointEntity(map, "light", {8, 8, 64});
+    const auto registry = McpNodeRegistry{map};
+
+    CHECK(
+      compactJson(selectionJson(registry, map))
+      == QStringLiteral(R"({"bounds":null,"faces":[],"nodes":[]})"));
+
+    mdl::selectNodes(map, {brush, light});
+    const auto nodes = selectionJson(registry, map);
+    CHECK(
+      nodes.value("nodes")
+      == QJsonValue{QJsonArray{registry.idOf(*brush), registry.idOf(*light)}});
+    CHECK(nodes.value("faces") == QJsonValue{QJsonArray{}});
+    CHECK(
+      nodes.value("bounds").toObject().value("max")
+      == QJsonValue{QJsonArray{16, 16, 72}});
+
+    mdl::deselectAll(map);
+    const auto topFace = *brush->brush().findFace(vm::vec3d{0, 0, 1});
+    mdl::selectBrushFaces(map, {{*brush, topFace}});
+    const auto faces = selectionJson(registry, map);
+    CHECK(faces.value("nodes") == QJsonValue{QJsonArray{}});
+    CHECK(
+      faces.value("faces")
+      == QJsonValue{QJsonArray{QJsonObject{
+        {"brush", registry.idOf(*brush)}, {"index", qint64(topFace)}, {"side", "+z"}}}});
+  }
 }
 
 } // namespace tb::ui

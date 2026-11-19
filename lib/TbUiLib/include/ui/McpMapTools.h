@@ -39,4 +39,19 @@ void registerMcpMapReadTools(McpToolDispatcher& dispatcher);
  */
 void registerMcpMapEvalTools(McpToolDispatcher& dispatcher);
 
+/** Registers the creation tools: create_box_brush, create_entity and paste_map_text. */
+void registerMcpMapCreateTools(McpToolDispatcher& dispatcher);
+
+/**
+ * Registers the editing tools: transform_nodes, delete_nodes, set_entity_properties and
+ * set_face_attributes.
+ */
+void registerMcpMapEditTools(McpToolDispatcher& dispatcher);
+
+/** Registers the structure tools: select_nodes. */
+void registerMcpMapStructureTools(McpToolDispatcher& dispatcher);
+
+/** Registers the history tools: undo and redo. */
+void registerMcpMapHistoryTools(McpToolDispatcher& dispatcher);
+
 } // namespace tb::ui

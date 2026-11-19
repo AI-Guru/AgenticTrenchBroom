@@ -34,9 +34,15 @@
 #include "mdl/PatchNode.h"
 #include "mdl/TransactionScope.h"
 #include "ui/CatchConfig.h"
+#include "ui/McpCheckpoints.h"
+#include "ui/McpPreconditions.h"
 #include "ui/McpToolDispatcher.h"
 
+#include <algorithm>
+#include <optional>
 #include <random>
+#include <sstream>
+#include <string>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -295,6 +301,30 @@ private:
         result[it.key()] = generate(it.value().toObject(), depth + 1);
       }
     }
+    if (properties.isEmpty() && chance(70))
+    {
+      // free-form maps such as entity properties: keys that TrenchBroom interprets,
+      // with values that must not reach its assertions
+      static const auto keys =
+        QJsonArray{"origin", "angles", "angle", "mangle", "light", "classname", "target"};
+      static const auto values = QJsonArray{
+        "inf 0 0",
+        "nan nan nan",
+        "1e308 1e308 1e308",
+        "0 9000000 0",
+        "0 0 0",
+        "90",
+        300,
+        1e300,
+        true,
+        QJsonArray{1, 2, 3},
+      };
+      const auto count = 1 + random(2);
+      for (size_t i = 0; i < count; ++i)
+      {
+        result[pick(keys).toString()] = pick(values);
+      }
+    }
     if (chance(3))
     {
       result["bogus"] = 1;
@@ -343,6 +373,10 @@ private:
       "B2",
       QString(300, 'x'),
       QString::fromUtf8("\xC3\xA4\xE2\x82\xAC"),
+      "{\n\"classname\" \"info_null\"\n\"origin\" \"inf 0 0\"\n}\n",
+      "{\n\"classname\" \"info_null\"\n\"origin\" \"1e308 0 0\"\n}\n",
+      "{\n\"classname\" \"info_null\"\n\"angles\" \"nan 0 0\"\n}\n",
+      "{\n\"classname\" \"info_null\"\n\"origin\" \"16 16 16\"\n}\n",
     };
     return pick(values);
   }
@@ -363,15 +397,64 @@ private:
   QStringList m_ids;
 };
 
+/**
+ * The lines of the map text in sorted order. Unlike the text, this does not change when
+ * undo re-adds a deleted node at the end of its parent. Cheaper than the content digest.
+ */
+std::vector<std::string> sortedMapLines(mdl::Map& map)
+{
+  auto stream = std::istringstream{mapText(map)};
+  auto lines = std::vector<std::string>{};
+  for (auto line = std::string{}; std::getline(stream, line);)
+  {
+    // skip the comments that number the entities and brushes
+    if (!line.starts_with("//"))
+    {
+      lines.push_back(std::move(line));
+    }
+  }
+  std::ranges::sort(lines);
+  return lines;
+}
+
+/** The state that a failed mutating call must not change. */
+struct MutationInvariant
+{
+  std::vector<std::string> digest;
+  size_t modificationCount;
+  std::vector<mdl::Node*> selectedNodes;
+  std::vector<mdl::BrushFaceHandle> selectedFaces;
+  std::optional<std::string> undoLabel;
+
+  explicit MutationInvariant(McpMapToolsFixture& f)
+    : digest{sortedMapLines(f.map)}
+    , modificationCount{f.map.modificationCount()}
+    , selectedNodes{f.map.selection().nodes}
+    , selectedFaces{f.map.selection().brushFaces}
+    , undoLabel{
+        f.map.undoCommandName() ? std::optional{*f.map.undoCommandName()} : std::nullopt}
+  {
+    std::ranges::sort(selectedNodes);
+    std::ranges::sort(selectedFaces, [](const auto& lhs, const auto& rhs) {
+      return std::pair{&lhs.node(), lhs.faceIndex()}
+             < std::pair{&rhs.node(), rhs.faceIndex()};
+    });
+  }
+
+  bool operator==(const MutationInvariant&) const = default;
+};
+
 void checkCall(McpMapToolsFixture& f, const McpToolDef& tool, const QJsonObject& args)
 {
   CAPTURE(tool.name, compactJson(args));
 
   const auto before = snapshot(f.map);
+  const auto invariantBefore = MutationInvariant{f};
   const auto result = f.call(tool.name, args);
 
   REQUIRE(result.value("isError").isBool());
-  if (result.value("isError").toBool())
+  const auto isError = result.value("isError").toBool();
+  if (isError)
   {
     const auto code = result.value("structuredContent")
                         .toObject()
@@ -390,6 +473,23 @@ void checkCall(McpMapToolsFixture& f, const McpToolDef& tool, const QJsonObject&
   if (tool.kind == McpToolKind::Read)
   {
     CHECK(snapshot(f.map) == before);
+  }
+  else if (tool.kind == McpToolKind::Mutate)
+  {
+    if (isError)
+    {
+      // a failed call is rolled back completely
+      CHECK(MutationInvariant{f} == invariantBefore);
+    }
+    else if (
+      canUndo(f.map) && McpHistoryTracker::isMcpLabel(*f.map.undoCommandName())
+      && f.map.modificationCount() != invariantBefore.modificationCount)
+    {
+      // undo the call so that the next calls see the same map; undo restores the content
+      f.map.undoCommand();
+      CHECK(sortedMapLines(f.map) == invariantBefore.digest);
+      CHECK(f.map.modificationCount() == invariantBefore.modificationCount);
+    }
   }
   REQUIRE(f.doc->nodes.verifyBijection());
 }

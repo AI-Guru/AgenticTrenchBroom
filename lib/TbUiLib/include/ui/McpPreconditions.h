@@ -196,6 +196,55 @@ McpResult<void> checkMapText(const QString& text, McpMapText kind);
 bool isLinkedGroup(mdl::Map& map, const mdl::GroupNode& groupNode);
 
 /**
+ * Returns not_supported if the given node is a linked group or is inside one.
+ */
+McpResult<void> requireNotLinked(const McpDocumentState& doc, const mdl::Node& node);
+
+/**
+ * Converts a PropValue argument to the text of an entity property: integer valued numbers
+ * are written without a fraction, other numbers in the shortest form that reads back
+ * exactly, booleans as "1" or "0", strings as they are, and arrays of three numbers as
+ * "x y z". Anything else yields invalid_argument at the given pointer. The text is also
+ * checked with checkMapText.
+ */
+McpResult<QString> propValueText(const QJsonValue& value, const QString& pointer);
+
+/**
+ * The largest magnitude of a coordinate or angle that tools accept in entity origins and
+ * rotations and in the bounds of nodes they transform or paste. TrenchBroom's node
+ * octree stores addresses as 16 bit integers and violates a contract for nodes beyond
+ * about 8e6 units, and huge angles overflow when they are converted to radians.
+ */
+inline constexpr double McpMaxEntityPropertyNumber = 1e6;
+
+/**
+ * Checks the value of an entity property whose numbers TrenchBroom uses in
+ * transformations: origin, angle, angles and mangle. Every number in such a value must
+ * be finite and at most McpMaxEntityPropertyNumber in magnitude, because TrenchBroom
+ * aborts in debug builds when it transforms or renders an entity with a non-finite
+ * origin or rotation. Values of other keys are not checked.
+ */
+McpResult<void> checkEntityPropertyValue(
+  const QString& key, const QString& value, const QString& pointer);
+
+/**
+ * Checks that the given nodes and their descendants can be added to the map and
+ * transformed without reaching a TrenchBroom assertion or contract: their bounds are
+ * finite and within McpMaxEntityPropertyNumber, entity rotations and group
+ * transformations are finite. The given nodes may be detached. Brush entities are
+ * transformed with their brushes, so for a brush or patch inside an entity the entity
+ * is checked too.
+ */
+McpResult<void> checkTransformableNodes(
+  const McpNodeRegistry& registry, const std::vector<const mdl::Node*>& nodes);
+
+/**
+ * Checks a material name: not empty, at most 256 characters, and no whitespace, quotes,
+ * parentheses or control characters, which the map formats cannot store.
+ */
+McpResult<void> checkMaterialName(const QString& name, const QString& pointer);
+
+/**
  * Reads an optional non-negative integer argument that the schema has already checked.
  * Values are clamped to [0, 1e9] so that the conversion is always defined.
  */

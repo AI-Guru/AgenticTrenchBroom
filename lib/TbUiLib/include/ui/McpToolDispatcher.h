@@ -46,6 +46,12 @@ struct McpToolDef
   mcp::ToolAnnotations annotations = {};
   bool allowedInBatch = false;
 
+  /**
+   * For Mutate tools: whether the selection the tool leaves behind is its result. Such
+   * tools (select_nodes) skip restoring the user's selection.
+   */
+  bool keepsSelection = false;
+
   /** Runs a Read, Mutate or History tool on the document returned by the provider. */
   std::function<McpResult<QJsonObject>(McpCallContext& context, const QJsonObject& args)>
     run = {};
@@ -68,8 +74,15 @@ struct McpToolDef
  *    which may fail with no_document or editor_busy.
  * 4. The node registry of the document is reconciled with the node tree.
  * 5. Read tools are run. They must not change the map, its selection or its undo stack.
+ * 6. Mutate tools are run inside one transaction named "MCP: <title>" with command
+ *    collation disabled, so that one call is one undo step. The user's selection is
+ *    restored in the same transaction unless the tool keeps its selection. If the tool
+ *    fails, the transaction is cancelled and nothing changes. A successful result is
+ *    extended by the mutation envelope: changes, nodes, issues, log and undo_label.
+ * 7. History tools are run without a transaction, with command collation disabled.
  *
- * The optional log capture callbacks are called around steps 3 to 5.
+ * Mutate and History tools are refused while another transaction is running. The
+ * optional log capture callbacks are called around steps 3 to 7.
  */
 class McpToolDispatcher
 {
@@ -113,6 +126,10 @@ private:
   mcp::ToolResult dispatch(const McpToolDef& def, const QJsonObject& args);
   mcp::ToolResult runRead(
     const McpToolDef& def, McpDocumentState& doc, const QJsonObject& args);
+  mcp::ToolResult runMutate(
+    const McpToolDef& def, McpDocumentState& doc, const QJsonObject& args);
+  mcp::ToolResult runHistory(
+    const McpToolDef& def, McpDocumentState& doc, const QJsonObject& args);
 
   mcp::ToolRegistry& m_registry;
   McpDocumentProvider m_provider;
@@ -122,6 +139,12 @@ private:
   std::vector<McpLogLine>* m_log = nullptr;
   bool m_inCall = false;
 };
+
+/** The maximum number of node summaries in a mutation envelope. */
+inline constexpr size_t McpEnvelopeMaxNodes = 50;
+
+/** The maximum number of issues in a mutation envelope. */
+inline constexpr size_t McpEnvelopeMaxIssues = 20;
 
 /** The closed set of error codes that tools may return. */
 const std::vector<QString>& mcpToolErrorCodes();

@@ -23,12 +23,21 @@
 
 #include "mcp/JsonSchema.h"
 #include "mdl/BrushFaceHandle.h"
+#include "mdl/CommandProcessor.h"
+#include "mdl/Issue.h"
 #include "mdl/Map.h"
+#include "mdl/Node.h"
 #include "mdl/Selection.h"
+#include "mdl/Transaction.h"
+#include "mdl/Validator.h"
+#include "mdl/WorldNode.h"
+#include "ui/McpJson.h"
+#include "ui/McpSelectionGuard.h"
 
 #include "kd/contracts.h"
 
 #include <algorithm>
+#include <unordered_map>
 
 namespace tb::ui
 {
@@ -105,6 +114,184 @@ struct ReadInvariant
 
   bool operator==(const ReadInvariant&) const = default;
 };
+
+/** Disables command collation for the lifetime of the scope. */
+class CollationScope
+{
+public:
+  explicit CollationScope(mdl::Map& map)
+    : m_map{map}
+    , m_wasEnabled{map.isCommandCollationEnabled()}
+  {
+    m_map.setIsCommandCollationEnabled(false);
+  }
+
+  ~CollationScope() { m_map.setIsCommandCollationEnabled(m_wasEnabled); }
+
+  CollationScope(const CollationScope&) = delete;
+  CollationScope& operator=(const CollationScope&) = delete;
+
+private:
+  mdl::Map& m_map;
+  bool m_wasEnabled;
+};
+
+/** Records the changes of the node registry for the lifetime of the scope. */
+class RecordingScope
+{
+public:
+  RecordingScope(McpNodeRegistry& registry, QString removalLabel)
+    : m_registry{registry}
+  {
+    m_registry.setRemovalLabel(std::move(removalLabel));
+    m_registry.beginRecording();
+  }
+
+  ~RecordingScope()
+  {
+    if (m_registry.isRecording())
+    {
+      m_registry.endRecording();
+    }
+    m_registry.setRemovalLabel({});
+  }
+
+  McpChangeSet end() { return m_registry.endRecording(); }
+
+  RecordingScope(const RecordingScope&) = delete;
+  RecordingScope& operator=(const RecordingScope&) = delete;
+
+private:
+  McpNodeRegistry& m_registry;
+};
+
+QString logLevelName(const LogLevel level)
+{
+  switch (level)
+  {
+  case LogLevel::Debug:
+    return QStringLiteral("debug");
+  case LogLevel::Info:
+    return QStringLiteral("info");
+  case LogLevel::Warn:
+    return QStringLiteral("warn");
+  case LogLevel::Error:
+    return QStringLiteral("error");
+  }
+  return QStringLiteral("info");
+}
+
+QJsonArray logJson(const std::vector<McpLogLine>* log)
+{
+  auto result = QJsonArray{};
+  if (log)
+  {
+    for (const auto& line : *log)
+    {
+      result.append(
+        QJsonObject{{"level", logLevelName(line.level)}, {"text", line.text}});
+    }
+  }
+  return result;
+}
+
+/** Returns the ids of the created and modified nodes that are live, in id order. */
+std::vector<mdl::Node*> touchedNodes(
+  const McpDocumentState& doc, const McpChangeSet& changes)
+{
+  auto result = std::vector<mdl::Node*>{};
+  const auto add = [&](const QString& id) {
+    if (id == u"world")
+    {
+      result.push_back(&doc.map.worldNode());
+      return;
+    }
+    const auto lookup = doc.nodes.lookup(id);
+    if (lookup.status == McpNodeRegistry::LookupStatus::Live)
+    {
+      result.push_back(lookup.node);
+    }
+  };
+
+  // both lists are sorted by number, merge them so that the result is in id order
+  auto created = changes.created.begin();
+  auto modified = changes.modified.begin();
+  if (modified != changes.modified.end() && *modified == u"world")
+  {
+    add(*modified++);
+  }
+  const auto number = [](const QString& id) { return id.mid(1).toULongLong(); };
+  while (created != changes.created.end() || modified != changes.modified.end())
+  {
+    if (
+      modified == changes.modified.end()
+      || (created != changes.created.end() && number(*created) < number(*modified)))
+    {
+      add(*created++);
+    }
+    else
+    {
+      add(*modified++);
+    }
+  }
+  return result;
+}
+
+/** Returns the non-hidden issues of the given nodes, at most McpEnvelopeMaxIssues. */
+QJsonObject issuesJson(const McpDocumentState& doc, const std::vector<mdl::Node*>& nodes)
+{
+  auto& map = doc.map;
+
+  // Node::issues caches its result, so it must be called with all validators
+  const auto validators = map.worldNode().registeredValidators();
+  auto descriptions = std::unordered_map<mdl::IssueType, QString>{};
+  for (const auto* validator : validators)
+  {
+    descriptions.emplace(
+      validator->type(), QString::fromStdString(validator->description()));
+  }
+
+  auto items = QJsonArray{};
+  auto total = qint64(0);
+  for (auto* node : nodes)
+  {
+    for (const auto* issue : node->issues(validators))
+    {
+      if (issue->hidden())
+      {
+        continue;
+      }
+      ++total;
+      if (size_t(items.size()) >= McpEnvelopeMaxIssues)
+      {
+        continue;
+      }
+
+      const auto typeIt = descriptions.find(issue->type());
+      auto item = QJsonObject{
+        {"node", doc.nodes.idOf(*node)},
+        {"type", typeIt != descriptions.end() ? typeIt->second : QString{}},
+        {"description", QString::fromStdString(issue->description())},
+      };
+      if (const auto* faceIssue = dynamic_cast<const mdl::BrushFaceIssue*>(issue))
+      {
+        item["face"] = qint64(faceIssue->faceIndex());
+      }
+      if (
+        const auto* propertyIssue = dynamic_cast<const mdl::EntityPropertyIssue*>(issue))
+      {
+        item["property"] = toUnicode(map, propertyIssue->propertyKey());
+      }
+      items.append(item);
+    }
+  }
+
+  return QJsonObject{
+    {"items", items},
+    {"total", total},
+    {"truncated", total > items.size()},
+  };
+}
 
 mcp::ToolOutput makeOutput(
   const McpToolDef& def, QJsonObject structured, const std::vector<QString>& warnings)
@@ -248,7 +435,9 @@ mcp::ToolResult McpToolDispatcher::dispatch(
   case McpToolKind::Read:
     return runRead(def, doc, args);
   case McpToolKind::Mutate:
+    return runMutate(def, doc, args);
   case McpToolKind::History:
+    return runHistory(def, doc, args);
   case McpToolKind::App:
     break;
   }
@@ -271,6 +460,126 @@ mcp::ToolResult McpToolDispatcher::runRead(
   }
 
   return toToolResult(def, std::move(result), context.warnings);
+}
+
+mcp::ToolResult McpToolDispatcher::runMutate(
+  const McpToolDef& def, McpDocumentState& doc, const QJsonObject& args)
+{
+  auto& map = doc.map;
+
+  // the provider checks this too, but a tool must never be run inside the user's
+  // transaction: cancelling it would also roll back what the tool did
+  if (const auto busy = requireNoActiveTransaction(map); busy.is_error())
+  {
+    return errorOf(busy);
+  }
+
+  const auto collation = CollationScope{map};
+  auto recording = RecordingScope{doc.nodes, def.title};
+  auto context = McpCallContext{.doc = doc, .log = m_log};
+
+  const auto* undoNameBefore = map.undoCommandName();
+
+  auto transaction = mdl::Transaction{map, "MCP: " + def.title.toStdString()};
+  auto guard = McpSelectionGuard{map, doc.nodes};
+
+  auto result = def.run(context, args);
+  if (result.is_error())
+  {
+    guard.dismiss();
+    transaction.cancel();
+    return errorOf(result);
+  }
+
+  if (def.keepsSelection)
+  {
+    guard.dismiss();
+  }
+  else
+  {
+    guard.restore();
+  }
+
+  if (!transaction.commit())
+  {
+    return toolError(
+      "operation_failed",
+      QString{"%1 could not be completed: linked groups could not be updated"}.arg(
+        def.name),
+      "check the log for details",
+      {{"log", logJson(m_log)}});
+  }
+
+  const auto changes = recording.end();
+  const auto touched = touchedNodes(doc, changes);
+
+  auto summaries = QJsonArray{};
+  for (const auto* node : touched)
+  {
+    if (size_t(summaries.size()) >= McpEnvelopeMaxNodes)
+    {
+      break;
+    }
+    summaries.append(nodeSummary(doc.nodes, map, *node));
+  }
+
+  // if nothing was done, the transaction was empty and no undo step was added
+  const auto* undoNameAfter = map.undoCommandName();
+  const auto addedUndoStep = undoNameAfter && undoNameAfter != undoNameBefore;
+  if (!addedUndoStep)
+  {
+    context.warnings.push_back("nothing changed; no undo step was added");
+  }
+
+  // the tool's own fields take precedence, e.g. the node ids returned by select_nodes
+  auto structured = std::move(result).value();
+  const auto addEnvelope = [&](const QString& key, QJsonValue value) {
+    if (!structured.contains(key))
+    {
+      structured[key] = std::move(value);
+    }
+  };
+  addEnvelope("changes", changes.toJson());
+  addEnvelope("nodes", summaries);
+  addEnvelope("nodes_truncated", touched.size() > McpEnvelopeMaxNodes);
+  addEnvelope("issues", issuesJson(doc, touched));
+  addEnvelope("log", logJson(m_log));
+  addEnvelope(
+    "undo_label",
+    addedUndoStep ? QJsonValue{QString::fromStdString(*undoNameAfter)} : QJsonValue{});
+
+  return makeOutput(def, std::move(structured), context.warnings);
+}
+
+mcp::ToolResult McpToolDispatcher::runHistory(
+  const McpToolDef& def, McpDocumentState& doc, const QJsonObject& args)
+{
+  auto& map = doc.map;
+  if (const auto busy = requireNoActiveTransaction(map); busy.is_error())
+  {
+    return errorOf(busy);
+  }
+
+  const auto collation = CollationScope{map};
+  auto recording = RecordingScope{doc.nodes, def.title};
+  auto context = McpCallContext{.doc = doc, .log = m_log};
+
+  auto result = def.run(context, args);
+  if (result.is_error())
+  {
+    return errorOf(result);
+  }
+
+  auto structured = std::move(result).value();
+  if (!structured.contains("changes"))
+  {
+    structured["changes"] = recording.end().toJson();
+  }
+  if (!structured.contains("log"))
+  {
+    structured["log"] = logJson(m_log);
+  }
+  return makeOutput(def, std::move(structured), context.warnings);
 }
 
 const std::vector<QString>& mcpToolErrorCodes()

@@ -103,4 +103,10 @@ QString nodeTypeName(const mdl::Node& node);
 QJsonObject nodeSummary(
   const McpNodeRegistry& registry, const mdl::Map& map, const mdl::Node& node);
 
+/**
+ * Returns the selection of the given map: {nodes:[ids], faces:[{brush, index, side?}],
+ * bounds}. The selected nodes must be registered with the given registry.
+ */
+QJsonObject selectionJson(const McpNodeRegistry& registry, const mdl::Map& map);
+
 } // namespace tb::ui

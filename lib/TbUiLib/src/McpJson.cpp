@@ -25,6 +25,7 @@
 #include "mdl/BezierPatch.h"
 #include "mdl/Brush.h"
 #include "mdl/BrushFace.h"
+#include "mdl/BrushFaceHandle.h"
 #include "mdl/BrushNode.h"
 #include "mdl/EditorContext.h"
 #include "mdl/Entity.h"
@@ -33,6 +34,7 @@
 #include "mdl/LayerNode.h"
 #include "mdl/Map.h"
 #include "mdl/PatchNode.h"
+#include "mdl/Selection.h"
 #include "mdl/WorldNode.h"
 #include "ui/McpNodeRegistry.h"
 #include "ui/QStringUtils.h"
@@ -259,6 +261,38 @@ QJsonObject nodeSummary(
     }));
 
   return result;
+}
+
+QJsonObject selectionJson(const McpNodeRegistry& registry, const mdl::Map& map)
+{
+  const auto& selection = map.selection();
+
+  auto nodes = QJsonArray{};
+  for (const auto* node : selection.nodes)
+  {
+    nodes.append(registry.idOf(*node));
+  }
+
+  auto faces = QJsonArray{};
+  for (const auto& handle : selection.brushFaces)
+  {
+    auto face = QJsonObject{
+      {"brush", registry.idOf(handle.node())},
+      {"index", qint64(handle.faceIndex())},
+    };
+    if (const auto side = sideName(handle.face().normal()))
+    {
+      face["side"] = *side;
+    }
+    faces.append(face);
+  }
+
+  const auto& selectionBounds = map.selectionBounds();
+  return QJsonObject{
+    {"nodes", nodes},
+    {"faces", faces},
+    {"bounds", selectionBounds ? QJsonValue{toJson(*selectionBounds)} : QJsonValue{}},
+  };
 }
 
 } // namespace tb::ui

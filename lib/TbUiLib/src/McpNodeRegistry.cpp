@@ -259,7 +259,7 @@ void McpNodeRegistry::setRemovalLabel(QString label)
 
 void McpNodeRegistry::beginRecording()
 {
-  m_recording = Recording{};
+  m_recording = Recording{.firstNumber = m_next};
 }
 
 McpChangeSet McpNodeRegistry::endRecording()
@@ -298,6 +298,56 @@ McpChangeSet McpNodeRegistry::currentChanges() const
 bool McpNodeRegistry::isRecording() const
 {
   return m_recording.has_value();
+}
+
+void McpNodeRegistry::restoreIdsAfterRollback()
+{
+  if (!m_recording)
+  {
+    return;
+  }
+
+  auto revived = std::unordered_set<uint64_t>{};
+  auto replaced = std::vector<uint64_t>{};
+  for (const auto& [removedNode, oldNumber] : m_recording->removedNodes)
+  {
+    // only compares the pointer: the node may not be live
+    const auto it = m_idByNode.find(removedNode);
+    if (
+      it == m_idByNode.end() || it->second == oldNumber || m_nodeById.contains(oldNumber))
+    {
+      continue;
+    }
+
+    // the node is live again, so the pointer is valid
+    const auto newNumber = it->second;
+    auto* node = m_nodeById.at(newNumber);
+    m_nodeById.erase(newNumber);
+    replaced.push_back(newNumber);
+
+    it->second = oldNumber;
+    m_nodeById.emplace(oldNumber, node);
+    m_letters.insert_or_assign(oldNumber, kindLetter(*node));
+    if (m_tombstones.erase(oldNumber) > 0)
+    {
+      revived.insert(oldNumber);
+    }
+  }
+
+  // one pass, since a failed call may have removed many thousands of nodes; this must
+  // happen before new tombstones are added, because evicting a tombstone also erases the
+  // letter of its number
+  if (!revived.empty())
+  {
+    std::erase_if(
+      m_tombstoneOrder, [&](const auto number) { return revived.contains(number); });
+  }
+
+  const auto label = currentRemovalLabel();
+  for (const auto number : replaced)
+  {
+    addTombstone(number, label);
+  }
 }
 
 void McpNodeRegistry::disconnectForTesting()
@@ -463,6 +513,10 @@ void McpNodeRegistry::markSubtreeRemoved(const mdl::Node& node)
     if (m_recording && !m_recording->created.contains(number))
     {
       m_recording->removed.insert(number);
+    }
+    if (m_recording && number < m_recording->firstNumber)
+    {
+      m_recording->removedNodes.emplace_back(&node, number);
     }
   }
 

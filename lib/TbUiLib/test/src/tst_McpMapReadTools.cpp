@@ -21,10 +21,13 @@
 #include <QJsonObject>
 
 #include "McpTestUtils.h"
+#include "base/Color.h"
 #include "mdl/Brush.h"
 #include "mdl/BrushFace.h"
 #include "mdl/BrushNode.h"
 #include "mdl/Entity.h"
+#include "mdl/EntityDefinition.h"
+#include "mdl/EntityDefinitionManager.h"
 #include "mdl/EntityNode.h"
 #include "mdl/GroupNode.h"
 #include "mdl/LayerNode.h"
@@ -37,12 +40,14 @@
 #include "mdl/Map_Nodes.h"
 #include "mdl/Map_Selection.h"
 #include "mdl/PatchNode.h"
+#include "mdl/PropertyDefinition.h"
 #include "mdl/TransactionScope.h"
 #include "mdl/WorldNode.h"
 #include "ui/CatchConfig.h"
 
 #include "vm/vec.h"
 
+#include <algorithm>
 #include <utility>
 
 #include <catch2/catch_test_macros.hpp>
@@ -83,6 +88,33 @@ QJsonObject findById(const QJsonArray& nodes, const QString& id)
   }
   FAIL("node " << id.toStdString() << " not found");
   return {};
+}
+
+void setTestDefinitions(mdl::Map& map)
+{
+  using namespace mdl::PropertyValueTypes;
+  map.entityDefinitionManager().setDefinitions({
+    mdl::EntityDefinition{
+      "light",
+      tb::Color{},
+      "A light.\nIt shines.",
+      {
+        {"light", Integer{300}, "Brightness", ""},
+        {"style", Choice{{{"0", "normal"}, {"1", "flicker"}}, "0"}, "Style", ""},
+        {"spawnflags", Flags{{{1, "Start off", ""}}, 0}, "", ""},
+        {"target", LinkSource{}, "", ""},
+      },
+      mdl::PointEntityDefinition{vm::bbox3d{8.0}, {}, {}},
+    },
+    mdl::EntityDefinition{
+      "info_player_start",
+      tb::Color{},
+      "Player start.",
+      {},
+      mdl::PointEntityDefinition{vm::bbox3d{{-16, -16, -24}, {16, 16, 32}}, {}, {}},
+    },
+    mdl::EntityDefinition{"func_door", tb::Color{}, "A door.", {}},
+  });
 }
 
 } // namespace
@@ -709,6 +741,199 @@ TEST_CASE("McpMapReadTools")
       f.map.undoCommand();
       checkAll();
     }
+  }
+
+  SECTION("list_entity_definitions")
+  {
+    SECTION("without definitions")
+    {
+      const auto result = f.ok("list_entity_definitions");
+      CHECK(result.value("definitions") == QJsonValue{QJsonArray{}});
+      CHECK(compactJson(result.value("warnings")).contains("no entity definitions"));
+    }
+
+    SECTION("lists the definitions sorted by classname")
+    {
+      setTestDefinitions(f.map);
+      const auto result = f.ok("list_entity_definitions");
+      CHECK(
+        result.value("definitions")
+        == QJsonValue{QJsonArray{
+          QJsonObject{
+            {"classname", "func_door"},
+            {"type", "brush"},
+            {"summary", "A door."},
+          },
+          QJsonObject{
+            {"classname", "info_player_start"},
+            {"type", "point"},
+            {"summary", "Player start."},
+            {"point_bounds",
+             QJsonObject{
+               {"min", QJsonArray{-16, -16, -24}}, {"max", QJsonArray{16, 16, 32}}}},
+          },
+          QJsonObject{
+            {"classname", "light"},
+            {"type", "point"},
+            {"summary", "A light."},
+            {"point_bounds",
+             QJsonObject{{"min", QJsonArray{-8, -8, -8}}, {"max", QJsonArray{8, 8, 8}}}},
+          },
+        }});
+      CHECK(result.value("total") == QJsonValue{3});
+
+      const auto lights = f.ok("list_entity_definitions", R"({"filter":"LIGHT*"})");
+      CHECK(lights.value("total") == QJsonValue{1});
+      const auto brushes = f.ok("list_entity_definitions", R"({"type":"brush"})");
+      CHECK(brushes.value("total") == QJsonValue{1});
+      const auto paged = f.ok("list_entity_definitions", R"({"offset":1,"limit":1})");
+      CHECK(paged.value("definitions").toArray().size() == 1);
+      CHECK(paged.value("next_offset") == QJsonValue{2});
+    }
+  }
+
+  SECTION("get_entity_definition")
+  {
+    setTestDefinitions(f.map);
+
+    SECTION("returns the properties")
+    {
+      const auto result = f.ok("get_entity_definition", R"({"classname":"light"})");
+      CHECK(result.value("classname") == QJsonValue{"light"});
+      CHECK(result.value("type") == QJsonValue{"point"});
+      CHECK(result.value("description") == QJsonValue{"A light.\nIt shines."});
+      CHECK(
+        result.value("properties")
+        == QJsonValue{QJsonArray{
+          QJsonObject{
+            {"key", "light"},
+            {"kind", "integer"},
+            {"short_description", "Brightness"},
+            {"long_description", ""},
+            {"read_only", false},
+            {"default", "300"},
+          },
+          QJsonObject{
+            {"key", "style"},
+            {"kind", "choice"},
+            {"short_description", "Style"},
+            {"long_description", ""},
+            {"read_only", false},
+            {"default", "0"},
+            {"choices",
+             QJsonArray{
+               QJsonObject{{"value", "0"}, {"description", "normal"}},
+               QJsonObject{{"value", "1"}, {"description", "flicker"}},
+             }},
+          },
+          QJsonObject{
+            {"key", "spawnflags"},
+            {"kind", "flags"},
+            {"short_description", ""},
+            {"long_description", ""},
+            {"read_only", false},
+            {"flags",
+             QJsonArray{
+               QJsonObject{
+                 {"value", 1},
+                 {"short_description", "Start off"},
+                 {"long_description", ""},
+               },
+             }},
+          },
+          QJsonObject{
+            {"key", "target"},
+            {"kind", "link_source"},
+            {"short_description", ""},
+            {"long_description", ""},
+            {"read_only", false},
+          },
+        }});
+    }
+
+    SECTION("suggests similar classnames")
+    {
+      const auto error = f.error("get_entity_definition", R"({"classname":"lihgt"})");
+      CHECK(error.value("code") == QJsonValue{"definition_not_found"});
+      CHECK(
+        error.value("details").toObject().value("suggestions").toArray().first()
+        == QJsonValue{"light"});
+    }
+  }
+
+  SECTION("list_materials")
+  {
+    populateTestScene(f);
+
+    SECTION("lists the materials used in the map")
+    {
+      const auto result = f.ok("list_materials");
+      const auto items = result.value("items").toArray();
+      auto names = QStringList{};
+      for (const auto& item : items)
+      {
+        names.push_back(item.toObject().value("name").toString());
+      }
+      CHECK(names.contains("wall"));
+      CHECK(names.contains("floor"));
+      CHECK(std::is_sorted(names.begin(), names.end(), [](const auto& a, const auto& b) {
+        return a.toLower() < b.toLower();
+      }));
+      CHECK(result.value("current_material").isString());
+      CHECK(compactJson(result.value("warnings")).contains("no materials are loaded"));
+
+      const auto wall = f.ok("list_materials", R"({"filter":"WA*"})").value("items");
+      CHECK(
+        wall
+        == QJsonValue{QJsonArray{
+          QJsonObject{{"name", "wall"}, {"usage_count", 6}, {"loaded", false}}}});
+    }
+
+    SECTION("counts every face")
+    {
+      f.ok(
+        "set_face_attributes",
+        R"({"faces":[{"brush":"B2","side":"+z"}],"material":"top"})");
+      const auto items = f.ok("list_materials", R"({"filter":"top"})").value("items");
+      CHECK(
+        items
+        == QJsonValue{QJsonArray{
+          QJsonObject{{"name", "top"}, {"usage_count", 1}, {"loaded", false}}}});
+      CHECK(
+        f.ok("list_materials", R"({"filter":"wall","used_only":true})")
+          .value("items")
+          .toArray()[0]
+          .toObject()
+          .value("usage_count")
+        == QJsonValue{5});
+    }
+  }
+
+  SECTION("get_log")
+  {
+    CHECK(f.ok("get_log") == QJsonObject{{"lines", QJsonArray{}}, {"total", 0}});
+
+    auto lines = std::vector<McpLogLine>{};
+    for (auto i = 0; i < 600; ++i)
+    {
+      lines.push_back(
+        {i % 2 == 0 ? LogLevel::Warn : LogLevel::Error, QString::number(i)});
+    }
+    f.doc->logHistory.append(lines);
+
+    const auto result = f.ok("get_log", R"({"limit":2})");
+    CHECK(
+      result
+      == QJsonObject{
+        {"lines",
+         QJsonArray{
+           QJsonObject{{"level", "warn"}, {"text", "598"}},
+           QJsonObject{{"level", "error"}, {"text", "599"}},
+         }},
+        {"total", 500},
+      });
+    CHECK(f.ok("get_log").value("lines").toArray().size() == 100);
+    CHECK(f.err("get_log", R"({"limit":501})") == "invalid_argument");
   }
 }
 

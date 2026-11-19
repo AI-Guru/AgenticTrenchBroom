@@ -544,6 +544,49 @@ TEST_CASE("McpToolFuzz")
       }
     }
 
+    // batches of random operations, with placeholders in their id slots
+    const auto* batch = f.dispatcher.find(u"batch");
+    REQUIRE(batch != nullptr);
+    auto batchable = std::vector<const McpToolDef*>{};
+    for (const auto* tool : f.dispatcher.tools())
+    {
+      if (tool->allowedInBatch)
+      {
+        batchable.push_back(tool);
+      }
+    }
+    auto rng = std::mt19937{uint32_t(state) + 100};
+    const auto random = [&](const size_t n) {
+      return std::uniform_int_distribution<size_t>{0, n - 1}(rng);
+    };
+    static const auto placeholders = QJsonArray{"$0", "$0.1", "$1", "$2.3", "$9"};
+    for (auto i = 0; i < 100; ++i)
+    {
+      auto operations = QJsonArray{};
+      const auto count = 1 + random(4);
+      for (size_t j = 0; j < count; ++j)
+      {
+        const auto* tool = batchable[random(batchable.size())];
+        auto arguments = generator.generate(tool->inputSchema).toObject();
+        const auto properties = tool->inputSchema.value("properties").toObject();
+        for (auto it = properties.begin(); it != properties.end(); ++it)
+        {
+          const auto placeholder =
+            placeholders[qsizetype(random(size_t(placeholders.size())))];
+          if (random(3) == 0 && isNodeIdSchema(it.value().toObject()))
+          {
+            arguments[it.key()] = placeholder;
+          }
+          else if (random(3) == 0 && isNodeIdsSchema(it.value().toObject()))
+          {
+            arguments[it.key()] = QJsonArray{placeholder};
+          }
+        }
+        operations.append(QJsonObject{{"tool", tool->name}, {"arguments", arguments}});
+      }
+      checkCall(f, *batch, {{"operations", operations}});
+    }
+
     tearDownState(f, state);
   }
 }

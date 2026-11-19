@@ -150,6 +150,37 @@ TEST_CASE("McpDeterminism")
     Call{"redo", "{}"},
     Call{"undo", R"({"count":50})"},
     Call{"get_scene_tree", R"({"include_brushes":true})"},
+    // building helpers, CSG, structure and batch tools
+    Call{
+      "create_hollow_box",
+      R"({"inner_bounds":{"min":[256,0,0],"max":[512,256,128]},"wall_thickness":16,
+          "group_name":"room"})"},
+    Call{
+      "create_primitive_brush",
+      R"({"shape":"hollow_cylinder","bounds":{"min":[0,256,0],"max":[64,320,64]},
+          "thickness":8})"},
+    Call{
+      "create_brush_from_points",
+      R"({"points":[[0,0,512],[64,0,512],[0,64,512],[0,0,576]]})"},
+    Call{"query_point", R"({"points":[[32,32,32],[384,128,64],[264,8,8]]})"},
+    Call{"check_brush_overlaps", "{}"},
+    Call{"resize_nodes", R"({"ids":["B2"],"bounds":{"min":[0,0,0],"max":[32,64,64]}})"},
+    Call{"duplicate_nodes", R"({"ids":["E3","B2"],"offset":[0,0,64],"count":2})"},
+    Call{"replace_material", R"({"from":"wall","to":"stone"})"},
+    Call{"csg", R"({"op":"hollow","ids":["B2"]})"},
+    Call{"create_box_brush", R"({"bounds":{"min":[248,96,0],"max":[264,160,96]}})"},
+    Call{"csg_subtract", R"({"subtract_ids":["@selection"]})"},
+    Call{"group_nodes", R"({"ids":["E3"],"name":"lights"})"},
+    Call{"create_layer", R"({"name":"extra","make_current":true})"},
+    Call{"move_to_layer", R"({"ids":["E4"],"layer":"L10"})"},
+    Call{"list_materials", "{}"},
+    Call{
+      "batch",
+      R"({"operations":[{"tool":"create_box_brush","arguments":{"bounds":{"min":[0,0,700],"max":[8,8,708]}}},
+                        {"tool":"snap_vertices","arguments":{"ids":["$0"]}},
+                        {"tool":"delete_nodes","arguments":{"ids":["B999"]}}]})"},
+    Call{"get_scene_tree", R"({"include_brushes":true})"},
+    Call{"get_log", "{}"},
   };
 
   const auto callCount = std::ranges::count_if(

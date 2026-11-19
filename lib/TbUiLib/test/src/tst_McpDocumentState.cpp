@@ -42,6 +42,38 @@ TEST_CASE("McpDocumentState")
   // the history model does not know the command that added the brush
   CHECK_FALSE(doc.history.consistent());
   CHECK(doc.checkpoints.size() == 0);
+  CHECK(doc.logHistory.lines().empty());
+}
+
+TEST_CASE("McpLogHistory")
+{
+  SECTION("append")
+  {
+    auto history = McpLogHistory{};
+    history.append({{LogLevel::Warn, "a"}, {LogLevel::Error, "b"}});
+    REQUIRE(history.lines().size() == 2);
+    CHECK(history.lines().front().text == "a");
+    CHECK(history.lines().back().level == LogLevel::Error);
+
+    // the oldest lines are dropped
+    auto lines = std::vector<McpLogLine>{};
+    for (size_t i = 0; i < McpLogHistory::Capacity; ++i)
+    {
+      lines.push_back({LogLevel::Warn, QString::number(i)});
+    }
+    history.append(lines);
+    CHECK(history.lines().size() == McpLogHistory::Capacity);
+    CHECK(history.lines().front().text == "0");
+    CHECK(history.lines().back().text == QString::number(McpLogHistory::Capacity - 1));
+  }
+
+  SECTION("mcpLogLevelName")
+  {
+    CHECK(mcpLogLevelName(LogLevel::Debug) == "debug");
+    CHECK(mcpLogLevelName(LogLevel::Info) == "info");
+    CHECK(mcpLogLevelName(LogLevel::Warn) == "warn");
+    CHECK(mcpLogLevelName(LogLevel::Error) == "error");
+  }
 }
 
 } // namespace tb::ui

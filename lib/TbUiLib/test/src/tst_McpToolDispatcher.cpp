@@ -302,10 +302,15 @@ TEST_CASE("McpToolDispatcher")
         return McpResult<QJsonObject>{QJsonObject{}};
       }));
 
+      lines.push_back({LogLevel::Warn, "careful"});
       dispatcher.call("probe", {});
       CHECK(seenLog == &lines);
       CHECK(begun == 1);
       CHECK(ended == 1);
+
+      // the captured lines are kept for get_log
+      REQUIRE(f.doc->logHistory.lines().size() == 1);
+      CHECK(f.doc->logHistory.lines().front().text == "careful");
 
       // schema errors are reported before the log is captured
       dispatcher.call("probe", parseObject(R"({"bogus":1})"));
@@ -581,6 +586,8 @@ TEST_CASE("McpToolDispatcher")
         const char* args;
         const char* failingArgs;
         const char* failingCode;
+        /** An optional create_box_brush call that prepares the scene. */
+        const char* setupBox = nullptr;
       };
 
       const auto rows = std::vector<Row>{
@@ -612,14 +619,78 @@ TEST_CASE("McpToolDispatcher")
          R"({"faces":[{"brush":"B2","side":"+z"}],"material":"grass"})",
          R"({"faces":[{"brush":"B2","normal":[1,1,0]}],"material":"grass"})",
          "face_not_found"},
+        {"create_hollow_box",
+         R"({"inner_bounds":{"min":[256,0,0],"max":[512,256,128]},"wall_thickness":16,
+             "group_name":"room"})",
+         R"({"inner_bounds":{"min":[256,0,0],"max":[8128,256,128]},"wall_thickness":16})",
+         "out_of_world_bounds"},
+        {"create_primitive_brush",
+         R"({"shape":"hollow_cylinder","bounds":{"min":[256,0,0],"max":[320,64,64]},
+             "thickness":8})",
+         R"({"shape":"hollow_cylinder","bounds":{"min":[256,0,0],"max":[320,64,64]}})",
+         "invalid_argument"},
+        {"create_brush_from_points",
+         R"({"points":[[256,0,0],[320,0,0],[256,64,0],[256,0,64]]})",
+         R"({"points":[[256,0,0],[320,0,0],[256,64,0],[320,64,0]]})",
+         "geometry_invalid"},
+        {"resize_nodes",
+         R"({"ids":["B2","E3"],"bounds":{"min":[0,0,0],"max":[128,128,128]}})",
+         R"({"ids":["B2","E3"],"bounds":{"min":[0,0,0],"max":[128,128,9000]}})",
+         "out_of_world_bounds"},
+        {"snap_vertices",
+         R"({"ids":["B2"],"to":48})",
+         R"({"ids":["B2","E3"],"to":48})",
+         "wrong_node_type"},
+        {"duplicate_nodes",
+         R"({"ids":["B2","E4"],"offset":[0,256,0],"count":2})",
+         R"({"ids":["B2","E4"],"offset":[0,4096,0],"count":2})",
+         "out_of_world_bounds"},
+        {"replace_material",
+         R"({"from":"wall","to":"brick"})",
+         R"({"from":"wall","to":"br ick"})",
+         "invalid_argument"},
+        {"csg",
+         R"({"op":"merge","ids":["B2","B5"]})",
+         R"({"op":"intersect","ids":["B2","B5"]})",
+         "operation_failed"},
+        {"csg_subtract",
+         R"({"subtract_ids":["B12"]})",
+         R"({"subtract_ids":["B12"],"from_ids":["B5"]})",
+         "operation_failed",
+         R"({"bounds":{"min":[32,32,32],"max":[96,96,96]}})"},
+        {"group_nodes",
+         R"({"ids":["B2","E3"],"name":"stuff"})",
+         R"({"ids":["B2","L10"],"name":"stuff"})",
+         "wrong_node_type"},
+        {"ungroup_nodes",
+         R"({"ids":["G8"]})",
+         R"({"ids":["G8","B2"]})",
+         "wrong_node_type"},
+        {"create_layer", R"({"name":"new"})", R"({"name":""})", "invalid_argument"},
+        {"move_to_layer",
+         R"({"ids":["B2","E4"],"layer":"L10"})",
+         R"({"ids":["E11"],"layer":"L10"})",
+         "operation_failed"},
+        {"batch",
+         R"({"operations":[
+             {"tool":"create_box_brush","arguments":{"bounds":{"min":[256,0,0],"max":[320,64,64]}}},
+             {"tool":"transform_nodes","arguments":{"ids":["$0","B2"],"translate":[0,0,64]}}]})",
+         R"({"operations":[
+             {"tool":"create_box_brush","arguments":{"bounds":{"min":[256,0,0],"max":[320,64,64]}}},
+             {"tool":"transform_nodes","arguments":{"ids":["$0"],"translate":[0,0,90000]}}]})",
+         "out_of_world_bounds"},
       };
 
       for (const auto& row : rows)
       {
         auto g = McpMapToolsFixture{};
         const auto scene = populateTestScene(g);
-        mdl::selectNodes(g.map, {scene.patch});
         CAPTURE(row.tool);
+        if (row.setupBox)
+        {
+          g.ok("create_box_brush", row.setupBox);
+        }
+        mdl::selectNodes(g.map, {scene.patch});
 
         const auto d0 = contentDigest(g.doc->nodes, g.map);
         const auto selection0 = g.map.selection().nodes;
@@ -653,6 +724,186 @@ TEST_CASE("McpToolDispatcher")
         CHECK(contentDigest(g.doc->nodes, g.map) == d1);
         CHECK(g.doc->nodes.verifyBijection());
       }
+    }
+  }
+
+  SECTION("addBatchTool")
+  {
+    const auto scene = populateTestScene(f);
+    mdl::selectNodes(f.map, {scene.patch});
+    const auto selection = f.map.selection().nodes;
+
+    SECTION("placeholders refer to the ids created by earlier operations")
+    {
+      const auto modificationCount = f.map.modificationCount();
+      const auto undoDepth = f.doc->history.undoStack().size();
+
+      const auto result = f.ok("batch", R"({"operations":[
+        {"tool":"create_box_brush","arguments":{"bounds":{"min":[256,0,0],"max":[320,64,64]}}},
+        {"tool":"create_hollow_box","arguments":{"inner_bounds":{"min":[512,0,0],"max":[576,64,64]},
+                                                 "wall_thickness":8}},
+        {"tool":"create_entity","arguments":{"classname":"func_door","brush_ids":["$0","$1.5"]}},
+        {"tool":"get_nodes","arguments":{"ids":["$2"]}}
+      ]})");
+
+      const auto results = result.value("results").toArray();
+      REQUIRE(results.size() == 4);
+      CHECK(results[0].toObject().value("tool") == QJsonValue{"create_box_brush"});
+      CHECK(
+        results[0].toObject().value("result").toObject().value("id")
+        == QJsonValue{"B12"});
+      CHECK(
+        results[0].toObject().value("result").toObject().value("changes")
+        == QJsonValue{QJsonObject{
+          {"created", QJsonArray{"B12"}},
+          {"removed", QJsonArray{}},
+          {"modified", QJsonArray{}},
+        }});
+      CHECK(
+        results[2].toObject().value("result").toObject().value("id")
+        == QJsonValue{"E19"});
+
+      // reading tools see the changes of the earlier operations
+      const auto door = results[3]
+                          .toObject()
+                          .value("result")
+                          .toObject()
+                          .value("nodes")
+                          .toArray()[0]
+                          .toObject();
+      CHECK(door.value("classname") == QJsonValue{"func_door"});
+      CHECK(door.value("child_ids") == QJsonValue{QJsonArray{"B12", "B18"}});
+
+      // one undo step for the whole batch, and the selection is restored
+      CHECK(result.value("undo_label") == QJsonValue{"MCP: Batch"});
+      CHECK(f.doc->history.undoStack().size() == undoDepth + 1);
+      CHECK(f.map.selection().nodes == selection);
+      CHECK(result.value("changes").toObject().value("created").toArray().size() == 8);
+
+      f.map.undoCommand();
+      CHECK(f.map.modificationCount() == modificationCount);
+      CHECK(f.err("get_nodes", R"({"ids":["E19"]})") == "stale_node");
+    }
+
+    SECTION("a failing operation rolls back everything")
+    {
+      const auto digest = contentDigest(f.doc->nodes, f.map);
+      const auto modificationCount = f.map.modificationCount();
+      const auto undoDepth = f.doc->history.undoStack().size();
+
+      const auto error = f.error("batch", R"({"operations":[
+        {"tool":"create_box_brush","arguments":{"bounds":{"min":[256,0,0],"max":[320,64,64]}}},
+        {"tool":"delete_nodes","arguments":{"ids":["B2"]}},
+        {"tool":"transform_nodes","arguments":{"ids":["$0"],"translate":[0,0,90000]}},
+        {"tool":"create_box_brush","arguments":{"bounds":{"min":[512,0,0],"max":[576,64,64]}}}
+      ]})");
+      CHECK(error.value("code") == QJsonValue{"out_of_world_bounds"});
+      const auto details = error.value("details").toObject();
+      CHECK(details.value("failed_index") == QJsonValue{2});
+      CHECK(details.value("tool") == QJsonValue{"transform_nodes"});
+      CHECK(
+        details.value("error").toObject().value("code")
+        == QJsonValue{"out_of_world_bounds"});
+      CHECK(details.value("results").toArray().size() == 2);
+      CHECK(
+        error.value("message").toString().startsWith("operation 2 (transform_nodes)"));
+
+      CHECK(contentDigest(f.doc->nodes, f.map) == digest);
+      CHECK(f.map.modificationCount() == modificationCount);
+      CHECK(f.doc->history.undoStack().size() == undoDepth);
+      CHECK(f.map.selection().nodes == selection);
+      CHECK(f.ok("get_nodes", R"({"ids":["B2"]})").value("nodes").toArray().size() == 1);
+      CHECK(f.doc->nodes.verifyBijection());
+    }
+
+    SECTION("every operation is checked before anything runs")
+    {
+      const auto before = snapshot(f.map);
+      const auto check = [&](const char* args, const char* pointer) {
+        CAPTURE(args);
+        const auto error = f.error("batch", args);
+        CHECK(error.value("code") == QJsonValue{"invalid_argument"});
+        CHECK(error.value("details").toObject().value("pointer") == QJsonValue{pointer});
+        CHECK(snapshot(f.map) == before);
+      };
+
+      check(
+        R"({"operations":[{"tool":"create_box_brush","arguments":{"bounds":{"min":[0,0,0],"max":[8,8,8]}}},
+                          {"tool":"create_box_brush","arguments":{"bounds":{"min":[0,0,0]}}}]})",
+        "/operations/1/arguments/bounds/max");
+      check(
+        R"({"operations":[{"tool":"get_nodes","arguments":{"ids":["B2"]}},{"tool":"bogus"}]})",
+        "/operations/1/tool");
+      check(R"({"operations":[{"tool":"undo"}]})", "/operations/0/tool");
+      check(R"({"operations":[{"tool":"batch"}]})", "/operations/0/tool");
+      check(
+        R"({"operations":[{"tool":"checkpoint_create","arguments":{"name":"a"}}]})",
+        "/operations/0/tool");
+      check(
+        R"({"operations":[{"tool":"get_nodes","arguments":{"ids":["$0"]}}]})",
+        "/operations/0/arguments/ids/0");
+      check(
+        R"({"operations":[{"tool":"get_nodes","arguments":{"ids":["B2"]}},
+                          {"tool":"get_nodes","arguments":{"ids":["$2"]}}]})",
+        "/operations/1/arguments/ids/0");
+      check(R"({"operations":[]})", "/operations");
+    }
+
+    SECTION("placeholders out of range")
+    {
+      const auto digest = contentDigest(f.doc->nodes, f.map);
+      const auto error = f.error("batch", R"({"operations":[
+        {"tool":"create_box_brush","arguments":{"bounds":{"min":[256,0,0],"max":[320,64,64]}}},
+        {"tool":"get_nodes","arguments":{"ids":["$0.1"]}}
+      ]})");
+      CHECK(error.value("code") == QJsonValue{"invalid_argument"});
+      CHECK(error.value("details").toObject().value("failed_index") == QJsonValue{1});
+      CHECK(contentDigest(f.doc->nodes, f.map) == digest);
+    }
+
+    SECTION("strings that only look like placeholders are kept")
+    {
+      const auto result = f.ok("batch", R"({"operations":[
+        {"tool":"set_entity_properties","arguments":{"ids":["E3"],"set":{"message":"$x","cost":"$ 5"}}}
+      ]})");
+      const auto entity = result.value("results")
+                            .toArray()[0]
+                            .toObject()
+                            .value("result")
+                            .toObject()
+                            .value("entities")
+                            .toArray()[0]
+                            .toObject();
+      CHECK(compactJson(entity).contains(R"({"key":"message","value":"$x"})"));
+      CHECK(compactJson(entity).contains(R"({"key":"cost","value":"$ 5"})"));
+    }
+
+    SECTION("selection changes are visible to later operations")
+    {
+      const auto result = f.ok("batch", R"({"operations":[
+        {"tool":"select_nodes","arguments":{"ids":["B2"]}},
+        {"tool":"transform_nodes","arguments":{"ids":["@selection"],"translate":[0,0,16]}}
+      ]})");
+      CHECK(
+        result.value("results").toArray()[1].toObject().value("result").toObject().value(
+          "bounds")
+        == QJsonValue{
+          QJsonObject{{"min", QJsonArray{0, 0, 16}}, {"max", QJsonArray{64, 64, 80}}}});
+      // but the user's selection is restored afterwards
+      CHECK(f.map.selection().nodes == selection);
+    }
+
+    SECTION("warnings of operations are returned with their results")
+    {
+      const auto result = f.ok("batch", R"({"operations":[
+        {"tool":"create_box_brush","arguments":{"bounds":{"min":[256,0,0],"max":[320.5,64,64]}}}
+      ]})");
+      CHECK(result.value("results")
+              .toArray()[0]
+              .toObject()
+              .value("result")
+              .toObject()
+              .contains("warnings"));
     }
   }
 

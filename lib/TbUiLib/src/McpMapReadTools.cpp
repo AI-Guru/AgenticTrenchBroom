@@ -17,6 +17,7 @@
  along with TrenchBroom. If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include "gl/Material.h"
 #include "gl/MaterialManager.h"
 #include "mdl/BezierPatch.h"
 #include "mdl/Brush.h"
@@ -40,6 +41,7 @@
 #include "mdl/MapTextEncoding.h"
 #include "mdl/Map_World.h"
 #include "mdl/PatchNode.h"
+#include "mdl/PropertyDefinition.h"
 #include "mdl/Selection.h"
 #include "mdl/SoftMapBounds.h"
 #include "mdl/WorldNode.h"
@@ -55,7 +57,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <map>
+#include <type_traits>
 #include <unordered_set>
+#include <variant>
 
 namespace tb::ui
 {
@@ -974,6 +979,425 @@ McpToolDef getSelectionTool()
   };
 }
 
+// list_entity_definitions
+
+constexpr auto SummaryLength = 200;
+constexpr auto MaxSuggestions = size_t(5);
+
+QString definitionTypeName(const mdl::EntityDefinition& definition)
+{
+  return mdl::getType(definition) == mdl::EntityDefinitionType::Point
+           ? QStringLiteral("point")
+           : QStringLiteral("brush");
+}
+
+/** The definitions sorted by classname. */
+std::vector<const mdl::EntityDefinition*> sortedDefinitions(const mdl::Map& map)
+{
+  auto result = std::vector<const mdl::EntityDefinition*>{};
+  for (const auto& definition : map.entityDefinitionManager().definitions())
+  {
+    result.push_back(&definition);
+  }
+  std::ranges::stable_sort(
+    result, [](const auto* lhs, const auto* rhs) { return lhs->name < rhs->name; });
+  return result;
+}
+
+QString summaryOf(const mdl::Map& map, const std::string& description)
+{
+  auto summary = toUnicode(map, description).section(u'\n', 0, 0).trimmed();
+  if (summary.size() > SummaryLength)
+  {
+    summary = summary.left(SummaryLength - 3) + "...";
+  }
+  return summary;
+}
+
+McpResult<QJsonObject> listEntityDefinitions(
+  McpCallContext& context, const QJsonObject& args)
+{
+  const auto& map = context.doc.map;
+  const auto filter = args.value("filter").toString("*");
+  const auto type = args.value("type").toString();
+
+  auto items = QJsonArray{};
+  for (const auto* definition : sortedDefinitions(map))
+  {
+    const auto classname = toUnicode(map, definition->name);
+    const auto typeName = definitionTypeName(*definition);
+    if (!globMatch(filter, classname) || (!type.isEmpty() && type != typeName))
+    {
+      continue;
+    }
+    auto item = QJsonObject{
+      {"classname", classname},
+      {"type", typeName},
+      {"summary", summaryOf(map, definition->description)},
+    };
+    if (const auto* point = mdl::getPointEntityDefinition(definition))
+    {
+      item["point_bounds"] = toJson(point->bounds);
+    }
+    items.append(item);
+  }
+
+  auto result = QJsonObject{};
+  result["definitions"] = page(items, args, result);
+  if (map.entityDefinitionManager().definitions().empty())
+  {
+    context.warnings.push_back(
+      "no entity definitions are loaded; check the game configuration");
+  }
+  return result;
+}
+
+McpToolDef listEntityDefinitionsTool()
+{
+  auto properties = QJsonObject{
+    {"filter",
+     schema::string(1, 256, "classname glob with * and ?, e.g. light* (default *)")},
+    {"type", schema::stringEnum({"point", "brush"})},
+  };
+  schema::addPaging(properties);
+
+  return {
+    .name = "list_entity_definitions",
+    .title = "List Entity Definitions",
+    .description =
+      "Lists the entity classes of the game (classname, point or brush, first line of "
+      "the description), sorted by classname. Use get_entity_definition for the "
+      "properties of one class.",
+    .inputSchema = schema::object(properties),
+    .kind = McpToolKind::Read,
+    .annotations = ReadOnly,
+    .allowedInBatch = true,
+    .run = listEntityDefinitions,
+  };
+}
+
+// get_entity_definition
+
+size_t editDistance(const QString& lhs, const QString& rhs)
+{
+  auto previous = std::vector<size_t>(size_t(rhs.size()) + 1);
+  auto current = std::vector<size_t>(size_t(rhs.size()) + 1);
+  for (size_t j = 0; j < previous.size(); ++j)
+  {
+    previous[j] = j;
+  }
+  for (qsizetype i = 0; i < lhs.size(); ++i)
+  {
+    current[0] = size_t(i) + 1;
+    for (qsizetype j = 0; j < rhs.size(); ++j)
+    {
+      const auto cost = lhs[i].toLower() == rhs[j].toLower() ? 0u : 1u;
+      current[size_t(j) + 1] = std::min(
+        {previous[size_t(j) + 1] + 1,
+         current[size_t(j)] + 1,
+         previous[size_t(j)] + cost});
+    }
+    std::swap(previous, current);
+  }
+  return previous.back();
+}
+
+QString propertyKind(const mdl::PropertyValueType& valueType)
+{
+  return std::visit(
+    kdl::overload(
+      [](const mdl::PropertyValueTypes::LinkTarget&) { return "link_target"; },
+      [](const mdl::PropertyValueTypes::LinkSource&) { return "link_source"; },
+      [](const mdl::PropertyValueTypes::String&) { return "string"; },
+      [](const mdl::PropertyValueTypes::Boolean&) { return "boolean"; },
+      [](const mdl::PropertyValueTypes::Integer&) { return "integer"; },
+      [](const mdl::PropertyValueTypes::Float&) { return "float"; },
+      [](const mdl::PropertyValueTypes::Choice&) { return "choice"; },
+      [](const mdl::PropertyValueTypes::Flags&) { return "flags"; },
+      [](const mdl::PropertyValueTypes::Origin&) { return "origin"; },
+      [](const mdl::PropertyValueTypes::Input&) { return "input"; },
+      [](const mdl::PropertyValueTypes::Output&) { return "output"; },
+      [](const auto& color) -> const char* {
+        if constexpr (requires { typename std::decay_t<decltype(color)>::Type; })
+        {
+          return "color";
+        }
+        else
+        {
+          return "unknown";
+        }
+      }),
+    valueType);
+}
+
+QJsonObject propertyJson(const mdl::Map& map, const mdl::PropertyDefinition& definition)
+{
+  auto result = QJsonObject{
+    {"key", toUnicode(map, definition.key)},
+    {"kind", propertyKind(definition.valueType)},
+    {"short_description", toUnicode(map, definition.shortDescription)},
+    {"long_description", toUnicode(map, definition.longDescription)},
+    {"read_only", definition.readOnly},
+  };
+  if (const auto defaultValue = mdl::PropertyDefinition::defaultValue(definition))
+  {
+    result["default"] = toUnicode(map, *defaultValue);
+  }
+  if (
+    const auto* choice =
+      std::get_if<mdl::PropertyValueTypes::Choice>(&definition.valueType))
+  {
+    auto choices = QJsonArray{};
+    for (const auto& option : choice->options)
+    {
+      choices.append(QJsonObject{
+        {"value", toUnicode(map, option.value)},
+        {"description", toUnicode(map, option.description)},
+      });
+    }
+    result["choices"] = choices;
+  }
+  if (
+    const auto* flags =
+      std::get_if<mdl::PropertyValueTypes::Flags>(&definition.valueType))
+  {
+    auto flagsJson = QJsonArray{};
+    for (const auto& flag : flags->flags)
+    {
+      flagsJson.append(QJsonObject{
+        {"value", flag.value},
+        {"short_description", toUnicode(map, flag.shortDescription)},
+        {"long_description", toUnicode(map, flag.longDescription)},
+      });
+    }
+    result["flags"] = flagsJson;
+  }
+  return result;
+}
+
+McpResult<QJsonObject> getEntityDefinition(
+  McpCallContext& context, const QJsonObject& args)
+{
+  const auto& map = context.doc.map;
+  const auto classname = args.value("classname").toString();
+
+  const auto* definition =
+    map.entityDefinitionManager().definition(fromUnicode(map, classname));
+  if (!definition)
+  {
+    auto candidates = std::vector<std::pair<size_t, QString>>{};
+    for (const auto* other : sortedDefinitions(map))
+    {
+      const auto name = toUnicode(map, other->name);
+      candidates.emplace_back(editDistance(classname, name), name);
+    }
+    std::ranges::stable_sort(
+      candidates, [](const auto& lhs, const auto& rhs) { return lhs.first < rhs.first; });
+
+    auto suggestions = QJsonArray{};
+    for (size_t i = 0; i < std::min(candidates.size(), MaxSuggestions); ++i)
+    {
+      suggestions.append(candidates[i].second);
+    }
+    return toolError(
+      "definition_not_found",
+      QString{"there is no entity definition for '%1'"}.arg(classname.left(256)),
+      "call list_entity_definitions for the known classnames",
+      {{"classname", classname.left(256)}, {"suggestions", suggestions}});
+  }
+
+  auto properties = QJsonArray{};
+  for (const auto& propertyDefinition : definition->propertyDefinitions)
+  {
+    properties.append(propertyJson(map, propertyDefinition));
+  }
+
+  auto result = QJsonObject{
+    {"classname", toUnicode(map, definition->name)},
+    {"type", definitionTypeName(*definition)},
+    {"description", toUnicode(map, definition->description)},
+    {"properties", properties},
+  };
+  if (const auto* point = mdl::getPointEntityDefinition(definition))
+  {
+    result["point_bounds"] = toJson(point->bounds);
+  }
+  return result;
+}
+
+McpToolDef getEntityDefinitionTool()
+{
+  return {
+    .name = "get_entity_definition",
+    .title = "Get Entity Definition",
+    .description =
+      "Returns the description and the properties (kind, default, choices, spawnflags) "
+      "of the given entity class.",
+    .inputSchema = schema::object(
+      {{"classname", schema::string(1, 256, "e.g. light or func_door")}}, {"classname"}),
+    .kind = McpToolKind::Read,
+    .annotations = ReadOnly,
+    .allowedInBatch = true,
+    .run = getEntityDefinition,
+  };
+}
+
+// list_materials
+
+McpResult<QJsonObject> listMaterials(McpCallContext& context, const QJsonObject& args)
+{
+  const auto& map = context.doc.map;
+  const auto filter = args.value("filter").toString("*");
+  const auto usedOnly = args.value("used_only").toBool(false);
+
+  struct Item
+  {
+    std::optional<QString> collection;
+    qint64 usageCount = 0;
+    bool loaded = false;
+  };
+  // keyed by lower case name, since material names are case insensitive
+  auto items = std::map<QString, std::pair<QString, Item>>{};
+
+  for (const auto* material : map.materialManager().materials())
+  {
+    const auto name = toUnicode(map, material->name());
+    auto& [displayName, item] = items[name.toLower()];
+    displayName = name;
+    item.loaded = true;
+    if (!material->collectionName().empty())
+    {
+      item.collection = toUnicode(map, material->collectionName());
+    }
+  }
+
+  const auto use = [&](const std::string& materialName) {
+    const auto name = toUnicode(map, materialName);
+    auto& [displayName, item] = items[name.toLower()];
+    if (displayName.isEmpty())
+    {
+      displayName = name;
+    }
+    ++item.usageCount;
+  };
+  const auto visit = [&](const auto& self, const mdl::Node& node) -> void {
+    if (const auto* brushNode = dynamic_cast<const mdl::BrushNode*>(&node))
+    {
+      for (const auto& face : brushNode->brush().faces())
+      {
+        use(face.materialName());
+      }
+    }
+    else if (const auto* patchNode = dynamic_cast<const mdl::PatchNode*>(&node))
+    {
+      use(patchNode->patch().materialName());
+    }
+    for (const auto* child : node.children())
+    {
+      self(self, *child);
+    }
+  };
+  visit(visit, map.worldNode());
+
+  auto itemsJson = QJsonArray{};
+  for (const auto& [key, entry] : items)
+  {
+    const auto& [name, item] = entry;
+    if (!globMatch(filter, name) || (usedOnly && item.usageCount == 0))
+    {
+      continue;
+    }
+    auto itemJson = QJsonObject{
+      {"name", name},
+      {"usage_count", item.usageCount},
+      {"loaded", item.loaded},
+    };
+    if (item.collection)
+    {
+      itemJson["collection"] = *item.collection;
+    }
+    itemsJson.append(itemJson);
+  }
+
+  auto result = QJsonObject{
+    {"current_material", toUnicode(map, map.currentMaterialName())},
+  };
+  result["items"] = page(itemsJson, args, result);
+  if (map.materialManager().materials().empty())
+  {
+    context.warnings.push_back(
+      "no materials are loaded; they may still be loading, or the game path is not "
+      "configured");
+  }
+  return result;
+}
+
+McpToolDef listMaterialsTool()
+{
+  auto properties = QJsonObject{
+    {"filter", schema::string(1, 256, "name glob with * and ?, e.g. *floor*")},
+    {"used_only", schema::boolean("only materials used by brush faces or patches")},
+  };
+  schema::addPaging(properties);
+
+  return {
+    .name = "list_materials",
+    .title = "List Materials",
+    .description =
+      "Lists the loaded materials and the materials used in the map, sorted by name, "
+      "with the number of faces using them. Materials load asynchronously, so the list "
+      "may be incomplete right after opening a map.",
+    .inputSchema = schema::object(properties),
+    .kind = McpToolKind::Read,
+    .annotations = ReadOnly,
+    .allowedInBatch = true,
+    .run = listMaterials,
+  };
+}
+
+// get_log
+
+constexpr auto DefaultLogLines = 100;
+
+McpResult<QJsonObject> getLog(McpCallContext& context, const QJsonObject& args)
+{
+  const auto& lines = context.doc.logHistory.lines();
+  const auto limit = std::min(sizeArgument(args, "limit", DefaultLogLines), lines.size());
+
+  auto result = QJsonArray{};
+  for (auto i = lines.size() - limit; i < lines.size(); ++i)
+  {
+    result.append(QJsonObject{
+      {"level", mcpLogLevelName(lines[i].level)},
+      {"text", lines[i].text},
+    });
+  }
+  return QJsonObject{
+    {"lines", result},
+    {"total", qint64(lines.size())},
+  };
+}
+
+McpToolDef getLogTool()
+{
+  return {
+    .name = "get_log",
+    .title = "Get Log",
+    .description =
+      "Returns the most recent warnings and errors logged during MCP calls on this "
+      "document, oldest first (at most 500 are kept).",
+    .inputSchema = schema::object({
+      {"limit",
+       schema::integer(
+         1, double(McpLogHistory::Capacity), "number of lines (default 100)")},
+    }),
+    .kind = McpToolKind::Read,
+    .annotations = ReadOnly,
+    .allowedInBatch = true,
+    .run = getLog,
+  };
+}
+
 } // namespace
 
 void registerMcpMapReadTools(McpToolDispatcher& dispatcher)
@@ -984,6 +1408,10 @@ void registerMcpMapReadTools(McpToolDispatcher& dispatcher)
   dispatcher.add(getBrushGeometryTool());
   dispatcher.add(findNodesTool());
   dispatcher.add(getSelectionTool());
+  dispatcher.add(listEntityDefinitionsTool());
+  dispatcher.add(getEntityDefinitionTool());
+  dispatcher.add(listMaterialsTool());
+  dispatcher.add(getLogTool());
 }
 
 } // namespace tb::ui

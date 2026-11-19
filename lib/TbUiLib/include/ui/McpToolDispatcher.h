@@ -111,6 +111,13 @@ public:
    */
   void add(McpToolDef def);
 
+  /**
+   * Adds the batch tool, which runs tools of this dispatcher that are allowed in batches
+   * in one transaction. Tools are looked up when the batch runs, so they may be added
+   * later.
+   */
+  void addBatchTool();
+
   /** Returns the tool with the given name, or nullptr. */
   const McpToolDef* find(QStringView name) const;
 
@@ -134,6 +141,10 @@ private:
     const McpToolDef& def, McpDocumentState& doc, const QJsonObject& args);
   mcp::ToolResult runHistory(
     const McpToolDef& def, McpDocumentState& doc, const QJsonObject& args);
+  McpResult<QJsonObject> runBatch(McpCallContext& context, const QJsonObject& args);
+  /** Runs an operation of a batch inside the batch's transaction. */
+  McpResult<QJsonObject> runNested(
+    const McpToolDef& def, McpCallContext& context, const QJsonObject& args);
 
   mcp::ToolRegistry& m_registry;
   McpDocumentProvider m_provider;

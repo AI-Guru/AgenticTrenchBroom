@@ -608,6 +608,393 @@ TEST_CASE("McpMapCreateTools")
       CHECK(snapshot(f.map) == before);
     }
   }
+
+  SECTION("create_hollow_box")
+  {
+    const auto wallBounds = [&](const QString& id) {
+      return f.ok("get_nodes", QJsonObject{{"ids", QJsonArray{id}}})
+        .value("nodes")
+        .toArray()[0]
+        .toObject()
+        .value("bounds");
+    };
+    const auto box = [](const QJsonArray& min, const QJsonArray& max) {
+      return QJsonValue{QJsonObject{{"min", min}, {"max", max}}};
+    };
+    const auto solid = [&](const QJsonArray& point) {
+      return f.ok("query_point", QJsonObject{{"points", QJsonArray{QJsonValue{point}}}})
+        .value("results")
+        .toArray()[0]
+        .toObject()
+        .value("inside_solid")
+        .toBool();
+    };
+
+    SECTION("creates six walls that do not overlap")
+    {
+      const auto result = f.ok(
+        "create_hollow_box",
+        R"({"inner_bounds":{"min":[0,0,0],"max":[256,128,96]},"wall_thickness":16,
+            "material":"wall","side_materials":{"-z":"floor"}})");
+      CHECK(
+        result.value("walls")
+        == QJsonValue{QJsonObject{
+          {"+x", "B2"},
+          {"-x", "B3"},
+          {"+y", "B4"},
+          {"-y", "B5"},
+          {"+z", "B6"},
+          {"-z", "B7"}}});
+      CHECK(result.value("undo_label") == QJsonValue{"MCP: Create Hollow Box"});
+      CHECK(
+        result.value("outer_bounds")
+        == box(QJsonArray{-16, -16, -16}, QJsonArray{272, 144, 112}));
+      CHECK(result.value("changes").toObject().value("created").toArray().size() == 6);
+      CHECK(!result.contains("group"));
+
+      // the exact layout: z slabs span the outer box, x walls the outer y and the inner
+      // z, y walls the inner x and z
+      CHECK(wallBounds("B2") == box({256, -16, 0}, {272, 144, 96}));
+      CHECK(wallBounds("B3") == box({-16, -16, 0}, {0, 144, 96}));
+      CHECK(wallBounds("B4") == box({0, 128, 0}, {256, 144, 96}));
+      CHECK(wallBounds("B5") == box({0, -16, 0}, {256, 0, 96}));
+      CHECK(wallBounds("B6") == box({-16, -16, 96}, {272, 144, 112}));
+      CHECK(wallBounds("B7") == box({-16, -16, -16}, {272, 144, 0}));
+
+      const auto nodes =
+        f.ok("get_nodes", R"({"ids":["B6","B7"]})").value("nodes").toArray();
+      CHECK(nodes[0].toObject().value("materials") == QJsonValue{QJsonArray{"wall"}});
+      CHECK(nodes[1].toObject().value("materials") == QJsonValue{QJsonArray{"floor"}});
+
+      const auto overlaps = f.ok("check_brush_overlaps");
+      CHECK(overlaps.value("pairs") == QJsonValue{QJsonArray{}});
+      CHECK(overlaps.value("brush_count") == QJsonValue{6});
+
+      CHECK_FALSE(solid({128, 64, 48}));
+      CHECK(solid({264, 64, 48}));
+      CHECK(solid({-8, -8, -8}));
+      CHECK(solid({128, 64, 104}));
+      CHECK_FALSE(solid({300, 64, 48}));
+
+      // the walls enclose the inner box exactly
+      auto volume = 0.0;
+      for (const auto& brush :
+           f.ok("get_brush_geometry", R"({"ids":["B2","B3","B4","B5","B6","B7"]})")
+             .value("brushes")
+             .toArray())
+      {
+        volume += brush.toObject().value("volume").toDouble();
+      }
+      CHECK(volume == 288.0 * 160.0 * 128.0 - 256.0 * 128.0 * 96.0);
+    }
+
+    SECTION("omits sides and groups the walls")
+    {
+      const auto result = f.ok(
+        "create_hollow_box",
+        R"({"inner_bounds":{"min":[0,0,0],"max":[64,64,64]},"wall_thickness":8,
+            "omit_sides":["+z","+x"],"group_name":"room"})");
+      CHECK(
+        result.value("walls")
+        == QJsonValue{
+          QJsonObject{{"-x", "B2"}, {"+y", "B3"}, {"-y", "B4"}, {"-z", "B5"}}});
+      CHECK(result.value("group") == QJsonValue{"G6"});
+
+      const auto group =
+        f.ok("get_nodes", R"({"ids":["G6"]})").value("nodes").toArray()[0].toObject();
+      CHECK(group.value("name") == QJsonValue{"room"});
+      CHECK(group.value("child_ids") == QJsonValue{QJsonArray{"B2", "B3", "B4", "B5"}});
+      // the walls are grouped in the same undo step and the selection is restored
+      CHECK(f.map.selection().nodes.empty());
+      REQUIRE(f.map.undoCommandName() != nullptr);
+      CHECK(*f.map.undoCommandName() == "MCP: Create Hollow Box");
+
+      CHECK_FALSE(solid({68, 32, 32}));
+      CHECK_FALSE(solid({32, 32, 68}));
+      CHECK(solid({-4, 32, 32}));
+      CHECK(f.ok("check_brush_overlaps").value("pairs") == QJsonValue{QJsonArray{}});
+    }
+
+    SECTION("errors")
+    {
+      const auto scene = populateTestScene(f);
+      const auto before = snapshot(f.map);
+      const auto err = [&](const char* args) { return f.err("create_hollow_box", args); };
+
+      CHECK(
+        err(R"({"inner_bounds":{"min":[0,0,0],"max":[64,64,64]},"wall_thickness":0})")
+        == "invalid_argument");
+      CHECK(
+        err(R"({"inner_bounds":{"min":[0,0,0],"max":[64,0,64]},"wall_thickness":8})")
+        == "invalid_argument");
+      CHECK(
+        err(R"({"inner_bounds":{"min":[0,0,0],"max":[32768,64,64]},"wall_thickness":8})")
+        == "out_of_world_bounds");
+      CHECK(
+        err(R"({"inner_bounds":{"min":[0,0,0],"max":[64,64,64]},"wall_thickness":8,
+                "omit_sides":["+x","+x"]})")
+        == "invalid_argument");
+      CHECK(
+        err(R"({"inner_bounds":{"min":[0,0,0],"max":[64,64,64]},"wall_thickness":8,
+                "omit_sides":["+x","-x","+y","-y","+z","-z"]})")
+        == "invalid_argument");
+      CHECK(
+        err(R"({"inner_bounds":{"min":[0,0,0],"max":[64,64,64]},"wall_thickness":8,
+                "material":"a b"})")
+        == "invalid_argument");
+      CHECK(
+        err(R"({"inner_bounds":{"min":[0,0,0],"max":[64,64,64]},"wall_thickness":8,
+                "group_name":"a\"b"})")
+        == "invalid_argument");
+      CHECK(
+        err(R"({"inner_bounds":{"min":[0,0,0],"max":[64,64,64]},"wall_thickness":8,
+                "parent":"E4","group_name":"room"})")
+        == "invalid_argument");
+      CHECK(
+        err(R"({"inner_bounds":{"min":[0,0,0],"max":[64,64,64]},"wall_thickness":8,
+                "parent":"E3"})")
+        == "invalid_parent");
+      CHECK(snapshot(f.map) == before);
+      (void)scene;
+    }
+  }
+
+  SECTION("create_primitive_brush")
+  {
+    const auto geometry = [&](const QJsonArray& ids) {
+      return f
+        .ok("get_brush_geometry", QJsonObject{{"ids", ids}, {"include_faces", false}})
+        .value("brushes")
+        .toArray();
+    };
+
+    SECTION("creates single brush shapes")
+    {
+      struct Row
+      {
+        const char* args;
+        qint64 faceCount;
+      };
+      const auto rows = std::vector<Row>{
+        {R"({"shape":"cylinder","bounds":{"min":[0,0,0],"max":[64,64,128]}})", 10},
+        {R"({"shape":"cylinder","bounds":{"min":[0,0,0],"max":[64,64,128]},"sides":12,
+             "alignment":"vertex"})",
+         14},
+        {R"({"shape":"cylinder","bounds":{"min":[0,0,0],"max":[128,64,64]},"axis":"x"})",
+         10},
+        {R"({"shape":"cone","bounds":{"min":[0,0,0],"max":[64,64,128]},"sides":12})", 13},
+        {R"({"shape":"uv_sphere","bounds":{"min":[0,0,0],"max":[64,64,64]}})", 0},
+        {R"({"shape":"ico_sphere","bounds":{"min":[0,0,0],"max":[64,64,64]}})", 0},
+        {R"({"shape":"cylinder","bounds":{"min":[0,0,0],"max":[64,64,64]},
+             "alignment":"scalable","precision":1})",
+         0},
+      };
+      for (const auto& row : rows)
+      {
+        CAPTURE(row.args);
+        auto g = McpMapToolsFixture{};
+        const auto result = g.ok("create_primitive_brush", row.args);
+        REQUIRE(result.value("ids") == QJsonValue{QJsonArray{"B2"}});
+        CHECK(result.value("undo_label") == QJsonValue{"MCP: Create Primitive Brush"});
+
+        const auto brush = g.ok("get_brush_geometry", R"({"ids":["B2"]})")
+                             .value("brushes")
+                             .toArray()[0]
+                             .toObject();
+        if (row.faceCount > 0)
+        {
+          CHECK(brush.value("face_count") == QJsonValue{row.faceCount});
+        }
+        CHECK(brush.value("valid").toObject().value("closed") == QJsonValue{true});
+
+        // the shape stays within the bounds
+        const auto args = parseObject(row.args);
+        const auto bounds = brush.value("bounds").toObject();
+        const auto requested = args.value("bounds").toObject();
+        for (qsizetype i = 0; i < 3; ++i)
+        {
+          CHECK(
+            bounds.value("min").toArray()[i].toDouble()
+            >= requested.value("min").toArray()[i].toDouble() - 1e-6);
+          CHECK(
+            bounds.value("max").toArray()[i].toDouble()
+            <= requested.value("max").toArray()[i].toDouble() + 1e-6);
+        }
+      }
+    }
+
+    SECTION("edge aligned cylinders fill their bounds")
+    {
+      f.ok(
+        "create_primitive_brush",
+        R"({"shape":"cylinder","bounds":{"min":[0,0,0],"max":[64,64,128]}})");
+      CHECK(
+        geometry({"B2"})[0].toObject().value("bounds")
+        == QJsonValue{
+          QJsonObject{{"min", QJsonArray{0, 0, 0}}, {"max", QJsonArray{64, 64, 128}}}});
+    }
+
+    SECTION("creates hollow cylinders and arches from several brushes")
+    {
+      const auto cylinder = f.ok(
+        "create_primitive_brush",
+        R"({"shape":"hollow_cylinder","bounds":{"min":[0,0,0],"max":[128,128,64]},
+            "sides":8,"thickness":16,"material":"stone"})");
+      CHECK(cylinder.value("ids").toArray().size() == 8);
+      CHECK(f.ok("check_brush_overlaps").value("pairs") == QJsonValue{QJsonArray{}});
+      // the center is empty, the ring is solid
+      const auto points = f.ok("query_point", R"({"points":[[64,64,32],[4,64,32]]})")
+                            .value("results")
+                            .toArray();
+      CHECK(points[0].toObject().value("inside_solid") == QJsonValue{false});
+      CHECK(points[1].toObject().value("inside_solid") == QJsonValue{true});
+
+      const auto arch = f.ok(
+        "create_primitive_brush",
+        R"({"shape":"arch","bounds":{"min":[256,0,0],"max":[384,32,64]},"axis":"y",
+            "thickness":16})");
+      CHECK(arch.value("ids").toArray().size() >= 2);
+      for (const auto& brush : geometry(arch.value("ids").toArray()))
+      {
+        CHECK(
+          brush.toObject().value("valid").toObject().value("closed") == QJsonValue{true});
+      }
+    }
+
+    SECTION("small primitives with many sides do not crash")
+    {
+      // regression: the vertices of a 1 unit cylinder with 64 sides are so close that
+      // the convex hull treated three of them as colinear and violated a contract
+      for (const auto* args : {
+             R"({"shape":"cylinder","bounds":{"min":[0,0,0],"max":[1,1,1]},"axis":"x",
+                 "sides":64})",
+             R"({"shape":"cylinder","bounds":{"min":[0.5,0,-3],"max":[2.5,1000,1]},
+                 "axis":"x","alignment":"scalable","precision":3})",
+           })
+      {
+        CAPTURE(args);
+        const auto result = f.call("create_primitive_brush", args);
+        if (!result.value("isError").toBool())
+        {
+          CHECK(f.doc->nodes.verifyBijection());
+        }
+      }
+    }
+
+    SECTION("warns about non-integer vertices")
+    {
+      const auto result = f.ok(
+        "create_primitive_brush",
+        R"({"shape":"cylinder","bounds":{"min":[0,0,0],"max":[64,64,64]},"sides":7})");
+      CHECK(compactJson(result.value("warnings")).contains("snap_vertices"));
+    }
+
+    SECTION("errors")
+    {
+      const auto before = snapshot(f.map);
+      const auto err = [&](const char* args) {
+        return f.err("create_primitive_brush", args);
+      };
+      CHECK(
+        err(R"({"shape":"hollow_cylinder","bounds":{"min":[0,0,0],"max":[64,64,64]}})")
+        == "invalid_argument");
+      // regression: BrushBuilder::createUvSphere reads past the end of its ring tables
+      // for scalable circles with a precision above 0
+      CHECK(
+        err(R"({"shape":"uv_sphere","bounds":{"min":[0,0,0],"max":[64,64,64]},
+                "alignment":"scalable","precision":1})")
+        == "invalid_argument");
+      CHECK(
+        err(R"({"shape":"hollow_cylinder","bounds":{"min":[0,0,0],"max":[64,64,64]},
+                "thickness":32})")
+        == "invalid_argument");
+      CHECK(
+        err(R"({"shape":"arch","bounds":{"min":[0,0,0],"max":[64,64,64]},
+                "thickness":0})")
+        == "invalid_argument");
+      CHECK(
+        err(R"({"shape":"cylinder","bounds":{"min":[0,0,0],"max":[64,64,0.5]}})")
+        == "invalid_argument");
+      CHECK(
+        err(R"({"shape":"cylinder","bounds":{"min":[0,0,0],"max":[64,64,64]},"sides":2})")
+        == "invalid_argument");
+      CHECK(
+        err(R"({"shape":"cylinder","bounds":{"min":[0,0,0],"max":[64,64,64]},
+                "alignment":"scalable","precision":4})")
+        == "invalid_argument");
+      CHECK(
+        err(R"({"shape":"torus","bounds":{"min":[0,0,0],"max":[64,64,64]}})")
+        == "invalid_argument");
+      CHECK(
+        err(R"({"shape":"cone","bounds":{"min":[0,0,0],"max":[64,64,64000]}})")
+        == "out_of_world_bounds");
+      CHECK(snapshot(f.map) == before);
+    }
+  }
+
+  SECTION("create_brush_from_points")
+  {
+    SECTION("creates the convex hull")
+    {
+      const auto result = f.ok(
+        "create_brush_from_points",
+        R"({"points":[[0,0,0],[64,0,0],[0,64,0],[0,0,64],[8,8,8]],"material":"rock"})");
+      CHECK(result.value("id") == QJsonValue{"B2"});
+      CHECK(result.value("vertex_count") == QJsonValue{4});
+      CHECK(result.value("face_count") == QJsonValue{4});
+      CHECK(result.value("undo_label") == QJsonValue{"MCP: Create Brush From Points"});
+
+      const auto brush = f.ok("get_brush_geometry", R"({"ids":["B2"]})")
+                           .value("brushes")
+                           .toArray()[0]
+                           .toObject();
+      CHECK(
+        brush.value("vertices")
+        == QJsonValue{QJsonArray{
+          QJsonArray{0, 0, 0},
+          QJsonArray{0, 0, 64},
+          QJsonArray{0, 64, 0},
+          QJsonArray{64, 0, 0}}});
+      CHECK(
+        f.ok("get_nodes", R"({"ids":["B2"]})")
+          .value("nodes")
+          .toArray()[0]
+          .toObject()
+          .value("materials")
+        == QJsonValue{QJsonArray{"rock"}});
+    }
+
+    SECTION("almost colinear points close to each other")
+    {
+      // regression: is_colinear accepted the third point, but it was too far from the
+      // edge of the first two, which violated a contract in the convex hull
+      const auto result = f.ok(
+        "create_brush_from_points",
+        R"({"points":[[0,0,0],[0.5,0.003,0],[1,0,0],[2,5,0],[2,2,5]]})");
+      CHECK(result.value("face_count").toInt() >= 4);
+    }
+
+    SECTION("errors")
+    {
+      const auto before = snapshot(f.map);
+      const auto err = [&](const char* args) {
+        return f.err("create_brush_from_points", args);
+      };
+      CHECK(
+        err(R"({"points":[[0,0,0],[64,0,0],[0,64,0],[64,64,0]]})") == "geometry_invalid");
+      CHECK(err(R"({"points":[[0,0,0],[0,0,0],[0,0,0],[0,0,0]]})") == "geometry_invalid");
+      CHECK(err(R"({"points":[[0,0,0],[64,0,0],[0,64,0]]})") == "invalid_argument");
+      CHECK(
+        err(R"({"points":[[0,0,0],[64,0,0],[0,64,0],[0,0,64000]]})")
+        == "out_of_world_bounds");
+      CHECK(
+        err(R"({"points":[[0,0,0],[64,0,0],[0,64,0],[0,0,1e7]]})") == "invalid_argument");
+      CHECK(
+        err(R"({"points":[[0,0,0],[64,0,0],[0,64,0],[0,0,64]],"parent":"B999"})")
+        == "unknown_node");
+      CHECK(snapshot(f.map) == before);
+    }
+  }
 }
 
 } // namespace tb::ui

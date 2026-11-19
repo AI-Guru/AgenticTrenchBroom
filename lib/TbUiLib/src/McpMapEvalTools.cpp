@@ -959,6 +959,272 @@ McpToolDef exportMapTextTool()
   };
 }
 
+// shared by query_point and check_brush_overlaps
+
+/** Returns all brushes in DFS order. */
+std::vector<const mdl::BrushNode*> allBrushes(const mdl::Map& map)
+{
+  auto result = std::vector<const mdl::BrushNode*>{};
+  const auto visit = [&](const auto& self, const mdl::Node& node) -> void {
+    if (const auto* brushNode = dynamic_cast<const mdl::BrushNode*>(&node))
+    {
+      result.push_back(brushNode);
+    }
+    for (const auto* child : node.children())
+    {
+      self(self, *child);
+    }
+  };
+  visit(visit, map.worldNode());
+  return result;
+}
+
+QString entityIdOf(const McpNodeRegistry& registry, const mdl::BrushNode& brushNode)
+{
+  const auto* entity = brushNode.entity();
+  return entity && !dynamic_cast<const mdl::WorldNode*>(entity) ? registry.idOf(*entity)
+                                                                : QStringLiteral("world");
+}
+
+// query_point
+
+constexpr auto MaxQueryPoints = 200;
+
+McpResult<QJsonObject> queryPoint(McpCallContext& context, const QJsonObject& args)
+{
+  const auto& doc = context.doc;
+  const auto& map = doc.map;
+
+  const auto pointsArg = args.value("points").toArray();
+  auto points = std::vector<vm::vec3d>{};
+  for (qsizetype i = 0; i < pointsArg.size(); ++i)
+  {
+    auto point = vec3(pointsArg[i], QString{"/points/%1"}.arg(i));
+    if (point.is_error())
+    {
+      return errorOf(point);
+    }
+    points.push_back(point.value());
+  }
+
+  const auto brushes = allBrushes(map);
+  auto results = QJsonArray{};
+  for (const auto& point : points)
+  {
+    auto containing = QJsonArray{};
+    auto insideSolid = false;
+    for (const auto* brushNode : brushes)
+    {
+      const auto& brush = brushNode->brush();
+      if (brush.bounds().contains(point) && brush.containsPoint(point))
+      {
+        const auto entity = entityIdOf(doc.nodes, *brushNode);
+        insideSolid = insideSolid || entity == u"world";
+        containing.append(
+          QJsonObject{{"id", doc.nodes.idOf(*brushNode)}, {"entity", entity}});
+      }
+    }
+    results.append(QJsonObject{
+      {"point", toJson(point)},
+      {"in_world_bounds", map.worldBounds().contains(point)},
+      {"inside_solid", insideSolid},
+      {"containing_brushes", containing},
+    });
+  }
+
+  return QJsonObject{{"results", results}};
+}
+
+McpToolDef queryPointTool()
+{
+  return {
+    .name = "query_point",
+    .title = "Query Point",
+    .description =
+      "Tells for each point whether it is inside solid world geometry and which brushes "
+      "contain it (a point on a brush face counts as inside). Brushes of entities such "
+      "as doors are listed but do not count as solid.",
+    .inputSchema = schema::object(
+      {
+        {"points", schema::array(schema::vec3(), 1, MaxQueryPoints, "points to test")},
+      },
+      {"points"}),
+    .kind = McpToolKind::Read,
+    .annotations = ReadOnly,
+    .allowedInBatch = true,
+    .run = queryPoint,
+  };
+}
+
+// check_brush_overlaps
+
+constexpr auto DefaultMaxPairs = 100;
+constexpr auto MaxPairs = 1000;
+constexpr auto OverlapEpsilon = 1e-6;
+
+/** Returns the brushes of the given nodes and their descendants, in DFS order. */
+McpResult<std::vector<const mdl::BrushNode*>> brushesOf(
+  const McpDocumentState& doc, const QJsonObject& args)
+{
+  if (!args.contains("ids"))
+  {
+    return allBrushes(doc.map);
+  }
+
+  auto nodes = resolveNodes(doc, args.value("ids").toArray(), size_t(schema::MaxNodeIds));
+  if (nodes.is_error())
+  {
+    return errorOf(nodes);
+  }
+
+  auto wanted = std::unordered_set<const mdl::BrushNode*>{};
+  const auto collect = [&](const auto& self, const mdl::Node& node) -> void {
+    if (const auto* brushNode = dynamic_cast<const mdl::BrushNode*>(&node))
+    {
+      wanted.insert(brushNode);
+    }
+    for (const auto* child : node.children())
+    {
+      self(self, *child);
+    }
+  };
+  for (const auto* node : nodes.value())
+  {
+    collect(collect, *node);
+  }
+
+  auto result = allBrushes(doc.map);
+  std::erase_if(
+    result, [&](const auto* brushNode) { return !wanted.contains(brushNode); });
+  return result;
+}
+
+McpResult<QJsonObject> checkBrushOverlaps(
+  McpCallContext& context, const QJsonObject& args)
+{
+  const auto& doc = context.doc;
+  const auto& map = doc.map;
+
+  auto brushesResult = brushesOf(doc, args);
+  if (brushesResult.is_error())
+  {
+    return errorOf(brushesResult);
+  }
+  const auto& brushes = brushesResult.value();
+
+  const auto minVolume = args.value("min_volume").toDouble(1.0);
+  const auto maxPairs = sizeArgument(args, "max_pairs", DefaultMaxPairs);
+
+  // sweep along x: candidates are pairs whose bounds overlap with positive extent
+  auto order = std::vector<size_t>(brushes.size());
+  for (size_t i = 0; i < order.size(); ++i)
+  {
+    order[i] = i;
+  }
+  std::ranges::stable_sort(order, [&](const auto lhs, const auto rhs) {
+    return brushes[lhs]->brush().bounds().min.x()
+           < brushes[rhs]->brush().bounds().min.x();
+  });
+
+  struct Pair
+  {
+    size_t a;
+    size_t b;
+    vm::bbox3d bounds;
+    double volume;
+  };
+  auto pairs = std::vector<Pair>{};
+
+  for (size_t i = 0; i < order.size(); ++i)
+  {
+    const auto& boundsA = brushes[order[i]]->brush().bounds();
+    for (size_t j = i + 1; j < order.size(); ++j)
+    {
+      const auto& boundsB = brushes[order[j]]->brush().bounds();
+      if (boundsB.min.x() >= boundsA.max.x() - OverlapEpsilon)
+      {
+        break;
+      }
+
+      auto overlapsWithExtent = true;
+      for (size_t k = 0; k < 3; ++k)
+      {
+        const auto extent = std::min(boundsA.max[k], boundsB.max[k])
+                            - std::max(boundsA.min[k], boundsB.min[k]);
+        overlapsWithExtent = overlapsWithExtent && extent > OverlapEpsilon;
+      }
+      if (!overlapsWithExtent)
+      {
+        continue;
+      }
+
+      auto intersection = brushes[order[i]]->brush();
+      if (intersection.intersect(map.worldBounds(), brushes[order[j]]->brush())
+            .is_success())
+      {
+        const auto volume = brushVolume(intersection);
+        if (volume > minVolume)
+        {
+          const auto a = std::min(order[i], order[j]);
+          const auto b = std::max(order[i], order[j]);
+          pairs.push_back({a, b, intersection.bounds(), volume});
+        }
+      }
+    }
+  }
+
+  // brushes are in DFS order, so this is deterministic
+  std::ranges::sort(pairs, [](const auto& lhs, const auto& rhs) {
+    return std::pair{lhs.a, lhs.b} < std::pair{rhs.a, rhs.b};
+  });
+
+  auto pairsJson = QJsonArray{};
+  for (const auto& pair : pairs)
+  {
+    if (size_t(pairsJson.size()) >= maxPairs)
+    {
+      break;
+    }
+    pairsJson.append(QJsonObject{
+      {"a", doc.nodes.idOf(*brushes[pair.a])},
+      {"b", doc.nodes.idOf(*brushes[pair.b])},
+      {"overlap_bounds", toJson(pair.bounds)},
+      {"overlap_volume", canon(pair.volume)},
+    });
+  }
+
+  return QJsonObject{
+    {"pairs", pairsJson},
+    {"total", qint64(pairs.size())},
+    {"truncated", pairs.size() > maxPairs},
+    {"brush_count", qint64(brushes.size())},
+  };
+}
+
+McpToolDef checkBrushOverlapsTool()
+{
+  return {
+    .name = "check_brush_overlaps",
+    .title = "Check Brush Overlaps",
+    .description =
+      "Finds pairs of brushes whose volumes overlap by more than min_volume cubic "
+      "units; brushes that only touch do not overlap. Checks all brushes, or the "
+      "brushes of the given nodes.",
+    .inputSchema = schema::object({
+      {"ids",
+       schema::nodeIds(
+         schema::MaxNodeIds, "brushes, or nodes whose brushes to check (default all)")},
+      {"min_volume",
+       schema::number(0, 1e18, "smallest overlap volume to report (default 1)")},
+      {"max_pairs", schema::integer(1, MaxPairs, "most pairs to return (default 100)")},
+    }),
+    .kind = McpToolKind::Read,
+    .annotations = ReadOnly,
+    .allowedInBatch = true,
+    .run = checkBrushOverlaps,
+  };
+}
+
 } // namespace
 
 void registerMcpMapEvalTools(McpToolDispatcher& dispatcher)
@@ -970,6 +1236,8 @@ void registerMcpMapEvalTools(McpToolDispatcher& dispatcher)
   dispatcher.add(checkpointListTool());
   dispatcher.add(checkpointDeleteTool());
   dispatcher.add(exportMapTextTool());
+  dispatcher.add(queryPointTool());
+  dispatcher.add(checkBrushOverlapsTool());
 }
 
 } // namespace tb::ui

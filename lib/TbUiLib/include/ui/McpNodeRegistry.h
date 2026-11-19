@@ -162,6 +162,15 @@ public:
   bool isRecording() const;
 
   /**
+   * Gives nodes that existed when the recording began and were removed and re-added
+   * during the recording their old ids back. Called after the transaction of a failed
+   * call was rolled back: rolling back re-adds removed nodes, which would otherwise get
+   * new ids, so that a failed call would change ids although it changed nothing else.
+   * The ids that the re-added nodes got in the meantime become stale.
+   */
+  void restoreIdsAfterRollback();
+
+  /**
    * Stops observing the map. Only intended for tests that need to put the registry out
    * of sync with the map to check reconcile().
    */
@@ -174,6 +183,10 @@ private:
     std::unordered_set<uint64_t> removed;
     std::unordered_set<uint64_t> modified;
     bool worldModified = false;
+    /** The first number assigned during the recording. */
+    uint64_t firstNumber = 0;
+    /** Removed nodes that existed when the recording began, in removal order. */
+    std::vector<std::pair<const mdl::Node*, uint64_t>> removedNodes;
   };
 
   void connectObservers();

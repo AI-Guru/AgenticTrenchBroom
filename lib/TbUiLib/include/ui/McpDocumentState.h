@@ -29,6 +29,7 @@
 
 #include "kd/result.h"
 
+#include <deque>
 #include <functional>
 #include <vector>
 
@@ -42,6 +43,33 @@ namespace tb::ui
 
 template <typename T>
 using McpResult = kdl::result<T, mcp::ToolError>;
+
+struct McpLogLine
+{
+  LogLevel level;
+  QString text;
+};
+
+/** Returns "debug", "info", "warn" or "error". */
+QString mcpLogLevelName(LogLevel level);
+
+/**
+ * The most recent warnings and errors logged during MCP calls on one document, oldest
+ * first. Returned by get_log.
+ */
+class McpLogHistory
+{
+public:
+  static constexpr size_t Capacity = 500;
+
+  /** Appends the given lines, dropping the oldest lines beyond the capacity. */
+  void append(const std::vector<McpLogLine>& lines);
+
+  const std::deque<McpLogLine>& lines() const;
+
+private:
+  std::deque<McpLogLine> m_lines;
+};
 
 /**
  * The MCP state of one live map: its node registry, a model of its undo history, its
@@ -62,13 +90,9 @@ struct McpDocumentState
   McpNodeRegistry nodes;
   McpHistoryTracker history;
   McpCheckpointStore checkpoints;
+  McpLogHistory logHistory;
 };
 
-struct McpLogLine
-{
-  LogLevel level;
-  QString text;
-};
 
 /** Passed to a map tool's run function. */
 struct McpCallContext

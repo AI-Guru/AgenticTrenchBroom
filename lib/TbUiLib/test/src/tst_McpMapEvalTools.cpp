@@ -857,6 +857,137 @@ TEST_CASE("McpMapEvalTools")
       CHECK(snapshot(map) == before);
     }
   }
+
+  SECTION("query_point")
+  {
+    populateTestScene(f);
+
+    SECTION("reports solid world brushes and entity brushes")
+    {
+      const auto results =
+        f.ok(
+           "query_point",
+           R"({"points":[[32,32,32],[136,8,32],[64,32,32],[32,160,8],[32,32,128],[9000,0,0]]})")
+          .value("results")
+          .toArray();
+      REQUIRE(results.size() == 6);
+
+      CHECK(
+        results[0]
+        == QJsonValue{QJsonObject{
+          {"point", QJsonArray{32, 32, 32}},
+          {"in_world_bounds", true},
+          {"inside_solid", true},
+          {"containing_brushes",
+           QJsonArray{QJsonObject{{"id", "B2"}, {"entity", "world"}}}},
+        }});
+
+      // a door brush is listed but not solid
+      CHECK(results[1].toObject().value("inside_solid") == QJsonValue{false});
+      CHECK(
+        results[1].toObject().value("containing_brushes")
+        == QJsonValue{QJsonArray{QJsonObject{{"id", "B5"}, {"entity", "E4"}}}});
+
+      // points on a face are inside
+      CHECK(results[2].toObject().value("inside_solid") == QJsonValue{true});
+
+      // brushes in groups belong to the world
+      CHECK(results[3].toObject().value("inside_solid") == QJsonValue{true});
+
+      CHECK(results[4].toObject().value("inside_solid") == QJsonValue{false});
+      CHECK(
+        results[4].toObject().value("containing_brushes") == QJsonValue{QJsonArray{}});
+
+      CHECK(results[5].toObject().value("in_world_bounds") == QJsonValue{false});
+      CHECK(results[5].toObject().value("inside_solid") == QJsonValue{false});
+    }
+
+    SECTION("errors")
+    {
+      CHECK(f.err("query_point", R"({"points":[]})") == "invalid_argument");
+      CHECK(f.err("query_point", R"({"points":[[0,0]]})") == "invalid_argument");
+      CHECK(f.err("query_point", R"({"points":[[1e7,0,0]]})") == "invalid_argument");
+      CHECK(f.err("query_point") == "invalid_argument");
+    }
+  }
+
+  SECTION("check_brush_overlaps")
+  {
+    populateTestScene(f);
+
+    SECTION("a scene without overlaps")
+    {
+      const auto result = f.ok("check_brush_overlaps");
+      CHECK(result.value("pairs") == QJsonValue{QJsonArray{}});
+      CHECK(result.value("total") == QJsonValue{0});
+      CHECK(result.value("truncated") == QJsonValue{false});
+      CHECK(result.value("brush_count") == QJsonValue{4});
+    }
+
+    SECTION("finds overlaps, but not touching brushes")
+    {
+      // overlaps the wall B2 by 32^3
+      addBrush(map, vm::bbox3d{{32, 32, 32}, {96, 96, 96}});
+      // touches B2
+      addBrush(map, vm::bbox3d{{-64, 0, 0}, {0, 64, 64}});
+      // overlaps the door brush B5 by 8 x 16 x 64
+      addBrush(map, vm::bbox3d{{136, 0, 0}, {152, 16, 64}});
+
+      const auto result = f.ok("check_brush_overlaps");
+      CHECK(
+        result.value("pairs")
+        == QJsonValue{QJsonArray{
+          QJsonObject{
+            {"a", "B2"},
+            {"b", "B12"},
+            {"overlap_bounds",
+             QJsonObject{
+               {"min", QJsonArray{32, 32, 32}}, {"max", QJsonArray{64, 64, 64}}}},
+            {"overlap_volume", 32768},
+          },
+          QJsonObject{
+            {"a", "B5"},
+            {"b", "B14"},
+            {"overlap_bounds",
+             QJsonObject{
+               {"min", QJsonArray{136, 0, 0}}, {"max", QJsonArray{144, 16, 64}}}},
+            {"overlap_volume", 8192},
+          },
+        }});
+      CHECK(result.value("total") == QJsonValue{2});
+
+      // min_volume
+      CHECK(
+        f.ok("check_brush_overlaps", R"({"min_volume":10000})").value("total")
+        == QJsonValue{1});
+
+      // max_pairs
+      const auto limited = f.ok("check_brush_overlaps", R"({"max_pairs":1})");
+      CHECK(limited.value("pairs").toArray().size() == 1);
+      CHECK(limited.value("truncated") == QJsonValue{true});
+      CHECK(limited.value("total") == QJsonValue{2});
+
+      // ids restrict the brushes; entities are expanded to their brushes
+      CHECK(
+        f.ok("check_brush_overlaps", R"({"ids":["B2","B13"]})").value("total")
+        == QJsonValue{0});
+      const auto door = f.ok("check_brush_overlaps", R"({"ids":["E4","B14"]})");
+      CHECK(door.value("total") == QJsonValue{1});
+      CHECK(door.value("brush_count") == QJsonValue{3});
+      CHECK(
+        f.ok("check_brush_overlaps", R"({"ids":["world"]})").value("total")
+        == QJsonValue{2});
+    }
+
+    SECTION("errors")
+    {
+      CHECK(f.err("check_brush_overlaps", R"({"ids":["B999"]})") == "unknown_node");
+      CHECK(f.err("check_brush_overlaps", R"({"max_pairs":0})") == "invalid_argument");
+      CHECK(f.err("check_brush_overlaps", R"({"min_volume":-1})") == "invalid_argument");
+      CHECK(
+        f.err("check_brush_overlaps", R"({"ids":["@selection"]})") == "invalid_argument");
+    }
+  }
 }
 
 } // namespace tb::ui

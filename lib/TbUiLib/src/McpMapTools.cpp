@@ -19,6 +19,8 @@
 
 #include "ui/McpMapTools.h"
 
+#include "ui/McpToolDispatcher.h"
+
 namespace tb::ui
 {
 
@@ -30,6 +32,7 @@ void registerMcpMapTools(McpToolDispatcher& dispatcher)
   registerMcpMapEditTools(dispatcher);
   registerMcpMapStructureTools(dispatcher);
   registerMcpMapHistoryTools(dispatcher);
+  dispatcher.addBatchTool();
 }
 
 } // namespace tb::ui

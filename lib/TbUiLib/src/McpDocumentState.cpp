@@ -30,4 +30,37 @@ McpDocumentState::McpDocumentState(mdl::Map& map_, QString documentId_)
 {
 }
 
+QString mcpLogLevelName(const LogLevel level)
+{
+  switch (level)
+  {
+  case LogLevel::Debug:
+    return QStringLiteral("debug");
+  case LogLevel::Info:
+    return QStringLiteral("info");
+  case LogLevel::Warn:
+    return QStringLiteral("warn");
+  case LogLevel::Error:
+    return QStringLiteral("error");
+  }
+  return QStringLiteral("info");
+}
+
+void McpLogHistory::append(const std::vector<McpLogLine>& lines)
+{
+  for (const auto& line : lines)
+  {
+    m_lines.push_back(line);
+  }
+  while (m_lines.size() > Capacity)
+  {
+    m_lines.pop_front();
+  }
+}
+
+const std::deque<McpLogLine>& McpLogHistory::lines() const
+{
+  return m_lines;
+}
+
 } // namespace tb::ui

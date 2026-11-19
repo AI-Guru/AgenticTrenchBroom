@@ -17,6 +17,8 @@
  along with TrenchBroom. If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <QSet>
+
 #include "gl/MaterialManager.h"
 #include "mdl/Brush.h"
 #include "mdl/BrushFace.h"
@@ -26,6 +28,8 @@
 #include "mdl/Entity.h"
 #include "mdl/EntityNode.h"
 #include "mdl/EntityNodeBase.h"
+#include "mdl/Grid.h"
+#include "mdl/GroupNode.h"
 #include "mdl/Map.h"
 #include "mdl/Map_Brushes.h"
 #include "mdl/Map_Entities.h"
@@ -34,6 +38,7 @@
 #include "mdl/Map_Selection.h"
 #include "mdl/NodeHandleManager.h"
 #include "mdl/NodeHandles.h"
+#include "mdl/PatchNode.h"
 #include "mdl/Selection.h"
 #include "mdl/UpdateBrushFaceAttributes.h"
 #include "mdl/WorldNode.h"
@@ -42,6 +47,8 @@
 #include "ui/McpPreconditions.h"
 #include "ui/McpSchemas.h"
 #include "ui/McpToolDispatcher.h"
+
+#include "kd/string_compare.h"
 
 #include "vm/bbox.h"
 #include "vm/mat.h"
@@ -54,6 +61,7 @@
 #include <cmath>
 #include <limits>
 #include <set>
+#include <tuple>
 #include <unordered_set>
 
 namespace tb::ui
@@ -1045,6 +1053,874 @@ McpToolDef setFaceAttributesTool()
   };
 }
 
+// shared by the brush editing tools
+
+QJsonArray idsOf(const McpNodeRegistry& registry, const auto& nodes)
+{
+  auto result = QJsonArray{};
+  for (const auto* node : nodes)
+  {
+    result.append(registry.idOf(*node));
+  }
+  return result;
+}
+
+mcp::ToolError notABrush(const McpDocumentState& doc, const mdl::Node& node)
+{
+  const auto id = doc.nodes.idOf(node);
+  return toolError(
+    "wrong_node_type",
+    QString{"%1 is a %2, not a brush"}.arg(id, nodeTypeName(node)),
+    "pass brush ids; brush entities are expanded to their brushes",
+    {{"id", id}, {"actual", nodeTypeName(node)}, {"expected", "brush"}});
+}
+
+/** Resolves the given ids to brushes; brush entities are expanded to their brushes. */
+McpResult<std::vector<mdl::BrushNode*>> resolveBrushes(
+  const McpDocumentState& doc, const QJsonArray& ids)
+{
+  auto targets = resolveTargets(doc, ids);
+  if (targets.is_error())
+  {
+    return errorOf(targets);
+  }
+  auto result = std::vector<mdl::BrushNode*>{};
+  for (auto* node : targets.value())
+  {
+    auto* brushNode = dynamic_cast<mdl::BrushNode*>(node);
+    if (!brushNode)
+    {
+      return notABrush(doc, *node);
+    }
+    result.push_back(brushNode);
+  }
+  return result;
+}
+
+/** Whether the brush can be edited although it may be inside a closed group. */
+bool isEditableBrush(const McpDocumentState& doc, const mdl::BrushNode& brushNode)
+{
+  const auto& editorContext = doc.map.editorContext();
+  return editorContext.visible(brushNode) && editorContext.editable(brushNode)
+         && requireNotLinked(doc, brushNode).is_success();
+}
+
+/**
+ * Resolves the given ids to brushes. Brush entities and groups are expanded to the
+ * brushes inside them that are visible, editable and not linked; the number of skipped
+ * brushes and patches is returned too.
+ */
+McpResult<std::pair<std::vector<mdl::BrushNode*>, size_t>> resolveBrushesInside(
+  const McpDocumentState& doc, const QJsonArray& ids)
+{
+  auto targets = resolveTargets(doc, ids);
+  if (targets.is_error())
+  {
+    return errorOf(targets);
+  }
+
+  auto result = std::vector<mdl::BrushNode*>{};
+  auto seen = std::unordered_set<const mdl::BrushNode*>{};
+  auto skipped = size_t(0);
+  const auto collect = [&](const auto& self, mdl::Node& node) -> void {
+    if (auto* brushNode = dynamic_cast<mdl::BrushNode*>(&node))
+    {
+      if (!isEditableBrush(doc, *brushNode))
+      {
+        ++skipped;
+      }
+      else if (seen.insert(brushNode).second)
+      {
+        result.push_back(brushNode);
+      }
+      return;
+    }
+    for (auto* child : node.children())
+    {
+      self(self, *child);
+    }
+  };
+
+  for (auto* node : targets.value())
+  {
+    if (dynamic_cast<mdl::BrushNode*>(node) || dynamic_cast<mdl::GroupNode*>(node))
+    {
+      collect(collect, *node);
+    }
+    else if (dynamic_cast<mdl::PatchNode*>(node))
+    {
+      // e.g. a patch of a brush entity
+      ++skipped;
+    }
+    else
+    {
+      return notABrush(doc, *node);
+    }
+  }
+  return std::pair{std::move(result), skipped};
+}
+
+/**
+ * Returns the ids in after that are not in before. Uses a hash set, since
+ * duplicate_nodes can create hundreds of thousands of nodes.
+ */
+QJsonArray newIds(const std::vector<QString>& before, const std::vector<QString>& after)
+{
+  const auto beforeSet = QSet<QString>{before.begin(), before.end()};
+  auto result = QJsonArray{};
+  for (const auto& id : after)
+  {
+    if (!beforeSet.contains(id))
+    {
+      result.append(id);
+    }
+  }
+  return result;
+}
+
+std::vector<vm::vec3d> sortedVertices(const mdl::Brush& brush)
+{
+  auto vertices = brush.vertexPositions();
+  std::ranges::sort(vertices);
+  return vertices;
+}
+
+// resize_nodes
+
+McpResult<QJsonObject> resizeNodes(McpCallContext& context, const QJsonObject& args)
+{
+  auto& doc = context.doc;
+  auto& map = doc.map;
+
+  auto boundsResult = bounds(args.value("bounds"), "/bounds");
+  if (boundsResult.is_error())
+  {
+    return errorOf(boundsResult);
+  }
+  auto boxResult = boxInWorld(map, boundsResult.value().min, boundsResult.value().max);
+  if (boxResult.is_error())
+  {
+    return errorOf(boxResult);
+  }
+  const auto newBounds = boxResult.value();
+
+  if (auto check = requireNoVertexHandlesSelected(map); check.is_error())
+  {
+    return errorOf(check);
+  }
+
+  auto targets = resolveTargets(doc, args.value("ids").toArray());
+  if (targets.is_error())
+  {
+    return errorOf(targets);
+  }
+  if (auto check = checkTransformableNodes(
+        doc.nodes,
+        std::vector<const mdl::Node*>{targets.value().begin(), targets.value().end()});
+      check.is_error())
+  {
+    return errorOf(check);
+  }
+
+  selectOnly(map, targets.value());
+  const auto oldBounds = map.selectionBounds();
+  if (!oldBounds)
+  {
+    return toolError("operation_failed", "the targets have no bounds");
+  }
+
+  static const auto axes = std::array<const char*, 3>{"x", "y", "z"};
+  const auto oldSize = oldBounds->size();
+  const auto newSize = newBounds.size();
+  for (size_t i = 0; i < 3; ++i)
+  {
+    if (oldSize[i] < 1.0 / 1024.0)
+    {
+      return toolError(
+        "invalid_argument",
+        QString{"the targets are flat along %1 and cannot be resized"}.arg(axes[i]),
+        "use transform_nodes to move them",
+        {{"axis", axes[i]}});
+    }
+    const auto factor = newSize[i] / oldSize[i];
+    if (factor < MinScaleFactor || factor > MaxScaleFactor)
+    {
+      return toolError(
+        "invalid_argument",
+        QString{"the size along %1 would change by a factor of %2"}.arg(axes[i]).arg(
+          factor),
+        QString{"the factor must be between %1 and %2"}
+          .arg(MinScaleFactor)
+          .arg(MaxScaleFactor),
+        {{"axis", axes[i]}, {"pointer", "/bounds"}});
+    }
+  }
+
+  if (!mdl::scaleSelection(map, *oldBounds, newBounds))
+  {
+    return toolError(
+      "operation_failed",
+      "the nodes could not be resized",
+      "a brush may have become invalid; check the log");
+  }
+
+  if (hasNonIntegerVertices(map.selection().allBrushes()))
+  {
+    context.warnings.push_back(
+      "some brush vertices are not on integer coordinates; call snap_vertices to fix "
+      "them");
+  }
+
+  const auto& resultBounds = map.selectionBounds();
+  return QJsonObject{
+    {"bounds", resultBounds ? QJsonValue{toJson(*resultBounds)} : QJsonValue{}},
+  };
+}
+
+McpToolDef resizeNodesTool()
+{
+  return {
+    .name = "resize_nodes",
+    .title = "Resize Nodes",
+    .description =
+      "Scales and moves the given nodes so that their combined bounds become the given "
+      "bounds, like dragging the bounds in the editor. Verify with get_brush_geometry.",
+    .inputSchema = schema::object(
+      {
+        {"ids", schema::nodeIds()},
+        {"bounds", schema::bounds("the new combined bounds")},
+      },
+      {"ids", "bounds"}),
+    .kind = McpToolKind::Mutate,
+    .annotations = Mutating,
+    .allowedInBatch = true,
+    .run = resizeNodes,
+  };
+}
+
+// snap_vertices
+
+McpResult<QJsonObject> snapVertices(McpCallContext& context, const QJsonObject& args)
+{
+  auto& doc = context.doc;
+  auto& map = doc.map;
+
+  const auto snapTo = args.value("to").toDouble(1.0);
+
+  auto brushes = resolveBrushes(doc, args.value("ids").toArray());
+  if (brushes.is_error())
+  {
+    return errorOf(brushes);
+  }
+
+  auto before = std::vector<std::vector<vm::vec3d>>{};
+  for (const auto* brushNode : brushes.value())
+  {
+    before.push_back(sortedVertices(brushNode->brush()));
+  }
+
+  selectOnly(
+    map, std::vector<mdl::Node*>{brushes.value().begin(), brushes.value().end()});
+  if (!mdl::snapVertices(map, snapTo))
+  {
+    return toolError(
+      "operation_failed", "the vertices could not be snapped", "check the log");
+  }
+
+  auto changed = QJsonArray{};
+  auto unchanged = QJsonArray{};
+  for (size_t i = 0; i < brushes.value().size(); ++i)
+  {
+    const auto* brushNode = brushes.value()[i];
+    (sortedVertices(brushNode->brush()) != before[i] ? changed : unchanged)
+      .append(doc.nodes.idOf(*brushNode));
+  }
+  if (changed.isEmpty())
+  {
+    context.warnings.push_back(
+      "nothing changed: the vertices were already snapped or could not be snapped");
+  }
+
+  return QJsonObject{{"changed", changed}, {"unchanged", unchanged}};
+}
+
+McpToolDef snapVerticesTool()
+{
+  return {
+    .name = "snap_vertices",
+    .title = "Snap Vertices",
+    .description =
+      "Moves the vertices of the given brushes to the nearest multiple of to (default "
+      "1, i.e. integer coordinates). Brushes that would become invalid are left "
+      "unchanged and listed in unchanged.",
+    .inputSchema = schema::object(
+      {
+        {"ids", schema::nodeIds(schema::MaxNodeIds, "brushes or brush entities")},
+        {"to", schema::number(0.001, 4096, "grid to snap to (default 1)")},
+      },
+      {"ids"}),
+    .kind = McpToolKind::Mutate,
+    .annotations = Mutating,
+    .allowedInBatch = true,
+    .run = snapVertices,
+  };
+}
+
+// duplicate_nodes
+
+constexpr auto MaxDuplicates = 64;
+
+McpResult<QJsonObject> duplicateNodes(McpCallContext& context, const QJsonObject& args)
+{
+  auto& doc = context.doc;
+  auto& map = doc.map;
+
+  auto offset = vm::vec3d{};
+  if (args.contains("offset"))
+  {
+    auto offsetResult = vec3(args.value("offset"), "/offset");
+    if (offsetResult.is_error())
+    {
+      return errorOf(offsetResult);
+    }
+    offset = offsetResult.value();
+  }
+  const auto count = sizeArgument(args, "count", 1);
+
+  if (auto check = requireNoVertexHandlesSelected(map); check.is_error())
+  {
+    return errorOf(check);
+  }
+
+  auto targets = resolveTargets(doc, args.value("ids").toArray());
+  if (targets.is_error())
+  {
+    return errorOf(targets);
+  }
+  if (auto check = checkTransformableNodes(
+        doc.nodes,
+        std::vector<const mdl::Node*>{targets.value().begin(), targets.value().end()});
+      check.is_error())
+  {
+    return errorOf(check);
+  }
+
+  selectOnly(map, targets.value());
+  const auto selectionBounds = map.selectionBounds();
+  if (!selectionBounds)
+  {
+    return toolError("operation_failed", "the targets have no bounds");
+  }
+  for (size_t k = 1; k <= count; ++k)
+  {
+    if (!map.worldBounds().contains(selectionBounds->translate(offset * double(k))))
+    {
+      return toolError(
+        "out_of_world_bounds",
+        QString{"copy %1 would not be inside the world bounds"}.arg(k),
+        "use a smaller offset or count",
+        {{"world_bounds", toJson(map.worldBounds())}});
+    }
+  }
+
+  auto copies = QJsonArray{};
+  for (size_t k = 0; k < count; ++k)
+  {
+    const auto before = doc.nodes.currentChanges().created;
+    mdl::duplicateSelectedNodes(map);
+    if (!map.selection().hasNodes())
+    {
+      return toolError("operation_failed", "the nodes could not be duplicated");
+    }
+    if (offset != vm::vec3d{0, 0, 0} && !mdl::translateSelection(map, offset))
+    {
+      return toolError("operation_failed", "the copies could not be moved");
+    }
+
+    copies.append(newIds(before, doc.nodes.currentChanges().created));
+  }
+
+  if (offset == vm::vec3d{0, 0, 0})
+  {
+    context.warnings.push_back("the offset is zero, so the copies overlap the originals");
+  }
+
+  return QJsonObject{{"copies", copies}};
+}
+
+McpToolDef duplicateNodesTool()
+{
+  return {
+    .name = "duplicate_nodes",
+    .title = "Duplicate Nodes",
+    .description =
+      "Copies the given nodes count times; copy k is moved by k times offset, e.g. a "
+      "row of pillars. Returns the ids of each copy (including the brushes inside "
+      "copied groups and entities).",
+    .inputSchema = schema::object(
+      {
+        {"ids", schema::nodeIds()},
+        {"offset", schema::vec3("offset between copies (default [0,0,0])")},
+        {"count", schema::integer(1, MaxDuplicates, "number of copies (default 1)")},
+      },
+      {"ids"}),
+    .kind = McpToolKind::Mutate,
+    .annotations = Mutating,
+    .allowedInBatch = true,
+    .run = duplicateNodes,
+  };
+}
+
+// replace_material
+
+McpResult<QJsonObject> replaceMaterial(McpCallContext& context, const QJsonObject& args)
+{
+  auto& doc = context.doc;
+  auto& map = doc.map;
+
+  const auto from = fromUnicode(map, args.value("from").toString());
+  const auto toName = args.value("to").toString();
+  if (auto check = checkMaterialName(toName, "/to"); check.is_error())
+  {
+    return errorOf(check);
+  }
+  const auto to = fromUnicode(map, toName);
+
+  auto brushes = std::vector<mdl::BrushNode*>{};
+  auto skipped = size_t(0);
+  if (args.contains("ids"))
+  {
+    auto resolved = resolveBrushesInside(doc, args.value("ids").toArray());
+    if (resolved.is_error())
+    {
+      return errorOf(resolved);
+    }
+    std::tie(brushes, skipped) = std::move(resolved).value();
+  }
+  else
+  {
+    const auto visit = [&](const auto& self, mdl::Node& node) -> void {
+      if (auto* brushNode = dynamic_cast<mdl::BrushNode*>(&node))
+      {
+        if (isEditableBrush(doc, *brushNode))
+        {
+          brushes.push_back(brushNode);
+        }
+        else
+        {
+          ++skipped;
+        }
+        return;
+      }
+      for (auto* child : node.children())
+      {
+        self(self, *child);
+      }
+    };
+    visit(visit, map.worldNode());
+  }
+
+  auto faces = std::vector<mdl::BrushFaceHandle>{};
+  const auto& editorContext = map.editorContext();
+  for (auto* brushNode : brushes)
+  {
+    const auto& brushFaces = brushNode->brush().faces();
+    for (size_t i = 0; i < brushFaces.size(); ++i)
+    {
+      if (
+        kdl::ci::str_is_equal(brushFaces[i].materialName(), from)
+        && editorContext.selectable(*brushNode, brushFaces[i]))
+      {
+        faces.emplace_back(*brushNode, i);
+      }
+    }
+  }
+
+  if (skipped > 0)
+  {
+    context.warnings.push_back(
+      QString{"%1 hidden, locked or linked brushes were skipped"}.arg(skipped));
+  }
+  if (faces.empty())
+  {
+    context.warnings.push_back(
+      QString{"no face has the material '%1'"}.arg(args.value("from").toString()));
+    return QJsonObject{{"faces_changed", 0}, {"brushes", QJsonArray{}}};
+  }
+
+  mdl::deselectAll(map);
+  mdl::selectBrushFaces(map, faces);
+  if (!mdl::setBrushFaceAttributes(
+        map, mdl::UpdateBrushFaceAttributes{.materialName = to}))
+  {
+    return toolError("operation_failed", "the material could not be set");
+  }
+
+  auto changedBrushes = std::vector<const mdl::BrushNode*>{};
+  for (const auto& handle : faces)
+  {
+    if (std::ranges::find(changedBrushes, &handle.node()) == changedBrushes.end())
+    {
+      changedBrushes.push_back(&handle.node());
+    }
+  }
+
+  if (to != mdl::BrushFace::NoMaterialName && !map.materialManager().material(to))
+  {
+    context.warnings.push_back(
+      QString{"material '%1' was not found; check list_materials"}.arg(toName));
+  }
+
+  return QJsonObject{
+    {"faces_changed", qint64(faces.size())},
+    {"brushes", idsOf(doc.nodes, changedBrushes)},
+  };
+}
+
+McpToolDef replaceMaterialTool()
+{
+  return {
+    .name = "replace_material",
+    .title = "Replace Material",
+    .description =
+      "Replaces the material from (case-insensitive) by to on every face of the given "
+      "brushes, groups and entities, or of the whole map. Hidden and locked brushes are "
+      "skipped.",
+    .inputSchema = schema::object(
+      {
+        {"from", schema::string(1, 256, "the material to replace")},
+        {"to", schema::material("the new material")},
+        {"ids",
+         schema::nodeIds(
+           schema::MaxNodeIds, "brushes, groups or entities (default: the whole map)")},
+      },
+      {"from", "to"}),
+    .kind = McpToolKind::Mutate,
+    .annotations = Mutating,
+    .allowedInBatch = true,
+    .run = replaceMaterial,
+  };
+}
+
+// csg
+
+McpResult<QJsonObject> csg(McpCallContext& context, const QJsonObject& args)
+{
+  auto& doc = context.doc;
+  auto& map = doc.map;
+
+  const auto op = args.value("op").toString();
+  auto brushes = resolveBrushes(doc, args.value("ids").toArray());
+  if (brushes.is_error())
+  {
+    return errorOf(brushes);
+  }
+  const auto minCount = op == u"hollow" ? size_t(1) : size_t(2);
+  if (brushes.value().size() < minCount)
+  {
+    return toolError(
+      "invalid_argument",
+      QString{"%1 needs at least %2 brushes"}.arg(op).arg(minCount),
+      {},
+      {{"pointer", "/ids"}});
+  }
+
+  if (op == u"intersect")
+  {
+    // TrenchBroom deletes the brushes if they do not intersect
+    auto intersection = brushes.value().front()->brush();
+    for (size_t i = 1; i < brushes.value().size(); ++i)
+    {
+      if (intersection.intersect(map.worldBounds(), brushes.value()[i]->brush())
+            .is_error())
+      {
+        return toolError(
+          "operation_failed",
+          "the brushes do not have a common volume",
+          "check with check_brush_overlaps");
+      }
+    }
+  }
+
+  selectOnly(
+    map, std::vector<mdl::Node*>{brushes.value().begin(), brushes.value().end()});
+
+  const auto before = doc.nodes.currentChanges().created;
+  const auto success = op == u"merge"       ? mdl::csgConvexMerge(map)
+                       : op == u"intersect" ? mdl::csgIntersect(map)
+                                            : mdl::csgHollow(map);
+  if (!success)
+  {
+    return toolError(
+      "operation_failed",
+      QString{"csg %1 failed"}.arg(op),
+      op == u"hollow"
+        ? QStringLiteral("the brushes may be thinner than twice the grid size; try "
+                         "create_hollow_box")
+        : QStringLiteral("check the log"),
+      {{"log", [&]() {
+          auto log = QJsonArray{};
+          if (context.log)
+          {
+            for (const auto& line : *context.log)
+            {
+              log.append(line.text);
+            }
+          }
+          return log;
+        }()}});
+  }
+
+  const auto ids = newIds(before, doc.nodes.currentChanges().created);
+  if (op != u"hollow" && ids.isEmpty())
+  {
+    // csgIntersect deletes the brushes and reports success if their intersection is
+    // empty; the check above should catch that, but the order of the brushes may differ
+    return toolError(
+      "operation_failed",
+      QString{"csg %1 did not create a brush"}.arg(op),
+      "check with check_brush_overlaps");
+  }
+
+  auto result = QJsonObject{{"ids", ids}};
+  if (op == u"hollow")
+  {
+    result["wall_thickness"] = canon(map.grid().actualSize());
+  }
+  return result;
+}
+
+McpToolDef csgTool()
+{
+  return {
+    .name = "csg",
+    .title = "CSG",
+    .description =
+      "merge replaces the brushes by their convex hull, intersect by their common "
+      "volume, hollow turns each brush into walls as thick as the current grid size "
+      "(create_hollow_box gives more control). The results get new ids.",
+    .inputSchema = schema::object(
+      {
+        {"op", schema::stringEnum({"merge", "intersect", "hollow"})},
+        {"ids", schema::nodeIds(schema::MaxNodeIds, "brushes or brush entities")},
+      },
+      {"op", "ids"}),
+    .kind = McpToolKind::Mutate,
+    .annotations = Destructive,
+    .allowedInBatch = true,
+    .run = csg,
+  };
+}
+
+// csg_subtract
+
+constexpr auto MinOverlapVolume = 1e-3;
+constexpr auto ExtentEpsilon = 1e-6;
+
+/** Whether the brushes share a volume, not only a face or an edge. */
+bool overlaps(const mdl::Map& map, const mdl::Brush& lhs, const mdl::Brush& rhs)
+{
+  const auto& a = lhs.bounds();
+  const auto& b = rhs.bounds();
+  for (size_t i = 0; i < 3; ++i)
+  {
+    if (std::min(a.max[i], b.max[i]) - std::max(a.min[i], b.min[i]) <= ExtentEpsilon)
+    {
+      return false;
+    }
+  }
+  auto intersection = lhs;
+  return intersection.intersect(map.worldBounds(), rhs).is_success()
+         && brushVolume(intersection) > MinOverlapVolume;
+}
+
+McpResult<QJsonObject> csgSubtract(McpCallContext& context, const QJsonObject& args)
+{
+  auto& doc = context.doc;
+  auto& map = doc.map;
+
+  auto subtrahendsResult =
+    resolveBrushesInside(doc, args.value("subtract_ids").toArray());
+  if (subtrahendsResult.is_error())
+  {
+    auto error = errorOf(subtrahendsResult);
+    error.details["pointer"] = "/subtract_ids";
+    return error;
+  }
+  const auto subtrahends = subtrahendsResult.value().first;
+  if (subtrahends.empty())
+  {
+    return toolError(
+      "invalid_argument",
+      "subtract_ids contain no editable brushes",
+      {},
+      {{"pointer", "/subtract_ids"}});
+  }
+  const auto subtrahendSet =
+    std::unordered_set<const mdl::BrushNode*>{subtrahends.begin(), subtrahends.end()};
+
+  auto candidates = std::vector<mdl::BrushNode*>{};
+  if (args.contains("from_ids"))
+  {
+    auto fromResult = resolveBrushesInside(doc, args.value("from_ids").toArray());
+    if (fromResult.is_error())
+    {
+      auto error = errorOf(fromResult);
+      error.details["pointer"] = "/from_ids";
+      return error;
+    }
+    candidates = fromResult.value().first;
+    for (const auto* brushNode : candidates)
+    {
+      if (subtrahendSet.contains(brushNode))
+      {
+        const auto id = doc.nodes.idOf(*brushNode);
+        return toolError(
+          "invalid_argument",
+          QString{"%1 is in subtract_ids and in from_ids"}.arg(id),
+          "a brush cannot be subtracted from itself",
+          {{"pointer", "/from_ids"}, {"id", id}});
+      }
+    }
+  }
+  else
+  {
+    const auto visit = [&](const auto& self, mdl::Node& node) -> void {
+      if (auto* brushNode = dynamic_cast<mdl::BrushNode*>(&node))
+      {
+        if (!subtrahendSet.contains(brushNode) && isEditableBrush(doc, *brushNode))
+        {
+          candidates.push_back(brushNode);
+        }
+        return;
+      }
+      for (auto* child : node.children())
+      {
+        self(self, *child);
+      }
+    };
+    visit(visit, map.worldNode());
+  }
+
+  // touching brushes are not minuends, unlike in TrenchBroom's subtract command
+  struct Minuend
+  {
+    mdl::BrushNode* node;
+    std::vector<const mdl::Brush*> subtrahends;
+  };
+  auto minuends = std::vector<Minuend>{};
+  for (auto* candidate : candidates)
+  {
+    auto overlapping = std::vector<const mdl::Brush*>{};
+    for (const auto* subtrahend : subtrahends)
+    {
+      if (overlaps(map, candidate->brush(), subtrahend->brush()))
+      {
+        overlapping.push_back(&subtrahend->brush());
+      }
+    }
+    if (!overlapping.empty())
+    {
+      minuends.push_back({candidate, std::move(overlapping)});
+    }
+  }
+  if (minuends.empty())
+  {
+    return toolError(
+      "operation_failed",
+      "nothing overlaps the subtracted brushes",
+      "brushes that only touch are not changed; check with check_brush_overlaps");
+  }
+
+  auto toAdd = kdl::flat_map<mdl::Node*, std::vector<std::unique_ptr<mdl::Node>>>{};
+  auto fragmentNodes = std::vector<std::vector<const mdl::Node*>>{};
+  auto failedFragments = size_t(0);
+  for (const auto& minuend : minuends)
+  {
+    auto& fragments = fragmentNodes.emplace_back();
+    for (auto& fragment : minuend.node->brush().subtract(
+           map.worldNode().mapFormat(),
+           map.worldBounds(),
+           map.currentMaterialName(),
+           minuend.subtrahends))
+    {
+      if (fragment.is_error())
+      {
+        ++failedFragments;
+        continue;
+      }
+      auto node = std::make_unique<mdl::BrushNode>(std::move(fragment).value());
+      fragments.push_back(node.get());
+      toAdd[minuend.node->parent()].push_back(std::move(node));
+    }
+  }
+
+  auto toRemove = std::vector<mdl::Node*>{};
+  auto fragmentsJson = QJsonObject{};
+  for (size_t i = 0; i < minuends.size(); ++i)
+  {
+    toRemove.push_back(minuends[i].node);
+  }
+  const auto keep = args.value("keep_subtractors").toBool(false);
+  if (!keep)
+  {
+    toRemove.insert(toRemove.end(), subtrahends.begin(), subtrahends.end());
+  }
+  const auto minuendIds = idsOf(doc.nodes, toRemove);
+
+  mdl::deselectAll(map);
+  if (!toAdd.empty() && mdl::addNodes(map, std::move(toAdd)).empty())
+  {
+    return toolError("operation_failed", "the fragments could not be added");
+  }
+  mdl::removeNodes(map, toRemove);
+
+  for (size_t i = 0; i < minuends.size(); ++i)
+  {
+    fragmentsJson[minuendIds[qsizetype(i)].toString()] =
+      idsOf(doc.nodes, fragmentNodes[i]);
+  }
+
+  if (failedFragments > 0)
+  {
+    context.warnings.push_back(
+      QString{"%1 fragments were invalid and left out; check the result"}.arg(
+        failedFragments));
+  }
+
+  return QJsonObject{
+    {"fragments", fragmentsJson},
+    {"subtractors_kept", keep},
+  };
+}
+
+McpToolDef csgSubtractTool()
+{
+  return {
+    .name = "csg_subtract",
+    .title = "CSG Subtract",
+    .description =
+      "Cuts the brushes of subtract_ids out of the brushes they overlap (or out of "
+      "from_ids), e.g. to cut a doorway into a wall. Brushes that only touch are not "
+      "changed. The cut brushes are replaced by fragments with new ids; the subtracted "
+      "brushes are deleted unless keep_subtractors is true.",
+    .inputSchema = schema::object(
+      {
+        {"subtract_ids",
+         schema::nodeIds(schema::MaxNodeIds, "brushes, groups or brush entities")},
+        {"from_ids",
+         schema::nodeIds(
+           schema::MaxNodeIds, "brushes to cut (default: all brushes they overlap)")},
+        {"keep_subtractors", schema::boolean("keep the subtracted brushes")},
+      },
+      {"subtract_ids"}),
+    .kind = McpToolKind::Mutate,
+    .annotations = Destructive,
+    .allowedInBatch = true,
+    .run = csgSubtract,
+  };
+}
+
 } // namespace
 
 void registerMcpMapEditTools(McpToolDispatcher& dispatcher)
@@ -1053,6 +1929,12 @@ void registerMcpMapEditTools(McpToolDispatcher& dispatcher)
   dispatcher.add(deleteNodesTool());
   dispatcher.add(setEntityPropertiesTool());
   dispatcher.add(setFaceAttributesTool());
+  dispatcher.add(resizeNodesTool());
+  dispatcher.add(snapVerticesTool());
+  dispatcher.add(duplicateNodesTool());
+  dispatcher.add(replaceMaterialTool());
+  dispatcher.add(csgTool());
+  dispatcher.add(csgSubtractTool());
 }
 
 } // namespace tb::ui

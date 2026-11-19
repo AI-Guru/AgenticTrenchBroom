@@ -34,6 +34,7 @@
 #include "mdl/Map_Nodes.h"
 #include "mdl/Map_Selection.h"
 #include "mdl/PatchNode.h"
+#include "mdl/Transaction.h"
 #include "mdl/WorldNode.h"
 #include "ui/CatchConfig.h"
 #include "ui/McpNodeRegistry.h"
@@ -432,6 +433,58 @@ TEST_CASE("McpNodeRegistry")
       CHECK(changes.created.empty());
       CHECK(changes.removed.empty());
       CHECK(changes.modified.empty());
+    }
+  }
+
+  SECTION("restoreIdsAfterRollback")
+  {
+    auto registry = McpNodeRegistry{map};
+    auto* brush = addBrush(map, vm::bbox3d{{0, 0, 0}, {16, 16, 16}});
+    auto* entity =
+      addBrushEntity(map, "func_door", {vm::bbox3d{{32, 0, 0}, {48, 16, 16}}});
+    const auto entityBrush = entity->children().front();
+    CHECK(registry.idOf(*brush) == "B2");
+    CHECK(registry.idOf(*entity) == "E3");
+    CHECK(registry.idOf(*entityBrush) == "B4");
+
+    SECTION("removed and re-added nodes get their ids back")
+    {
+      registry.beginRecording();
+      {
+        auto transaction = mdl::Transaction{map, "test"};
+        mdl::removeNodes(map, {brush, entity});
+        addBrush(map, vm::bbox3d{{64, 0, 0}, {80, 16, 16}});
+        transaction.cancel();
+      }
+
+      // the rollback re-added the nodes with new ids
+      CHECK(registry.idOf(*brush) != "B2");
+      registry.restoreIdsAfterRollback();
+      CHECK(registry.idOf(*brush) == "B2");
+      CHECK(registry.idOf(*entity) == "E3");
+      CHECK(registry.idOf(*entityBrush) == "B4");
+      CHECK(registry.lookup(u"B2").status == McpNodeRegistry::LookupStatus::Live);
+      CHECK(registry.verifyBijection());
+
+      const auto changes = registry.endRecording();
+      CHECK(changes.created.empty());
+      CHECK(changes.removed.empty());
+    }
+
+    SECTION("nodes that were not re-added stay removed")
+    {
+      registry.beginRecording();
+      mdl::removeNodes(map, {brush});
+      registry.restoreIdsAfterRollback();
+      CHECK(registry.lookup(u"B2").status == McpNodeRegistry::LookupStatus::Stale);
+      CHECK(registry.endRecording().removed == ids({"B2"}));
+      CHECK(registry.verifyBijection());
+    }
+
+    SECTION("without recording")
+    {
+      registry.restoreIdsAfterRollback();
+      CHECK(registry.verifyBijection());
     }
   }
 

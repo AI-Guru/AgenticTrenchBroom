@@ -36,12 +36,14 @@
 #include "mdl/Map.h"
 #include "mdl/Map_CopyPaste.h"
 #include "mdl/Map_Geometry.h"
+#include "mdl/Map_Groups.h"
 #include "mdl/Map_Nodes.h"
 #include "mdl/Map_Selection.h"
 #include "mdl/Map_World.h"
 #include "mdl/NodeReader.h"
 #include "mdl/PasteType.h"
 #include "mdl/PatchNode.h"
+#include "mdl/Polyhedron3.h"
 #include "mdl/Selection.h"
 #include "mdl/SoftMapBounds.h"
 #include "mdl/WorldNode.h"
@@ -56,10 +58,13 @@
 #include "vm/bbox.h"
 #include "vm/vec.h"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
+#include <map>
 #include <ranges>
 #include <set>
+#include <variant>
 
 namespace tb::ui
 {
@@ -753,6 +758,641 @@ McpToolDef pasteMapTextTool()
   };
 }
 
+// shared by the brush creation tools
+
+mdl::BrushBuilder brushBuilder(const mdl::Map& map)
+{
+  const auto& faceAttribsConfig = map.gameInfo().gameConfig.faceAttribsConfig;
+  return mdl::BrushBuilder{
+    map.worldNode().mapFormat(),
+    map.worldBounds(),
+    faceAttribsConfig.defaultUvAttributes,
+    faceAttribsConfig.defaultSurfaceAttributes};
+}
+
+mcp::ToolError geometryError(const Error& error, const QString& hint)
+{
+  return toolError("geometry_invalid", QString::fromStdString(error.msg), hint);
+}
+
+bool hasNonIntegerVertices(const mdl::Brush& brush)
+{
+  return std::ranges::any_of(brush.vertexPositions(), [](const vm::vec3d& position) {
+    for (size_t i = 0; i < 3; ++i)
+    {
+      if (std::abs(position[i] - std::round(position[i])) > 1e-6)
+      {
+        return true;
+      }
+    }
+    return false;
+  });
+}
+
+/** Adds the given brushes to the parent and returns the added nodes in order. */
+McpResult<std::vector<mdl::BrushNode*>> addBrushes(
+  mdl::Map& map, mdl::Node& parent, std::vector<mdl::Brush> brushes)
+{
+  auto nodes = std::vector<std::unique_ptr<mdl::Node>>{};
+  auto brushNodes = std::vector<mdl::BrushNode*>{};
+  for (auto& brush : brushes)
+  {
+    auto brushNode = std::make_unique<mdl::BrushNode>(std::move(brush));
+    brushNodes.push_back(brushNode.get());
+    nodes.push_back(std::move(brushNode));
+  }
+  if (mdl::addNodes(map, parent, std::move(nodes)).empty())
+  {
+    return toolError("operation_failed", "the brushes could not be added");
+  }
+  return brushNodes;
+}
+
+McpResult<std::optional<QString>> groupNameArgument(const QJsonObject& args)
+{
+  if (!args.contains("group_name"))
+  {
+    return std::nullopt;
+  }
+  const auto name = args.value("group_name").toString();
+  if (auto check = checkMapText(name, McpMapText::Value); check.is_error())
+  {
+    auto error = errorOf(check);
+    error.details["pointer"] = "/group_name";
+    return error;
+  }
+  return std::optional{name};
+}
+
+/** Groups the given nodes; they must have the same parent. */
+McpResult<mdl::GroupNode*> groupNewNodes(
+  mdl::Map& map, const std::vector<mdl::Node*>& nodes, const QString& name)
+{
+  mdl::deselectAll(map);
+  mdl::selectNodes(map, nodes);
+  auto* groupNode = mdl::groupSelectedNodes(map, fromUnicode(map, name));
+  if (!groupNode)
+  {
+    return toolError("operation_failed", "the brushes could not be grouped");
+  }
+  return groupNode;
+}
+
+McpResult<mdl::Node*> brushParentArgument(
+  const McpDocumentState& doc, const QJsonObject& args, const bool grouped)
+{
+  auto parent = resolveParent(doc, optionalString(args, "parent"));
+  if (parent.is_error())
+  {
+    return parent;
+  }
+  if (grouped && dynamic_cast<const mdl::EntityNode*>(parent.value()))
+  {
+    return toolError(
+      "invalid_argument",
+      "group_name cannot be used with a brush entity parent",
+      "omit group_name or pass a layer or group as parent",
+      {{"pointer", "/group_name"}});
+  }
+  return parent;
+}
+
+// create_hollow_box
+
+constexpr auto MinWallThickness = 0.001;
+constexpr auto MaxWallThickness = 4096.0;
+
+/** The walls of a hollow box in the order in which they are created. */
+const auto WallSides = std::array<QString, 6>{"+x", "-x", "+y", "-y", "+z", "-z"};
+
+/**
+ * Returns the wall on the given side. The walls do not overlap: the z slabs span the
+ * outer box in x and y, the x walls span the outer box in y and the inner box in z, and
+ * the y walls span the inner box in x and z.
+ */
+vm::bbox3d wallBounds(
+  const QString& side, const vm::bbox3d& inner, const vm::bbox3d& outer)
+{
+  const auto& i = inner;
+  const auto& o = outer;
+  if (side == u"+x")
+  {
+    return {{i.max.x(), o.min.y(), i.min.z()}, {o.max.x(), o.max.y(), i.max.z()}};
+  }
+  if (side == u"-x")
+  {
+    return {{o.min.x(), o.min.y(), i.min.z()}, {i.min.x(), o.max.y(), i.max.z()}};
+  }
+  if (side == u"+y")
+  {
+    return {{i.min.x(), i.max.y(), i.min.z()}, {i.max.x(), o.max.y(), i.max.z()}};
+  }
+  if (side == u"-y")
+  {
+    return {{i.min.x(), o.min.y(), i.min.z()}, {i.max.x(), i.min.y(), i.max.z()}};
+  }
+  if (side == u"+z")
+  {
+    return {{o.min.x(), o.min.y(), i.max.z()}, o.max};
+  }
+  return {o.min, {o.max.x(), o.max.y(), i.min.z()}};
+}
+
+McpResult<QJsonObject> createHollowBox(McpCallContext& context, const QJsonObject& args)
+{
+  auto& doc = context.doc;
+  auto& map = doc.map;
+
+  auto innerResult = bounds(args.value("inner_bounds"), "/inner_bounds");
+  if (innerResult.is_error())
+  {
+    return errorOf(innerResult);
+  }
+  auto innerBox = boxInWorld(map, innerResult.value().min, innerResult.value().max);
+  if (innerBox.is_error())
+  {
+    auto error = errorOf(innerBox);
+    error.details["pointer"] = "/inner_bounds";
+    return error;
+  }
+  const auto inner = innerBox.value();
+
+  const auto thickness = args.value("wall_thickness").toDouble();
+  const auto delta = vm::vec3d::fill(thickness);
+  auto outerBox = boxInWorld(map, inner.min - delta, inner.max + delta);
+  if (outerBox.is_error())
+  {
+    auto error = errorOf(outerBox);
+    error.message = "the outer box (inner_bounds plus wall_thickness): " + error.message;
+    return error;
+  }
+  const auto outer = outerBox.value();
+
+  auto materialResult = materialArgument(map, args, "material");
+  if (materialResult.is_error())
+  {
+    return errorOf(materialResult);
+  }
+  const auto material = materialResult.value();
+
+  const auto sideMaterials = args.value("side_materials").toObject();
+  auto wallMaterials = std::map<QString, std::string>{};
+  for (const auto& side : WallSides)
+  {
+    wallMaterials[side] = material;
+    if (sideMaterials.contains(side))
+    {
+      const auto name = sideMaterials.value(side).toString();
+      if (auto check = checkMaterialName(name, "/side_materials/" + side);
+          check.is_error())
+      {
+        return errorOf(check);
+      }
+      wallMaterials[side] = fromUnicode(map, name);
+    }
+  }
+
+  auto omitted = std::set<QString>{};
+  const auto omitSides = args.value("omit_sides").toArray();
+  for (qsizetype i = 0; i < omitSides.size(); ++i)
+  {
+    if (!omitted.insert(omitSides[i].toString()).second)
+    {
+      return toolError(
+        "invalid_argument",
+        QString{"/omit_sides/%1: %2 is listed twice"}.arg(i).arg(omitSides[i].toString()),
+        {},
+        {{"pointer", QString{"/omit_sides/%1"}.arg(i)}});
+    }
+  }
+
+  auto groupName = groupNameArgument(args);
+  if (groupName.is_error())
+  {
+    return errorOf(groupName);
+  }
+
+  auto parent = brushParentArgument(doc, args, groupName.value().has_value());
+  if (parent.is_error())
+  {
+    return errorOf(parent);
+  }
+
+  const auto builder = brushBuilder(map);
+  auto brushes = std::vector<mdl::Brush>{};
+  auto sides = std::vector<QString>{};
+  for (const auto& side : WallSides)
+  {
+    if (omitted.contains(side))
+    {
+      continue;
+    }
+    auto brush =
+      builder.createCuboid(wallBounds(side, inner, outer), wallMaterials[side]);
+    if (brush.is_error())
+    {
+      return geometryError(std::get<Error>(brush.error()), "check the bounds");
+    }
+    brushes.push_back(std::move(brush).value());
+    sides.push_back(side);
+  }
+
+  auto added = addBrushes(map, *parent.value(), std::move(brushes));
+  if (added.is_error())
+  {
+    return errorOf(added);
+  }
+
+  auto walls = QJsonObject{};
+  for (size_t i = 0; i < sides.size(); ++i)
+  {
+    walls[sides[i]] = doc.nodes.idOf(*added.value()[i]);
+  }
+  auto result = QJsonObject{
+    {"walls", walls},
+    {"inner_bounds", toJson(inner)},
+    {"outer_bounds", toJson(outer)},
+  };
+
+  if (groupName.value())
+  {
+    auto groupNode = groupNewNodes(
+      map,
+      std::vector<mdl::Node*>{added.value().begin(), added.value().end()},
+      *groupName.value());
+    if (groupNode.is_error())
+    {
+      return errorOf(groupNode);
+    }
+    result["group"] = doc.nodes.idOf(*groupNode.value());
+  }
+
+  auto materials = std::set<std::string>{};
+  for (const auto& side : sides)
+  {
+    materials.insert(wallMaterials[side]);
+  }
+  warnAboutMaterials(context, materials);
+  warnAboutBounds(context, outer);
+
+  return result;
+}
+
+McpToolDef createHollowBoxTool()
+{
+  auto sideMaterials = QJsonObject{};
+  for (const auto& side : WallSides)
+  {
+    sideMaterials[side] = schema::material();
+  }
+
+  return {
+    .name = "create_hollow_box",
+    .title = "Create Hollow Box",
+    .description =
+      "Creates a sealed room: six non-overlapping wall brushes around inner_bounds, "
+      "each wall_thickness thick. omit_sides leaves walls out, e.g. [\"+z\"] for no "
+      "ceiling. Verify with query_point and check_brush_overlaps.",
+    .inputSchema = schema::object(
+      {
+        {"inner_bounds", schema::bounds("the empty space inside the walls")},
+        {"wall_thickness", schema::number(MinWallThickness, MaxWallThickness, "e.g. 16")},
+        {"material", schema::material("material of all walls (default: current)")},
+        {"side_materials",
+         schema::describe(
+           schema::object(sideMaterials),
+           "material per wall, e.g. {\"-z\":\"floor\",\"+z\":\"ceiling\"}")},
+        {"omit_sides", schema::array(schema::side(), 1, 5, "walls to leave out")},
+        {"group_name", schema::string(1, 128, "group the walls under this name")},
+        {"parent", schema::nodeId("a layer or group (default: the current one)")},
+      },
+      {"inner_bounds", "wall_thickness"}),
+    .kind = McpToolKind::Mutate,
+    .annotations = Mutating,
+    .allowedInBatch = true,
+    .run = createHollowBox,
+  };
+}
+
+// create_primitive_brush
+
+constexpr auto MaxPrimitiveSides = 64;
+
+vm::axis::type axisArgument(const QJsonObject& args)
+{
+  const auto axis = args.value("axis").toString("z");
+  return axis == u"x" ? vm::axis::x : axis == u"y" ? vm::axis::y : vm::axis::z;
+}
+
+mdl::CircleShape circleShapeArgument(const QJsonObject& args)
+{
+  const auto alignment = args.value("alignment").toString("edge");
+  const auto sides = sizeArgument(args, "sides", 8);
+  if (alignment == u"vertex")
+  {
+    return mdl::VertexAlignedCircle{sides};
+  }
+  if (alignment == u"scalable")
+  {
+    return mdl::ScalableCircle{sizeArgument(args, "precision", 0)};
+  }
+  return mdl::EdgeAlignedCircle{sides};
+}
+
+McpResult<QJsonObject> createPrimitiveBrush(
+  McpCallContext& context, const QJsonObject& args)
+{
+  auto& doc = context.doc;
+  auto& map = doc.map;
+
+  auto boundsResult = bounds(args.value("bounds"), "/bounds");
+  if (boundsResult.is_error())
+  {
+    return errorOf(boundsResult);
+  }
+  auto boxResult = boxInWorld(map, boundsResult.value().min, boundsResult.value().max);
+  if (boxResult.is_error())
+  {
+    return errorOf(boxResult);
+  }
+  const auto box = boxResult.value();
+  const auto size = box.size();
+  for (size_t i = 0; i < 3; ++i)
+  {
+    if (size[i] < 1.0)
+    {
+      return toolError(
+        "invalid_argument",
+        "primitives must be at least 1 unit large along every axis",
+        "pass larger bounds",
+        {{"pointer", "/bounds"}});
+    }
+  }
+
+  const auto shape = args.value("shape").toString();
+  const auto axis = axisArgument(args);
+  const auto circleShape = circleShapeArgument(args);
+
+  // BrushBuilder::createUvSphere reads past the end of its ring tables for scalable
+  // circles with a precision above 0
+  if (
+    shape == u"uv_sphere" && std::holds_alternative<mdl::ScalableCircle>(circleShape)
+    && std::get<mdl::ScalableCircle>(circleShape).precision > 0)
+  {
+    return toolError(
+      "invalid_argument",
+      "scalable uv spheres only support precision 0",
+      "omit precision, or use edge or vertex alignment with sides and rings",
+      {{"pointer", "/precision"}});
+  }
+
+  const auto needsThickness = shape == u"hollow_cylinder" || shape == u"arch";
+  auto thickness = 0.0;
+  if (needsThickness)
+  {
+    // the two extents across the axis
+    const auto crossSection = std::min(size[(axis + 1) % 3], size[(axis + 2) % 3]);
+    thickness = args.value("thickness").toDouble(0.0);
+    if (
+      !args.contains("thickness") || !(thickness > 0.0 && thickness < crossSection / 2.0))
+    {
+      return toolError(
+        "invalid_argument",
+        QString{"%1 needs a thickness greater than 0 and less than %2"}.arg(shape).arg(
+          crossSection / 2.0),
+        "thickness is the wall thickness, e.g. 8",
+        {{"pointer", "/thickness"}});
+    }
+  }
+  else if (args.contains("thickness"))
+  {
+    context.warnings.push_back(QString{"thickness is ignored for %1"}.arg(shape));
+  }
+
+  auto materialResult = materialArgument(map, args, "material");
+  if (materialResult.is_error())
+  {
+    return errorOf(materialResult);
+  }
+  const auto material = materialResult.value();
+
+  auto parent = brushParentArgument(doc, args, false);
+  if (parent.is_error())
+  {
+    return errorOf(parent);
+  }
+
+  const auto builder = brushBuilder(map);
+  const auto single = [](Result<mdl::Brush> brush) -> Result<std::vector<mdl::Brush>> {
+    if (brush.is_error())
+    {
+      return std::get<Error>(brush.error());
+    }
+    auto result = std::vector<mdl::Brush>{};
+    result.push_back(std::move(brush).value());
+    return result;
+  };
+
+  auto brushes =
+    shape == u"cylinder"
+      ? single(builder.createCylinder(box, circleShape, axis, material))
+    : shape == u"cone" ? single(builder.createCone(box, circleShape, axis, material))
+    : shape == u"uv_sphere"
+      ? single(builder.createUvSphere(
+          box, circleShape, sizeArgument(args, "rings", 4), axis, material))
+    : shape == u"ico_sphere" ? single(builder.createIcoSphere(
+                                 box, sizeArgument(args, "iterations", 1), material))
+    : shape == u"hollow_cylinder"
+      ? builder.createHollowCylinder(box, thickness, circleShape, axis, material)
+      : builder.createArch(box, thickness, circleShape, axis, material);
+  if (brushes.is_error())
+  {
+    return geometryError(
+      std::get<Error>(brushes.error()), "try larger bounds or other parameters");
+  }
+  if (brushes.value().empty())
+  {
+    return toolError("geometry_invalid", "no brushes were created", "try larger bounds");
+  }
+
+  const auto nonInteger = std::ranges::any_of(
+    brushes.value(), [](const auto& brush) { return hasNonIntegerVertices(brush); });
+
+  auto added = addBrushes(map, *parent.value(), std::move(brushes).value());
+  if (added.is_error())
+  {
+    return errorOf(added);
+  }
+
+  auto ids = QJsonArray{};
+  for (const auto* brushNode : added.value())
+  {
+    ids.append(doc.nodes.idOf(*brushNode));
+  }
+
+  warnAboutMaterials(context, {material});
+  warnAboutBounds(context, box);
+  if (nonInteger)
+  {
+    context.warnings.push_back(
+      "some vertices are not on integer coordinates; call snap_vertices to fix them");
+  }
+
+  return QJsonObject{{"ids", ids}};
+}
+
+McpToolDef createPrimitiveBrushTool()
+{
+  return {
+    .name = "create_primitive_brush",
+    .title = "Create Primitive Brush",
+    .description =
+      "Creates a cylinder, cone, sphere, hollow cylinder or arch filling the given "
+      "bounds, built like TrenchBroom's shape tool. Hollow cylinders and arches consist "
+      "of several brushes and need a thickness. Verify with get_brush_geometry.",
+    .inputSchema = schema::object(
+      {
+        {"shape",
+         schema::stringEnum(
+           {"cylinder", "cone", "uv_sphere", "ico_sphere", "hollow_cylinder", "arch"})},
+        {"bounds", schema::bounds("the box the shape fills")},
+        {"axis",
+         schema::stringEnum(
+           {"x", "y", "z"},
+           "the axis of cylinders, cones and spheres, or the tunnel direction of arches "
+           "(default z)")},
+        {"sides", schema::integer(3, MaxPrimitiveSides, "number of sides (default 8)")},
+        {"alignment",
+         schema::stringEnum(
+           {"edge", "vertex", "scalable"},
+           "edge or vertex aligned circles with the given sides, or scalable circles "
+           "with 12, 24, 48 or 96 sides depending on precision (default edge)")},
+        {"precision",
+         schema::integer(
+           0, 3, "precision of scalable circles (default 0; uv spheres only support 0)")},
+        {"rings", schema::integer(2, 32, "rings of uv spheres (default 4)")},
+        {"iterations", schema::integer(0, 3, "subdivisions of ico spheres (default 1)")},
+        {"thickness",
+         schema::number(0, 1e6, "wall thickness of hollow cylinders and arches")},
+        {"material", schema::material("default: the current material")},
+        {"parent", schema::nodeId("a layer, group or brush entity (default: current)")},
+      },
+      {"shape", "bounds"}),
+    .kind = McpToolKind::Mutate,
+    .annotations = Mutating,
+    .allowedInBatch = true,
+    .run = createPrimitiveBrush,
+  };
+}
+
+// create_brush_from_points
+
+constexpr auto MinBrushPoints = 4;
+constexpr auto MaxBrushPoints = 256;
+
+McpResult<QJsonObject> createBrushFromPoints(
+  McpCallContext& context, const QJsonObject& args)
+{
+  auto& doc = context.doc;
+  auto& map = doc.map;
+
+  const auto pointsArg = args.value("points").toArray();
+  auto points = std::vector<vm::vec3d>{};
+  for (qsizetype i = 0; i < pointsArg.size(); ++i)
+  {
+    const auto pointer = QString{"/points/%1"}.arg(i);
+    auto point = vec3(pointsArg[i], pointer);
+    if (point.is_error())
+    {
+      return errorOf(point);
+    }
+    if (!map.worldBounds().contains(point.value()))
+    {
+      return toolError(
+        "out_of_world_bounds",
+        QString{"%1 is not inside the world bounds"}.arg(pointer),
+        "keep coordinates inside world_bounds (see get_map_info)",
+        {{"pointer", pointer}, {"world_bounds", toJson(map.worldBounds())}});
+    }
+    points.push_back(point.value());
+  }
+
+  auto materialResult = materialArgument(map, args, "material");
+  if (materialResult.is_error())
+  {
+    return errorOf(materialResult);
+  }
+  const auto material = materialResult.value();
+
+  auto parent = brushParentArgument(doc, args, false);
+  if (parent.is_error())
+  {
+    return errorOf(parent);
+  }
+
+  const auto polyhedron = mdl::Polyhedron3{points};
+  if (!polyhedron.polyhedron() || !polyhedron.closed())
+  {
+    return toolError(
+      "geometry_invalid",
+      "the points do not span a volume",
+      "points must span a volume: pass at least 4 points that are not in one plane",
+      {{"pointer", "/points"}});
+  }
+
+  auto brush = brushBuilder(map).createBrush(polyhedron, material);
+  if (brush.is_error())
+  {
+    return geometryError(std::get<Error>(brush.error()), "points must span a volume");
+  }
+
+  const auto nonInteger = hasNonIntegerVertices(brush.value());
+  auto* brushNode = mdl::addNode(
+    map, *parent.value(), std::make_unique<mdl::BrushNode>(std::move(brush).value()));
+  if (!brushNode)
+  {
+    return toolError("operation_failed", "the brush could not be added");
+  }
+
+  warnAboutMaterials(context, {material});
+  warnAboutBounds(context, brushNode->logicalBounds());
+  if (nonInteger)
+  {
+    context.warnings.push_back(
+      "some vertices are not on integer coordinates; call snap_vertices to fix them");
+  }
+
+  return QJsonObject{
+    {"id", doc.nodes.idOf(*brushNode)},
+    {"vertex_count", qint64(brushNode->brush().vertexCount())},
+    {"face_count", qint64(brushNode->brush().faceCount())},
+  };
+}
+
+McpToolDef createBrushFromPointsTool()
+{
+  return {
+    .name = "create_brush_from_points",
+    .title = "Create Brush From Points",
+    .description =
+      "Creates the convex hull of the given points as one brush, e.g. a wedge or a "
+      "ramp. Points inside the hull are ignored. Verify with get_brush_geometry.",
+    .inputSchema = schema::object(
+      {
+        {"points",
+         schema::array(
+           schema::vec3(), MinBrushPoints, MaxBrushPoints, "the corners of the brush")},
+        {"material", schema::material("default: the current material")},
+        {"parent", schema::nodeId("a layer, group or brush entity (default: current)")},
+      },
+      {"points"}),
+    .kind = McpToolKind::Mutate,
+    .annotations = Mutating,
+    .allowedInBatch = true,
+    .run = createBrushFromPoints,
+  };
+}
+
 } // namespace
 
 void registerMcpMapCreateTools(McpToolDispatcher& dispatcher)
@@ -760,6 +1400,9 @@ void registerMcpMapCreateTools(McpToolDispatcher& dispatcher)
   dispatcher.add(createBoxBrushTool());
   dispatcher.add(createEntityTool());
   dispatcher.add(pasteMapTextTool());
+  dispatcher.add(createHollowBoxTool());
+  dispatcher.add(createPrimitiveBrushTool());
+  dispatcher.add(createBrushFromPointsTool());
 }
 
 } // namespace tb::ui

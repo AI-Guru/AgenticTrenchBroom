@@ -114,6 +114,15 @@ target_sources(TbUiLib
     ${CMAKE_CURRENT_SOURCE_DIR}/src/MaterialBrowser.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/MaterialBrowserView.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/MaterialCollectionEditor.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/McpDocumentState.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/McpJson.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/McpMapReadTools.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/McpMapTools.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/McpNodeRegistry.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/McpPreconditions.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/McpSchemas.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/McpSelectionGuard.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/McpToolDispatcher.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/MiniToolBarLayout.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/ModEditor.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/MousePreferencePane.cpp
@@ -301,6 +310,14 @@ target_sources(TbUiLib
     ${CMAKE_CURRENT_SOURCE_DIR}/include/ui/MaterialBrowser.h
     ${CMAKE_CURRENT_SOURCE_DIR}/include/ui/MaterialBrowserView.h
     ${CMAKE_CURRENT_SOURCE_DIR}/include/ui/MaterialCollectionEditor.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/ui/McpDocumentState.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/ui/McpJson.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/ui/McpMapTools.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/ui/McpNodeRegistry.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/ui/McpPreconditions.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/ui/McpSchemas.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/ui/McpSelectionGuard.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/ui/McpToolDispatcher.h
     ${CMAKE_CURRENT_SOURCE_DIR}/include/ui/MiniToolBarLayout.h
     ${CMAKE_CURRENT_SOURCE_DIR}/include/ui/ModEditor.h
     ${CMAKE_CURRENT_SOURCE_DIR}/include/ui/MousePreferencePane.h
@@ -382,6 +399,7 @@ target_link_libraries(TbUiLib
     cpptrace::cpptrace
     ctre::ctre
     Qt6::Svg
+    TbMcpLib
     TbQlLib
     TbVersionLib
   PUBLIC

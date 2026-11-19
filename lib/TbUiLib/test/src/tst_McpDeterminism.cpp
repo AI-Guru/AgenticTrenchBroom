@@ -1,0 +1,148 @@
+/*
+ Copyright (C) 2026 TrenchBroom contributors
+
+ This file is part of TrenchBroom.
+
+ TrenchBroom is free software: you can redistribute it and/or modify
+ it under the terms of the GNU General Public License as published by
+ the Free Software Foundation, either version 3 of the License, or
+ (at your option) any later version.
+
+ TrenchBroom is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ GNU General Public License for more details.
+
+ You should have received a copy of the GNU General Public License
+ along with TrenchBroom. If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#include <QJsonObject>
+
+#include "McpTestUtils.h"
+#include "mdl/BrushNode.h"
+#include "mdl/EntityNode.h"
+#include "mdl/Map.h"
+#include "mdl/Map_Entities.h"
+#include "mdl/Map_Geometry.h"
+#include "mdl/Map_Nodes.h"
+#include "mdl/Map_Selection.h"
+#include "ui/CatchConfig.h"
+
+#include "kd/overload.h"
+
+#include <functional>
+#include <variant>
+
+#include <catch2/catch_test_macros.hpp>
+
+namespace tb::ui
+{
+namespace
+{
+
+struct Call
+{
+  const char* tool;
+  const char* args;
+};
+
+/** A direct edit, as the user would make it, between tool calls. */
+using Edit = std::function<void(McpMapToolsFixture&, const McpTestScene&)>;
+
+using Step = std::variant<Call, Edit>;
+
+std::vector<QString> runScript(const std::vector<Step>& script)
+{
+  auto f = McpMapToolsFixture{};
+  const auto scene = populateTestScene(f);
+
+  auto results = std::vector<QString>{};
+  for (const auto& step : script)
+  {
+    std::visit(
+      kdl::overload(
+        [&](const Call& call) {
+          results.push_back(compactJson(f.call(call.tool, call.args)));
+        },
+        [&](const Edit& edit) { edit(f, scene); }),
+      step);
+  }
+  return results;
+}
+
+} // namespace
+
+TEST_CASE("McpDeterminism")
+{
+  const auto script = std::vector<Step>{
+    Call{"get_map_info", "{}"},
+    Call{"get_scene_tree", "{}"},
+    Call{"get_scene_tree", R"({"include_brushes":true,"limit":5})"},
+    Call{"get_scene_tree", R"({"include_brushes":true,"offset":5})"},
+    Call{"find_nodes", "{}"},
+    Call{"find_nodes", R"({"types":["brush"],"material":"*"})"},
+    Call{"find_nodes", R"({"text":"*"})"},
+    Call{"get_nodes", R"({"ids":["world","L1","B2","E3","E4","G8","P9","L10","E11"]})"},
+    Call{"get_brush_geometry", R"({"ids":["B2","B5","B6","B7"]})"},
+    Edit{[](McpMapToolsFixture& f, const McpTestScene& scene) {
+      mdl::selectNodes(f.map, {scene.wall, scene.light});
+    }},
+    Call{"get_selection", "{}"},
+    Call{"get_map_info", "{}"},
+    Call{"get_nodes", R"({"ids":["@selection"]})"},
+    Edit{[](McpMapToolsFixture& f, const McpTestScene&) {
+      mdl::rotateSelection(f.map, {32, 32, 32}, {0, 0, 1}, vm::to_radians(30.0));
+    }},
+    Call{"get_brush_geometry", R"({"ids":["@selection"]})"},
+    Call{"get_brush_geometry", R"({"ids":["B2"],"include_faces":false})"},
+    Edit{[](McpMapToolsFixture& f, const McpTestScene& scene) {
+      mdl::deselectAll(f.map);
+      mdl::removeNodes(f.map, {scene.door});
+    }},
+    Call{"get_nodes", R"({"ids":["E4"]})"},
+    Call{"get_nodes", R"({"ids":["B5"]})"},
+    Call{"find_nodes", R"({"classname":"*"})"},
+    Edit{[](McpMapToolsFixture& f, const McpTestScene&) { f.map.undoCommand(); }},
+    Call{"find_nodes", R"({"classname":"func_door"})"},
+    Call{"get_scene_tree", R"({"types":["entity"]})"},
+    Call{"get_map_info", "{}"},
+    Edit{[](McpMapToolsFixture& f, const McpTestScene&) {
+      addBrush(f.map, vm::bbox3d{{256, 0, 0}, {320, 64, 64}}, "new");
+    }},
+    Call{"find_nodes", R"({"material":"new"})"},
+    Call{"get_brush_geometry", R"({"ids":["B15"]})"},
+    Edit{[](McpMapToolsFixture& f, const McpTestScene& scene) {
+      mdl::selectBrushFaces(f.map, {{*scene.floor, 2}});
+    }},
+    Call{"get_selection", "{}"},
+    Call{"find_nodes", R"({"intersects":{"min":[0,0,0],"max":[300,300,300]}})"},
+    Call{"get_scene_tree", R"({"root":"L10","max_depth":0})"},
+    Call{"get_nodes", R"({"ids":["B999"]})"},
+    Call{"get_brush_geometry", R"({"ids":["E3"]})"},
+    Call{"find_nodes", R"({"inside":{"min":[1,0,0],"max":[0,1,1]}})"},
+    Call{"get_map_info", "{}"},
+    Call{"get_scene_tree", R"({"include_brushes":true})"},
+  };
+
+  const auto callCount = std::ranges::count_if(
+    script, [](const auto& step) { return std::holds_alternative<Call>(step); });
+  REQUIRE(callCount >= 30);
+
+  const auto first = runScript(script);
+  const auto second = runScript(script);
+  REQUIRE(first.size() == second.size());
+  for (size_t i = 0; i < first.size(); ++i)
+  {
+    CAPTURE(i);
+    CHECK(first[i] == second[i]);
+  }
+
+  // the script must exercise errors as well as successes
+  CHECK(std::ranges::any_of(
+    first, [](const auto& r) { return r.contains("\"isError\":true"); }));
+  CHECK(std::ranges::any_of(
+    first, [](const auto& r) { return r.contains("\"isError\":false"); }));
+}
+
+} // namespace tb::ui

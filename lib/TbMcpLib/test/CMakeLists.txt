@@ -4,6 +4,7 @@ add_compile_definitions(CATCH_CONFIG_ENABLE_ALL_STRINGMAKERS=1)
 
 target_sources(TbMcpLibTest PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/src/tst_Http.cpp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/tst_HttpTransport.cpp"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/tst_JsonRpc.cpp"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/tst_JsonSchema.cpp"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/tst_Server.cpp"

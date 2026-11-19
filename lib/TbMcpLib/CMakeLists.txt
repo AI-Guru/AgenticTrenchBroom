@@ -3,6 +3,7 @@ add_library(TbMcpLib STATIC)
 target_sources(TbMcpLib
   PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src/Http.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/HttpTransport.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/JsonRpc.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/JsonSchema.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/Server.cpp
@@ -12,6 +13,7 @@ target_sources(TbMcpLib
     BASE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/include
     FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/include/mcp/Http.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/mcp/HttpTransport.h
     ${CMAKE_CURRENT_SOURCE_DIR}/include/mcp/JsonRpc.h
     ${CMAKE_CURRENT_SOURCE_DIR}/include/mcp/JsonSchema.h
     ${CMAKE_CURRENT_SOURCE_DIR}/include/mcp/Server.h

@@ -21,6 +21,10 @@ The library is split into layers that can be tested on their own:
   sessions on top of the
   [Streamable HTTP](https://modelcontextprotocol.io/specification/2025-06-18/basic/transports#streamable-http)
   transport. The server maps an `HttpRequest` to an `HttpResponse` and does no I/O itself.
+- `HttpTransport.h`: a small HTTP/1.1 server on `QTcpServer` that listens on 127.0.0.1
+  only and passes each request to a handler such as `Server::handle`. It supports
+  keep-alive and pipelining, enforces the parser's size limits, limits the number of
+  connections and closes idle connections.
 
 The server supports the protocol versions 2025-06-18 and 2025-03-26. It only sends JSON
 responses (no server-sent events), never sends requests to the client and does not
@@ -51,8 +55,17 @@ tools.add(tb::mcp::ToolSpec{
 });
 
 auto server = tb::mcp::Server{tb::mcp::ServerInfo{.version = "1.0"}, tools};
-const auto response = server.handle(request, localPort);
+auto transport = tb::mcp::HttpTransport{
+  [&](const tb::mcp::HttpRequest& request, const quint16 localPort) {
+    return server.handle(request, localPort);
+  }};
+if (const auto result = transport.listen(6767); result.is_error())
+{
+  // the port is in use
+}
 ```
+
+The transport must not be destroyed from within the handler; use `deleteLater` instead.
 
 Tool handlers receive arguments that have not been validated yet; callers are expected to
 run `tb::mcp::validate` against the input schema first.

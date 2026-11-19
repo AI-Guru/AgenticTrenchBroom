@@ -20,6 +20,7 @@
 #include <QApplication>
 #include <QComboBox>
 #include <QCommandLineParser>
+#include <QDebug>
 #include <QEvent>
 #include <QFile>
 #include <QFileInfo>
@@ -46,6 +47,7 @@
 #include "ui/FileEventFilter.h"
 #include "ui/MapWindow.h"
 #include "ui/MapWindowManager.h"
+#include "ui/McpController.h"
 #include "ui/QPathUtils.h"
 #include "ui/QPreferenceStore.h"
 #include "ui/RecentDocuments.h"
@@ -57,6 +59,8 @@
 #include <chrono>
 #include <deque>
 #endif
+
+#include <optional>
 
 using namespace std::chrono_literals;
 using namespace tb;
@@ -297,15 +301,39 @@ bool openFiles(AppController& appController, const QStringList& fileNames)
   return anyDocumentOpened;
 }
 
+struct CommandLineOptions
+{
+  QStringList fileNames;
+  std::optional<quint16> mcpPort;
+};
+
 /**
- * Parses the command line, applies any options, and returns the files to open.
+ * Parses the command line, applies any options, and returns the files to open and the
+ * remaining options.
  */
-QStringList parseCommandLine()
+CommandLineOptions parseCommandLine()
 {
   auto parser = QCommandLineParser{};
   parser.addOption(QCommandLineOption("portable"));
   parser.addOption(QCommandLineOption("enableDraftReleaseUpdates"));
+  parser.addOption(QCommandLineOption{
+    "mcp-port", "Start the MCP server on 127.0.0.1:<port> (0 = any free port).", "port"});
   parser.process(*qApp);
+
+  auto mcpPort = std::optional<quint16>{};
+  if (parser.isSet("mcp-port"))
+  {
+    auto ok = false;
+    const auto port = parser.value("mcp-port").toInt(&ok);
+    if (ok && port >= 0 && port <= 65535)
+    {
+      mcpPort = quint16(port);
+    }
+    else
+    {
+      qWarning() << "Ignoring invalid --mcp-port" << parser.value("mcp-port");
+    }
+  }
 
   if (parser.isSet("enableDraftReleaseUpdates"))
   {
@@ -315,7 +343,7 @@ QStringList parseCommandLine()
     prefs.saveChanges();
   }
 
-  return parser.positionalArguments();
+  return {parser.positionalArguments(), mcpPort};
 }
 
 #if !defined(Q_OS_MACOS)
@@ -529,7 +557,8 @@ int main(int argc, char* argv[])
   PreferenceManager::createInstance(
     std::make_unique<QPreferenceStore>(pathAsQString(SystemPaths::preferenceFilePath())));
 
-  const auto fileNames = parseCommandLine();
+  const auto options = parseCommandLine();
+  const auto& fileNames = options.fileNames;
 
 #if !defined(Q_OS_MACOS)
   // On macOS, the system ensures that only one instance is running and sends the files
@@ -567,6 +596,12 @@ int main(int argc, char* argv[])
   populateMainMenu(*appController);
   installFileEventFilter(*appController);
 #endif
+
+  // Start before anything may show a modal dialog, so that clients get editor_busy
+  // instead of no answer while it is open. The port given on the command line overrides
+  // the preferences without changing them.
+  auto mcpController = McpController{*appController};
+  mcpController.start(options.mcpPort);
 
   appController->askForAutoUpdates();
   appController->triggerAutoUpdateCheck();

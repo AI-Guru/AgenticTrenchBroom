@@ -181,6 +181,30 @@ TEST_CASE("McpDeterminism")
                         {"tool":"delete_nodes","arguments":{"ids":["B999"]}}]})"},
     Call{"get_scene_tree", R"({"include_brushes":true})"},
     Call{"get_log", "{}"},
+    // agent helper tools
+    Call{"get_conventions", "{}"},
+    Call{"checkpoint_create", R"({"name":"helpers"})"},
+    Call{
+      "create_room",
+      R"({"inner_bounds":{"min":[1024,0,0],"max":[1280,256,128]},
+          "openings":[{"side":"-x","width":64,"height":96}],"group_name":"room2"})"},
+    Call{
+      "create_stairs",
+      R"({"start":[1100,128,0],"direction":"+y","steps":4,"step_height":8.5})"},
+    Call{"create_entity", R"({"classname":"light","origin":[1100,64,100]})"},
+    Call{"drop_to_floor", R"({"ids":["@selection","E3"]})"},
+    Call{"align_nodes", R"({"ids":["E3"],"to":"B2","side":"+z","mode":"center"})"},
+    Call{"clip_brush", R"({"id":"B2","plane":{"point":[16,0,0],"normal":[1,0.5,0]}})"},
+    Call{
+      "describe_region", R"({"bounds":{"min":[1000,-100,-100],"max":[1300,300,200]}})"},
+    Call{
+      "batch",
+      R"({"dry_run":true,"operations":[{"tool":"delete_nodes","arguments":{"ids":["B2"]}},
+                                      {"tool":"get_map_stats"}]})"},
+    Call{"open_group", R"({"id":"G8"})"},
+    Call{"close_group", "{}"},
+    Call{"checkpoint_revert", R"({"name":"helpers"})"},
+    Call{"checkpoint_diff", R"({"from":"helpers"})"},
   };
 
   const auto callCount = std::ranges::count_if(

@@ -962,6 +962,126 @@ TEST_CASE("McpMapEditTools")
       CHECK(g.map.modificationCount() == before.modificationCount);
     }
   }
+
+  SECTION("clip_brush")
+  {
+    const auto geometry = [&](const QString& id) {
+      return f.ok("get_brush_geometry", QJsonObject{{"ids", QJsonArray{id}}})
+        .value("brushes")
+        .toArray()[0]
+        .toObject();
+    };
+
+    SECTION("keeps the part behind the plane")
+    {
+      const auto digest = contentDigest(f.doc->nodes, f.map);
+      const auto result =
+        f.ok("clip_brush", R"({"id":"B2","plane":{"point":[32,0,0],"normal":[2,0,0]}})");
+      CHECK(result.value("id") == QJsonValue{"B2"});
+      CHECK(result.value("kept") == QJsonValue{"back"});
+      CHECK(result.value("bounds") == QJsonValue{boundsJson({0, 0, 0}, {32, 64, 64})});
+      CHECK(!result.contains("front_id"));
+      CHECK(result.value("undo_label") == QJsonValue{"MCP: Clip Brush"});
+      CHECK(result.value("changes")
+              .toObject()
+              .value("modified")
+              .toArray()
+              .contains(QJsonValue{"B2"}));
+      CHECK(geometry("B2").value("volume") == QJsonValue{32 * 64 * 64});
+      CHECK(faceWithSide(faces(f, "B2"), "+x").value("distance") == QJsonValue{32});
+
+      f.map.undoCommand();
+      CHECK(contentDigest(f.doc->nodes, f.map) == digest);
+    }
+
+    SECTION("keeps the front part")
+    {
+      const auto result = f.ok(
+        "clip_brush",
+        R"({"id":"B2","plane":{"point":[0,0,16],"normal":[0,0,1]},"keep":"front"})");
+      CHECK(result.value("bounds") == QJsonValue{boundsJson({0, 0, 16}, {64, 64, 64})});
+    }
+
+    SECTION("keeps both parts")
+    {
+      const auto result = f.ok(
+        "clip_brush",
+        R"({"id":"B2","plane":{"point":[0,48,0],"normal":[0,1,0]},"keep":"both"})");
+      CHECK(result.value("bounds") == QJsonValue{boundsJson({0, 0, 0}, {64, 48, 64})});
+      CHECK(result.value("front_id") == QJsonValue{"B12"});
+      CHECK(
+        result.value("front_bounds") == QJsonValue{boundsJson({0, 48, 0}, {64, 64, 64})});
+      CHECK(nodeBounds(f, "B12") == boundsJson({0, 48, 0}, {64, 64, 64}));
+      CHECK(
+        f.ok("check_brush_overlaps", R"({"ids":["B2","B12"]})").value("pairs")
+        == QJsonValue{QJsonArray{}});
+    }
+
+    SECTION("the plane points are ordered so that the normal points to the front")
+    {
+      for (const auto& [normal, back] : std::vector<std::pair<vm::vec3d, vm::bbox3d>>{
+             {{1, 0, 0}, {{0, 0, 0}, {32, 64, 64}}},
+             {{-1, 0, 0}, {{32, 0, 0}, {64, 64, 64}}},
+             {{0, 1, 0}, {{0, 0, 0}, {64, 32, 64}}},
+             {{0, -1, 0}, {{0, 32, 0}, {64, 64, 64}}},
+             {{0, 0, 1}, {{0, 0, 0}, {64, 64, 32}}},
+             {{0, 0, -1}, {{0, 0, 32}, {64, 64, 64}}},
+           })
+      {
+        CAPTURE(normal);
+        const auto result = f.ok(
+          "clip_brush",
+          QJsonObject{
+            {"id", "B2"},
+            {"plane",
+             QJsonObject{
+               {"point", QJsonArray{32, 32, 32}}, {"normal", toJson(normal)}}}});
+        CHECK(result.value("bounds") == QJsonValue{boundsJson(back.min, back.max)});
+        f.map.undoCommand();
+      }
+
+      // an oblique plane keeps the vertices behind it
+      f.ok("clip_brush", R"({"id":"B2","plane":{"point":[32,32,0],"normal":[1,1,0]}})");
+      const auto brush = geometry("B2");
+      CHECK(brush.value("volume") == QJsonValue{64 * 64 * 64 / 2});
+      for (const auto& vertex : brush.value("vertices").toArray())
+      {
+        const auto v = vertex.toArray();
+        CHECK(v[0].toDouble() + v[1].toDouble() <= 64.0);
+      }
+    }
+
+    SECTION("errors")
+    {
+      const auto before = snapshot(f.map);
+      const auto err = [&](const char* args) { return f.err("clip_brush", args); };
+      CHECK(
+        err(R"({"id":"B2","plane":{"point":[100,0,0],"normal":[1,0,0]}})")
+        == "operation_failed");
+      CHECK(
+        err(R"({"id":"B2","plane":{"point":[64,0,0],"normal":[1,0,0]}})")
+        == "operation_failed");
+      CHECK(
+        err(R"({"id":"B2","plane":{"point":[32,0,0],"normal":[0,0,0]}})")
+        == "invalid_argument");
+      CHECK(
+        err(R"({"id":"B2","plane":{"point":[32,0,0],"normal":[1,0,0]},"keep":"none"})")
+        == "invalid_argument");
+      CHECK(
+        err(R"({"id":"E4","plane":{"point":[136,0,0],"normal":[1,0,0]}})")
+        == "invalid_argument");
+      CHECK(
+        err(R"({"id":"P9","plane":{"point":[1,0,0],"normal":[1,0,0]}})")
+        == "wrong_node_type");
+      CHECK(
+        err(R"({"id":"B7","plane":{"point":[32,0,0],"normal":[1,0,0]}})")
+        == "node_not_selectable");
+      CHECK(
+        err(R"({"id":"B99","plane":{"point":[32,0,0],"normal":[1,0,0]}})")
+        == "unknown_node");
+      CHECK(snapshot(f.map) == before);
+    }
+  }
 }
 
 } // namespace tb::ui

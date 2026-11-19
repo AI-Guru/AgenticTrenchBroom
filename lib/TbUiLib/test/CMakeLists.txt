@@ -35,6 +35,7 @@ target_sources(TbUiLibTest
     ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_McpMapCreateTools.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_McpMapEditTools.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_McpMapEvalTools.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_McpMapHelperTools.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_McpMapHistoryTools.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_McpMapReadTools.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_McpMapStructureTools.cpp

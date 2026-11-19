@@ -104,6 +104,11 @@ struct McpCallContext
 
   /** Tools append warnings here; they are returned to the client. */
   std::vector<QString> warnings = {};
+  /**
+   * Set by a Mutate tool to roll back what it did although it succeeded; its result is
+   * still returned (batch with dry_run).
+   */
+  bool discardChanges = false;
 };
 
 enum class McpToolKind

@@ -123,6 +123,7 @@ target_sources(TbUiLib
     ${CMAKE_CURRENT_SOURCE_DIR}/src/McpMapCreateTools.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/McpMapEditTools.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/McpMapEvalTools.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/McpMapHelperTools.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/McpMapHistoryTools.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/McpMapReadTools.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/McpMapStructureTools.cpp

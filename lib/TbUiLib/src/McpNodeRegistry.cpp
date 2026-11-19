@@ -350,6 +350,54 @@ void McpNodeRegistry::restoreIdsAfterRollback()
   }
 }
 
+bool McpNodeRegistry::reassignId(const mdl::Node& node, const QStringView staleId)
+{
+  const auto it = m_idByNode.find(&node);
+  const auto parsed = parseNumberedId(staleId);
+  if (it == m_idByNode.end() || !parsed)
+  {
+    return false;
+  }
+
+  const auto [letter, oldNumber] = *parsed;
+  if (
+    letter != kindLetter(node) || oldNumber >= m_next || m_nodeById.contains(oldNumber)
+    || std::ranges::any_of(
+      m_pending, [&](const auto& entry) { return entry.second == oldNumber; }))
+  {
+    return false;
+  }
+
+  const auto newNumber = it->second;
+  auto* liveNode = m_nodeById.at(newNumber);
+  m_nodeById.erase(newNumber);
+  it->second = oldNumber;
+  m_nodeById.emplace(oldNumber, liveNode);
+  m_letters.insert_or_assign(oldNumber, letter);
+  if (m_tombstones.erase(oldNumber) > 0)
+  {
+    std::erase(m_tombstoneOrder, oldNumber);
+  }
+
+  if (m_recording)
+  {
+    const auto wasCreated = m_recording->created.erase(newNumber) > 0;
+    m_recording->modified.erase(newNumber);
+    if (m_recording->removed.erase(oldNumber) > 0)
+    {
+      // removed and re-added during the recording
+      m_recording->modified.insert(oldNumber);
+    }
+    else if (wasCreated)
+    {
+      m_recording->created.insert(oldNumber);
+    }
+  }
+
+  addTombstone(newNumber, currentRemovalLabel());
+  return true;
+}
+
 void McpNodeRegistry::disconnectForTesting()
 {
   m_notifierConnection.disconnect();

@@ -23,15 +23,18 @@
 #include "McpTestUtils.h"
 #include "mdl/BrushFaceHandle.h"
 #include "mdl/BrushNode.h"
+#include "mdl/EditorContext.h"
 #include "mdl/EntityNode.h"
 #include "mdl/GroupNode.h"
 #include "mdl/LayerNode.h"
 #include "mdl/Map.h"
 #include "mdl/Map_Groups.h"
 #include "mdl/Map_Layers.h"
+#include "mdl/Map_NodeLocking.h"
 #include "mdl/Map_Selection.h"
 #include "mdl/PatchNode.h"
 #include "mdl/Selection.h"
+#include "mdl/WorldNode.h"
 #include "ui/CatchConfig.h"
 
 #include <catch2/catch_test_macros.hpp>
@@ -303,6 +306,114 @@ TEST_CASE("McpMapStructureTools")
         == "node_not_selectable");
       CHECK(
         f.err("move_to_layer", R"({"ids":["L1"],"layer":"L10"})") == "wrong_node_type");
+      CHECK(snapshot(f.map) == before);
+    }
+  }
+
+  SECTION("open_group")
+  {
+    SECTION("opens a group so that its children can be edited")
+    {
+      CHECK(
+        f.err("transform_nodes", R"({"ids":["B7"],"translate":[0,0,8]})")
+        == "node_not_selectable");
+
+      const auto result = f.ok("open_group", R"({"id":"G8"})");
+      CHECK(result.value("current_group") == QJsonValue{"G8"});
+      CHECK(result.value("undo_label") == QJsonValue{"MCP: Open Group"});
+      CHECK(f.map.editorContext().currentGroup() == scene.group);
+      CHECK(scene.group->opened());
+
+      f.ok("transform_nodes", R"({"ids":["B7"],"translate":[0,0,8]})");
+      // nodes outside of the open group cannot be edited now
+      CHECK(
+        f.err("transform_nodes", R"({"ids":["B2"],"translate":[0,0,8]})")
+        == "node_not_selectable");
+
+      // undo closes the group again
+      f.map.undoCommand();
+      f.map.undoCommand();
+      CHECK(f.map.editorContext().currentGroup() == nullptr);
+    }
+
+    SECTION("nested groups")
+    {
+      f.ok("open_group", R"({"id":"G8"})");
+      const auto inner =
+        f.ok("group_nodes", R"({"ids":["B7"],"name":"inner"})").value("group").toString();
+      f.ok("open_group", QJsonObject{{"id", inner}});
+      CHECK(f.ok("close_group").value("current_group") == QJsonValue{"G8"});
+    }
+
+    SECTION("errors")
+    {
+      const auto before = snapshot(f.map);
+      CHECK(f.err("open_group", R"({"id":"B2"})") == "wrong_node_type");
+      CHECK(f.err("open_group", R"({"id":"E4"})") == "wrong_node_type");
+      CHECK(f.err("open_group", R"({"id":"G99"})") == "unknown_node");
+      CHECK(f.err("open_group", R"({"id":"world"})") == "wrong_node_type");
+      CHECK(f.err("open_group", R"({})") == "invalid_argument");
+      CHECK(snapshot(f.map) == before);
+
+      f.ok("open_group", R"({"id":"G8"})");
+      const auto error = f.error("open_group", R"({"id":"G8"})");
+      CHECK(error.value("code") == QJsonValue{"node_not_selectable"});
+      CHECK(
+        error.value("details").toObject().value("reason") == QJsonValue{"group_open"});
+    }
+
+    SECTION("groups outside the open group are refused even if unlocked")
+    {
+      // EditorContext::pushGroup requires the group to be a child of the open group; an
+      // unlocked layer makes groups outside the open group selectable
+      const auto other =
+        f.ok("group_nodes", R"({"ids":["B2"],"name":"other"})").value("group").toString();
+      f.ok("open_group", R"({"id":"G8"})");
+      mdl::unlockNodes(f.map, {f.map.worldNode().defaultLayer()});
+
+      const auto before = snapshot(f.map);
+      const auto error = f.error("open_group", QJsonObject{{"id", other}});
+      CHECK(error.value("code") == QJsonValue{"node_not_selectable"});
+      CHECK(
+        error.value("details").toObject().value("reason")
+        == QJsonValue{"not_in_open_group"});
+      CHECK(snapshot(f.map) == before);
+      CHECK(f.map.editorContext().currentGroup() == scene.group);
+    }
+
+    SECTION("a group with an open descendant is refused even if unlocked")
+    {
+      f.ok("open_group", R"({"id":"G8"})");
+      const auto inner =
+        f.ok("group_nodes", R"({"ids":["B7"],"name":"inner"})").value("group").toString();
+      f.ok("open_group", QJsonObject{{"id", inner}});
+      mdl::unlockNodes(f.map, {f.map.worldNode().defaultLayer()});
+      REQUIRE(scene.group->hasOpenedDescendant());
+
+      const auto before = snapshot(f.map);
+      CHECK(f.err("open_group", R"({"id":"G8"})") == "node_not_selectable");
+      CHECK(snapshot(f.map) == before);
+    }
+  }
+
+  SECTION("close_group")
+  {
+    SECTION("closes the open group")
+    {
+      f.ok("open_group", R"({"id":"G8"})");
+      const auto result = f.ok("close_group");
+      CHECK(result.value("closed") == QJsonValue{"G8"});
+      CHECK(result.value("current_group") == QJsonValue{});
+      CHECK(result.value("undo_label") == QJsonValue{"MCP: Close Group"});
+      CHECK(f.map.editorContext().currentGroup() == nullptr);
+      CHECK_FALSE(scene.group->opened());
+    }
+
+    SECTION("errors")
+    {
+      const auto before = snapshot(f.map);
+      CHECK(f.err("close_group") == "no_open_group");
+      CHECK(f.err("close_group", R"({"id":"G8"})") == "invalid_argument");
       CHECK(snapshot(f.map) == before);
     }
   }

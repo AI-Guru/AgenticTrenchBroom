@@ -70,14 +70,18 @@ const auto Instructions = QStringLiteral(
 - Each mutating call is ONE undo step named "MCP: <tool>", leaves the user's selection as it was, and returns
   changes {created, removed, modified}, issues on touched nodes, warnings and log lines. undo only undoes MCP steps
   unless allow_user_commands is true.
-- Build rooms with create_hollow_box (non-overlapping walls), cut openings with csg_subtract (touching brushes are
-  never cut), and use create_primitive_brush, create_brush_from_points, duplicate_nodes and group_nodes for details.
-- Verify without screenshots: get_brush_geometry, find_nodes, query_point, check_brush_overlaps, validate_map,
-  get_map_stats, checkpoint_create before a change and checkpoint_diff after it. screenshot and screenshot_set (views
-  3d, iso, top, front, side; frame_ids to look at nodes) return PNG images to show your work; set_camera and
-  focus_nodes point the user's view at something.
+- Call get_conventions first for units, grid and typical sizes (player, doors, stairs).
+- Block out with create_room (floor, ceiling and walls with door/window openings) and create_stairs; place things
+  with drop_to_floor and align_nodes; describe_region summarizes an area. create_hollow_box, csg_subtract (touching
+  brushes are never cut), clip_brush, create_primitive_brush, create_brush_from_points, duplicate_nodes and
+  group_nodes (open_group/close_group to edit inside) cover the rest.
+- checkpoint_create before big edits; checkpoint_revert undoes your steps back to it. Verify without screenshots:
+  validate_map, query_point, check_brush_overlaps, checkpoint_diff, get_brush_geometry, find_nodes, get_map_stats.
+  screenshot and screenshot_set (views 3d, iso, top, front, side; frame_ids to look at nodes) return PNG images to
+  show your work; set_camera and focus_nodes point the user's view at something.
 - Use batch for multi-step edits that must succeed or fail together ("$0" refers to the first id created by
-  operation 0, "$0.2" to the third); a failed batch changes nothing.
+  operation 0, "$0.2" to the third); a failed batch changes nothing. batch with dry_run:true previews the results
+  and issues and then rolls everything back.
 - If you get editor_busy, the human is interacting (dialog open, dragging, modal tool); retry shortly.)");
 
 const auto ModalHint = QStringLiteral("ask the user to close the dialog, then retry");

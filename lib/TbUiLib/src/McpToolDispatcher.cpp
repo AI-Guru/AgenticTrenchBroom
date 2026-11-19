@@ -645,6 +645,45 @@ mcp::ToolResult McpToolDispatcher::runMutate(
     return errorOf(result);
   }
 
+  // the tool's own fields take precedence, e.g. the node ids returned by select_nodes
+  auto structured = std::move(result).value();
+  const auto addEnvelope = [&](const McpChangeSet& changes) {
+    const auto touched = touchedNodes(doc, changes);
+    auto summaries = QJsonArray{};
+    for (const auto* node : touched)
+    {
+      if (size_t(summaries.size()) >= McpEnvelopeMaxNodes)
+      {
+        break;
+      }
+      summaries.append(nodeSummary(doc.nodes, map, *node));
+    }
+
+    const auto add = [&](const QString& key, QJsonValue value) {
+      if (!structured.contains(key))
+      {
+        structured[key] = std::move(value);
+      }
+    };
+    add("changes", changes.toJson());
+    add("nodes", summaries);
+    add("nodes_truncated", touched.size() > McpEnvelopeMaxNodes);
+    add("issues", issuesJson(doc, touched));
+    add("log", logJson(m_log));
+  };
+
+  if (context.discardChanges)
+  {
+    // a dry run: report what the call did, then roll it back; the recording scope
+    // restores the ids of nodes that the rollback re-adds
+    addEnvelope(doc.nodes.currentChanges());
+    structured["undo_label"] = QJsonValue{};
+    structured["dry_run"] = true;
+    guard.dismiss();
+    transaction.cancel();
+    return makeOutput(def, std::move(structured), context.warnings);
+  }
+
   if (def.keepsSelection)
   {
     guard.dismiss();
@@ -664,18 +703,7 @@ mcp::ToolResult McpToolDispatcher::runMutate(
       {{"log", logJson(m_log)}});
   }
 
-  const auto changes = recording.end();
-  const auto touched = touchedNodes(doc, changes);
-
-  auto summaries = QJsonArray{};
-  for (const auto* node : touched)
-  {
-    if (size_t(summaries.size()) >= McpEnvelopeMaxNodes)
-    {
-      break;
-    }
-    summaries.append(nodeSummary(doc.nodes, map, *node));
-  }
+  addEnvelope(recording.end());
 
   // if nothing was done, the transaction was empty and no undo step was added
   const auto* undoNameAfter = map.undoCommandName();
@@ -684,23 +712,11 @@ mcp::ToolResult McpToolDispatcher::runMutate(
   {
     context.warnings.push_back("nothing changed; no undo step was added");
   }
-
-  // the tool's own fields take precedence, e.g. the node ids returned by select_nodes
-  auto structured = std::move(result).value();
-  const auto addEnvelope = [&](const QString& key, QJsonValue value) {
-    if (!structured.contains(key))
-    {
-      structured[key] = std::move(value);
-    }
-  };
-  addEnvelope("changes", changes.toJson());
-  addEnvelope("nodes", summaries);
-  addEnvelope("nodes_truncated", touched.size() > McpEnvelopeMaxNodes);
-  addEnvelope("issues", issuesJson(doc, touched));
-  addEnvelope("log", logJson(m_log));
-  addEnvelope(
-    "undo_label",
-    addedUndoStep ? QJsonValue{QString::fromStdString(*undoNameAfter)} : QJsonValue{});
+  if (!structured.contains("undo_label"))
+  {
+    structured["undo_label"] =
+      addedUndoStep ? QJsonValue{QString::fromStdString(*undoNameAfter)} : QJsonValue{};
+  }
 
   return makeOutput(def, std::move(structured), context.warnings);
 }
@@ -746,7 +762,8 @@ void McpToolDispatcher::addBatchTool()
       "nothing is changed. In arguments, a string \"$<i>\" is replaced by the first id "
       "created by operation i, and \"$<i>.<k>\" by the k-th (from 0), e.g. "
       "{\"tool\":\"create_entity\",\"arguments\":{\"classname\":\"func_door\","
-      "\"brush_ids\":[\"$0\"]}}.",
+      "\"brush_ids\":[\"$0\"]}}. With dry_run the batch is previewed: results and "
+      "issues are returned, then everything is rolled back.",
     .inputSchema = schema::object(
       {
         {"operations",
@@ -762,6 +779,10 @@ void McpToolDispatcher::addBatchTool()
            1,
            MaxBatchOperations,
            "the tool calls to run in order")},
+        {"dry_run",
+         schema::boolean(
+           "run everything, report the results and issues, then undo it all: the map "
+           "is left unchanged (default false)")},
       },
       {"operations"}),
     .kind = McpToolKind::Mutate,
@@ -933,6 +954,10 @@ McpResult<QJsonObject> McpToolDispatcher::runBatch(
     results.append(QJsonObject{{"tool", op.def->name}, {"result", structured}});
   }
 
+  if (args.value("dry_run").toBool(false))
+  {
+    context.discardChanges = true;
+  }
   return QJsonObject{{"results", results}};
 }
 
@@ -1031,6 +1056,7 @@ const std::vector<QString>& mcpToolErrorCodes()
     "view_unavailable",
     "render_failed",
     "operation_failed",
+    "history_mismatch",
   };
   return codes;
 }

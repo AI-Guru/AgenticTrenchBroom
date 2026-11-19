@@ -171,6 +171,14 @@ public:
   void restoreIdsAfterRollback();
 
   /**
+   * Gives the given live node the given id back, which must be a stale id of the same
+   * kind, e.g. after reverting to a checkpoint re-added a node that was deleted after the
+   * checkpoint. The node's current id becomes stale. Returns false and changes nothing if
+   * the node is not live or the id is not a stale id of the node's kind.
+   */
+  bool reassignId(const mdl::Node& node, QStringView staleId);
+
+  /**
    * Stops observing the map. Only intended for tests that need to put the registry out
    * of sync with the map to check reconcile().
    */

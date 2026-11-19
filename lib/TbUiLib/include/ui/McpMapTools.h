@@ -53,5 +53,6 @@ void registerMcpMapStructureTools(McpToolDispatcher& dispatcher);
 
 /** Registers the history tools: undo and redo. */
 void registerMcpMapHistoryTools(McpToolDispatcher& dispatcher);
+void registerMcpMapHelperTools(McpToolDispatcher& dispatcher);
 
 } // namespace tb::ui

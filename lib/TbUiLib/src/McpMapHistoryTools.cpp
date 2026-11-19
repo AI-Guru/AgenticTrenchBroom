@@ -17,6 +17,9 @@
  along with TrenchBroom. If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <QJsonArray>
+#include <QSet>
+
 #include "mdl/Map.h"
 #include "ui/McpCheckpoints.h"
 #include "ui/McpMapTools.h"
@@ -24,6 +27,8 @@
 #include "ui/McpSchemas.h"
 #include "ui/McpToolDispatcher.h"
 
+#include <algorithm>
+#include <limits>
 #include <string>
 
 namespace tb::ui
@@ -200,12 +205,185 @@ McpToolDef redoTool()
   };
 }
 
+// checkpoint_revert
+
+mcp::ToolError historyMismatch(
+  const QString& message, const QString& reason, QJsonObject details = {})
+{
+  details["reason"] = reason;
+  return toolError(
+    "history_mismatch",
+    message,
+    "use undo or redo, or compare with checkpoint_diff and repair the map by hand",
+    std::move(details));
+}
+
+/**
+ * Gives nodes that the undo steps re-added the ids they had when the checkpoint was
+ * taken: undoing a delete re-adds the node, which gets a new id. Nodes are matched by
+ * their id free content digests, as checkpoint_diff does for reidentified nodes.
+ */
+size_t restoreCheckpointIds(McpDocumentState& doc, const McpCheckpoint& checkpoint)
+{
+  const auto current = takeCheckpoint(doc.nodes, doc.map, doc.history, "current");
+  const auto diff =
+    diffCheckpoints(checkpoint, current, std::numeric_limits<size_t>::max());
+
+  const auto createdIds = doc.nodes.currentChanges().created;
+  const auto created = QSet<QString>{createdIds.begin(), createdIds.end()};
+
+  auto count = size_t(0);
+  for (const auto& pair : diff.value("reidentified").toArray())
+  {
+    const auto from = pair.toObject().value("from").toString();
+    const auto to = pair.toObject().value("to").toString();
+    const auto lookup = doc.nodes.lookup(to);
+    if (
+      created.contains(to) && lookup.status == McpNodeRegistry::LookupStatus::Live
+      && doc.nodes.reassignId(*lookup.node, from))
+    {
+      ++count;
+    }
+  }
+  return count;
+}
+
+McpResult<QJsonObject> checkpointRevert(McpCallContext& context, const QJsonObject& args)
+{
+  auto& doc = context.doc;
+  auto& map = doc.map;
+
+  const auto name = args.value("name").toString();
+  const auto* checkpoint = doc.checkpoints.find(name);
+  if (!checkpoint)
+  {
+    return toolError(
+      "unknown_checkpoint",
+      QString{"there is no checkpoint '%1'"}.arg(name),
+      "call checkpoint_list for the existing checkpoints",
+      {{"name", name},
+       {"available", QJsonArray::fromStringList(doc.checkpoints.names())}});
+  }
+
+  doc.history.sync();
+  if (!checkpoint->historyConsistent || !doc.history.consistent())
+  {
+    return historyMismatch(
+      "the undo history cannot be matched to the checkpoint",
+      "history_unknown",
+      {{"name", name}});
+  }
+
+  // the checkpoint's history must be the bottom of the current one
+  const auto serials = doc.history.undoSerials();
+  const auto& prefix = checkpoint->historySerials;
+  if (
+    prefix.size() > serials.size()
+    || !std::equal(prefix.begin(), prefix.end(), serials.begin()))
+  {
+    return historyMismatch(
+      QString{"the checkpoint '%1' is not in the current undo history: steps before it "
+              "were undone or replaced"}
+        .arg(name),
+      "not_an_ancestor",
+      {{"name", name}});
+  }
+
+  // check everything before undoing anything
+  const auto& undoStack = doc.history.undoStack();
+  auto labels = std::vector<std::string>{};
+  for (auto i = undoStack.size(); i > prefix.size(); --i)
+  {
+    const auto& entry = undoStack[i - 1];
+    if (!entry.mcp)
+    {
+      return historyMismatch(
+        QString{"'%1' was done after the checkpoint and was not made by an MCP tool"}.arg(
+          QString::fromStdString(entry.label)),
+        "user_command",
+        {{"name", name}, {"undo_label", QString::fromStdString(entry.label)}});
+    }
+    labels.push_back(entry.label);
+  }
+
+  auto undone = QJsonArray{};
+  for (const auto& label : labels)
+  {
+    const auto* top = map.undoCommandName();
+    if (!canUndo(map) || !top || *top != label)
+    {
+      return toolError(
+        "operation_failed",
+        QString{"the undo history changed while reverting to '%1'"}.arg(name),
+        "call get_map_info and checkpoint_diff",
+        {{"undone", undone}});
+    }
+
+    map.undoCommand();
+
+    const auto* moved = map.redoCommandName();
+    if (!moved || *moved != label)
+    {
+      return toolError(
+        "operation_failed",
+        QString{"'%1' could not be undone"}.arg(QString::fromStdString(label)),
+        "check the log",
+        {{"undone", undone}});
+    }
+    undone.append(QString::fromStdString(label));
+  }
+
+  const auto reidentified = restoreCheckpointIds(doc, *checkpoint);
+
+  const auto after = takeCheckpoint(doc.nodes, map, doc.history, "current");
+  const auto diff = diffCheckpoints(*checkpoint, after, 0);
+  const auto remaining = diff.value("added_count").toInteger()
+                         + diff.value("removed_count").toInteger()
+                         + diff.value("modified_count").toInteger()
+                         + diff.value("reidentified_count").toInteger();
+  if (remaining > 0 || !diff.value("content_identical").toBool())
+  {
+    context.warnings.push_back(
+      QString{"the map differs from the checkpoint in %1 nodes; see checkpoint_diff"}.arg(
+        remaining));
+  }
+
+  auto result = historyState(map);
+  result["checkpoint"] = name;
+  result["undone"] = undone;
+  result["reidentified"] = qint64(reidentified);
+  result["content_identical"] = diff.value("content_identical");
+  result["identical"] = remaining == 0 && diff.value("content_identical").toBool();
+  return result;
+}
+
+McpToolDef checkpointRevertTool()
+{
+  auto nameSchema = schema::string(1, 64, "the checkpoint to revert to");
+  nameSchema["pattern"] = "^[A-Za-z0-9_.-]{1,64}$";
+  return {
+    .name = "checkpoint_revert",
+    .title = "Revert To Checkpoint",
+    .description =
+      "Undoes every MCP step made since the checkpoint was created, so that the map "
+      "and the node ids are as they were (checkpoint_diff then reports no changes). "
+      "Refuses with history_mismatch if a step was made by the user or if steps before "
+      "the checkpoint were undone; the undone steps can be redone.",
+    .inputSchema = schema::object({{"name", nameSchema}}, {"name"}),
+    .kind = McpToolKind::History,
+    .annotations = {.readOnly = false, .destructive = true, .idempotent = false},
+    .allowedInBatch = false,
+    .run = checkpointRevert,
+  };
+}
+
 } // namespace
 
 void registerMcpMapHistoryTools(McpToolDispatcher& dispatcher)
 {
   dispatcher.add(undoTool());
   dispatcher.add(redoTool());
+  dispatcher.add(checkpointRevertTool());
 }
 
 } // namespace tb::ui

@@ -671,6 +671,28 @@ TEST_CASE("McpToolDispatcher")
          R"({"ids":["B2","E4"],"layer":"L10"})",
          R"({"ids":["E11"],"layer":"L10"})",
          "operation_failed"},
+        {"clip_brush",
+         R"({"id":"B2","plane":{"point":[32,0,0],"normal":[1,0,0]},"keep":"both"})",
+         R"({"id":"B2","plane":{"point":[96,0,0],"normal":[1,0,0]}})",
+         "operation_failed"},
+        {"create_room",
+         R"({"inner_bounds":{"min":[256,0,0],"max":[512,256,128]},
+             "openings":[{"side":"+x","width":64,"height":96}],"group_name":"room"})",
+         R"({"inner_bounds":{"min":[256,0,0],"max":[512,256,128]},
+             "openings":[{"side":"+x","width":512,"height":96}]})",
+         "invalid_argument"},
+        {"create_stairs",
+         R"({"start":[256,0,0],"direction":"+y","steps":4,"group_name":"stairs"})",
+         R"({"start":[256,0,8000],"direction":"+y","steps":100})",
+         "out_of_world_bounds"},
+        {"drop_to_floor",
+         R"({"ids":["E3","E4"]})",
+         R"({"ids":["L1"]})",
+         "wrong_node_type"},
+        {"align_nodes",
+         R"({"ids":["B2","E3"],"to":"E4","side":"+x","mode":"flush_outside"})",
+         R"({"ids":["B2","E3"],"to":"B99","side":"+x"})",
+         "unknown_node"},
         {"batch",
          R"({"operations":[
              {"tool":"create_box_brush","arguments":{"bounds":{"min":[256,0,0],"max":[320,64,64]}}},
@@ -893,6 +915,90 @@ TEST_CASE("McpToolDispatcher")
       CHECK(f.map.selection().nodes == selection);
     }
 
+    SECTION("dry_run reports the results and leaves the map unchanged")
+    {
+      const auto before = snapshot(f.map);
+      const auto text = f.ok("export_map_text").value("text");
+      const auto undoDepth = f.doc->history.undoStack().size();
+
+      const auto result = f.ok("batch", R"({"dry_run":true,"operations":[
+        {"tool":"create_box_brush","arguments":{"bounds":{"min":[256,0,0],"max":[320,64,64]}}},
+        {"tool":"transform_nodes","arguments":{"ids":["B2","E3"],"translate":[0,0,16]}},
+        {"tool":"set_entity_properties","arguments":{"ids":["E3"],"set":{"light":500}}},
+        {"tool":"create_entity","arguments":{"classname":"func_door","brush_ids":["$0"]}},
+        {"tool":"get_map_stats"}
+      ]})");
+      CHECK(result.value("dry_run") == QJsonValue{true});
+      CHECK(result.value("undo_label") == QJsonValue{});
+      const auto results = result.value("results").toArray();
+      REQUIRE(results.size() == 5);
+      CHECK(
+        results[0].toObject().value("result").toObject().value("id")
+        == QJsonValue{"B12"});
+      // later operations see the earlier ones
+      CHECK(
+        results[4].toObject().value("result").toObject().value("counts").toObject().value(
+          "brush_entities")
+        == QJsonValue{2});
+      const auto changes = result.value("changes").toObject();
+      CHECK(changes.value("created").toArray().contains(QJsonValue{"B12"}));
+      CHECK(changes.value("modified").toArray().contains(QJsonValue{"B2"}));
+      CHECK(result.value("issues").toObject().contains("items"));
+      CHECK(compactJson(result.value("nodes")).contains(R"("classname":"func_door")"));
+
+      // byte identical afterwards, with the same ids, selection and history
+      CHECK(f.ok("export_map_text").value("text") == text);
+      CHECK(snapshot(f.map) == before);
+      CHECK(f.doc->history.undoStack().size() == undoDepth);
+      CHECK(f.map.selection().nodes == selection);
+      CHECK(f.err("get_nodes", R"({"ids":["B12"]})") == "stale_node");
+      CHECK(f.doc->nodes.verifyBijection());
+    }
+
+    SECTION("dry_run restores deleted nodes with their ids")
+    {
+      const auto before = snapshot(f.map);
+      const auto digest = contentDigest(f.doc->nodes, f.map);
+
+      const auto result = f.ok("batch", R"({"dry_run":true,"operations":[
+        {"tool":"delete_nodes","arguments":{"ids":["B2","E3"]}},
+        {"tool":"get_map_stats"}
+      ]})");
+      CHECK(
+        result.value("changes").toObject().value("removed")
+        == QJsonValue{QJsonArray{"B2", "E3"}});
+
+      // the rollback re-adds deleted nodes at the end of their parent, like undo, so
+      // only the order of the nodes in the file may differ
+      CHECK(contentDigest(f.doc->nodes, f.map) == digest);
+      auto lines = [](const std::string& text) {
+        auto sorted = QString::fromStdString(text).split('\n');
+        sorted.sort();
+        return sorted;
+      };
+      CHECK(lines(mapText(f.map)) == lines(before.text));
+      CHECK(f.map.modificationCount() == before.modificationCount);
+      CHECK(f.map.selection().nodes == selection);
+      CHECK(f.id(*scene.wall) == "B2");
+      CHECK(f.id(*scene.light) == "E3");
+      CHECK(f.doc->nodes.verifyBijection());
+    }
+
+    SECTION("dry_run fails like a batch")
+    {
+      const auto before = snapshot(f.map);
+      const auto error = f.error("batch", R"({"dry_run":true,"operations":[
+        {"tool":"create_box_brush","arguments":{"bounds":{"min":[256,0,0],"max":[320,64,64]}}},
+        {"tool":"delete_nodes","arguments":{"ids":["B99"]}}
+      ]})");
+      CHECK(error.value("code") == QJsonValue{"unknown_node"});
+      CHECK(error.value("details").toObject().value("failed_index") == QJsonValue{1});
+      CHECK(snapshot(f.map) == before);
+      CHECK(
+        f.err("batch", R"({"dry_run":1,"operations":[{"tool":"get_map_stats"}]})")
+        == "invalid_argument");
+    }
+
     SECTION("warnings of operations are returned with their results")
     {
       const auto result = f.ok("batch", R"({"operations":[
@@ -914,7 +1020,8 @@ TEST_CASE("McpToolDispatcher")
 
   SECTION("mcpToolErrorCodes")
   {
-    CHECK(mcpToolErrorCodes().size() == 32);
+    CHECK(mcpToolErrorCodes().size() == 33);
+    CHECK(isMcpToolErrorCode("history_mismatch"));
     CHECK(isMcpToolErrorCode("stale_node"));
     CHECK(isMcpToolErrorCode("operation_failed"));
     CHECK_FALSE(isMcpToolErrorCode("bogus"));

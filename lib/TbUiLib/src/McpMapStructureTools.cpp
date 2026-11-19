@@ -18,6 +18,7 @@
  */
 
 #include "mdl/BrushFaceHandle.h"
+#include "mdl/EditorContext.h"
 #include "mdl/GroupNode.h"
 #include "mdl/Layer.h"
 #include "mdl/LayerNode.h"
@@ -504,6 +505,109 @@ McpToolDef moveToLayerTool()
   };
 }
 
+// open_group
+
+QJsonValue idOrNull(const McpNodeRegistry& registry, const mdl::Node* node)
+{
+  return node ? QJsonValue{registry.idOf(*node)} : QJsonValue{};
+}
+
+McpResult<QJsonObject> openGroup(McpCallContext& context, const QJsonObject& args)
+{
+  auto& doc = context.doc;
+  auto& map = doc.map;
+
+  const auto id = args.value("id").toString();
+  auto group = resolveAs<mdl::GroupNode>(doc, id, "group");
+  if (group.is_error())
+  {
+    return errorOf(group);
+  }
+
+  // checks that the group can be selected, i.e. that it is closed and inside the
+  // current group, visible, unlocked and not linked
+  auto targets = resolveTargets(doc, QJsonArray{id});
+  if (targets.is_error())
+  {
+    return errorOf(targets);
+  }
+
+  // EditorContext::pushGroup and GroupNode::open require a closed child of the open
+  // group; a group outside of it is selectable if the user unlocked its layer
+  auto* currentGroup = map.editorContext().currentGroup();
+  if (
+    !group.value()->closed()
+    || (currentGroup && group.value()->containingGroup() != currentGroup))
+  {
+    return toolError(
+      "node_not_selectable",
+      QString{"%1 is not a closed group inside the open group %2"}.arg(
+        id, currentGroup ? doc.nodes.idOf(*currentGroup) : QString{"(none)"}),
+      "call close_group until the group's parent is open",
+      {{"id", id}, {"reason", "not_in_open_group"}});
+  }
+
+  mdl::openGroup(map, *group.value());
+  return QJsonObject{
+    {"current_group", idOrNull(doc.nodes, map.editorContext().currentGroup())},
+  };
+}
+
+McpToolDef openGroupTool()
+{
+  return {
+    .name = "open_group",
+    .title = "Open Group",
+    .description =
+      "Opens a group so that the nodes inside it can be selected and edited one by one, "
+      "like double-clicking it. Nodes outside the open group cannot be selected until "
+      "close_group is called. Deselects everything.",
+    .inputSchema =
+      schema::object({{"id", schema::nodeId("the group to open (G<n>)")}}, {"id"}),
+    .kind = McpToolKind::Mutate,
+    .annotations = Mutating,
+    .allowedInBatch = true,
+    .run = openGroup,
+  };
+}
+
+// close_group
+
+McpResult<QJsonObject> closeGroup(McpCallContext& context, const QJsonObject&)
+{
+  auto& doc = context.doc;
+  auto& map = doc.map;
+
+  const auto* currentGroup = map.editorContext().currentGroup();
+  if (!currentGroup)
+  {
+    return toolError("no_open_group", "no group is open", "open_group opens a group");
+  }
+
+  const auto closed = doc.nodes.idOf(*currentGroup);
+  mdl::closeGroup(map);
+  return QJsonObject{
+    {"closed", closed},
+    {"current_group", idOrNull(doc.nodes, map.editorContext().currentGroup())},
+  };
+}
+
+McpToolDef closeGroupTool()
+{
+  return {
+    .name = "close_group",
+    .title = "Close Group",
+    .description =
+      "Closes the open group; its parent group, if any, becomes the open group. "
+      "Deselects everything.",
+    .inputSchema = schema::object({}),
+    .kind = McpToolKind::Mutate,
+    .annotations = Mutating,
+    .allowedInBatch = true,
+    .run = closeGroup,
+  };
+}
+
 } // namespace
 
 void registerMcpMapStructureTools(McpToolDispatcher& dispatcher)
@@ -514,6 +618,8 @@ void registerMcpMapStructureTools(McpToolDispatcher& dispatcher)
   dispatcher.add(createLayerTool());
   dispatcher.add(setCurrentLayerTool());
   dispatcher.add(moveToLayerTool());
+  dispatcher.add(openGroupTool());
+  dispatcher.add(closeGroupTool());
 }
 
 } // namespace tb::ui

@@ -488,6 +488,62 @@ TEST_CASE("McpNodeRegistry")
     }
   }
 
+  SECTION("reassignId")
+  {
+    auto registry = McpNodeRegistry{map};
+    auto* brush = addBrush(map, vm::bbox3d{{0, 0, 0}, {16, 16, 16}});
+    auto* entity = addPointEntity(map, "light", {0, 0, 0});
+    CHECK(registry.idOf(*brush) == "B2");
+    CHECK(registry.idOf(*entity) == "E3");
+
+    mdl::removeNodes(map, {brush});
+    map.undoCommand();
+    // the re-added brush has a new id
+    const auto newId = registry.idOf(*brush);
+    CHECK(newId == "B4");
+    CHECK(registry.lookup(u"B2").status == McpNodeRegistry::LookupStatus::Stale);
+
+    SECTION("gives a node a stale id of its kind")
+    {
+      registry.beginRecording();
+      CHECK(registry.reassignId(*brush, u"B2"));
+      CHECK(registry.idOf(*brush) == "B2");
+      CHECK(registry.lookup(u"B2").node == brush);
+      CHECK(registry.lookup(u"B4").status == McpNodeRegistry::LookupStatus::Stale);
+      CHECK(registry.verifyBijection());
+      // nothing was created or removed during the recording
+      const auto changes = registry.endRecording();
+      CHECK(changes.created.empty());
+      CHECK(changes.removed.empty());
+    }
+
+    SECTION("reports the restored id as created")
+    {
+      mdl::removeNodes(map, {brush});
+      registry.beginRecording();
+      map.undoCommand();
+      const auto interim = registry.idOf(*brush);
+      CHECK(registry.reassignId(*brush, u"B2"));
+      const auto changes = registry.endRecording();
+      CHECK(changes.created == ids({"B2"}));
+      CHECK(changes.removed.empty());
+      CHECK(registry.lookup(interim).status == McpNodeRegistry::LookupStatus::Stale);
+    }
+
+    SECTION("refuses ids that are live, unknown, malformed or of another kind")
+    {
+      CHECK_FALSE(registry.reassignId(*brush, u"E3"));
+      CHECK_FALSE(registry.reassignId(*brush, u"B3"));
+      CHECK_FALSE(registry.reassignId(*brush, u"E2"));
+      CHECK_FALSE(registry.reassignId(*brush, u"B99"));
+      CHECK_FALSE(registry.reassignId(*brush, u"world"));
+      CHECK_FALSE(registry.reassignId(*brush, u"x"));
+      CHECK_FALSE(registry.reassignId(map.worldNode(), u"B2"));
+      CHECK(registry.idOf(*brush) == newId);
+      CHECK(registry.verifyBijection());
+    }
+  }
+
   SECTION("reconcile")
   {
     auto registry = McpNodeRegistry{map};

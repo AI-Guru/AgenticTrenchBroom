@@ -19,6 +19,7 @@
 
 #include <QSet>
 
+#include "base/Error.h"
 #include "gl/MaterialManager.h"
 #include "mdl/Brush.h"
 #include "mdl/BrushFace.h"
@@ -28,6 +29,8 @@
 #include "mdl/Entity.h"
 #include "mdl/EntityNode.h"
 #include "mdl/EntityNodeBase.h"
+#include "mdl/GameConfig.h"
+#include "mdl/GameInfo.h"
 #include "mdl/Grid.h"
 #include "mdl/GroupNode.h"
 #include "mdl/Map.h"
@@ -36,6 +39,7 @@
 #include "mdl/Map_Geometry.h"
 #include "mdl/Map_Nodes.h"
 #include "mdl/Map_Selection.h"
+#include "mdl/NodeContents.h"
 #include "mdl/NodeHandleManager.h"
 #include "mdl/NodeHandles.h"
 #include "mdl/PatchNode.h"
@@ -1921,6 +1925,215 @@ McpToolDef csgSubtractTool()
   };
 }
 
+// clip_brush
+
+constexpr auto ClipEpsilon = 1e-6;
+
+/**
+ * Returns three points on the plane, ordered so that a brush face created from them has
+ * the given normal (pinned by a unit test for all six axis normals).
+ */
+std::array<vm::vec3d, 3> planePoints(const vm::vec3d& point, const vm::vec3d& normal)
+{
+  // the axis that is least parallel to the normal gives a stable first direction
+  const auto& axis =
+    std::abs(normal.x()) < std::abs(normal.y())
+      ? (std::abs(normal.x()) < std::abs(normal.z()) ? vm::vec3d{1, 0, 0}
+                                                     : vm::vec3d{0, 0, 1})
+      : (std::abs(normal.y()) < std::abs(normal.z()) ? vm::vec3d{0, 1, 0}
+                                                     : vm::vec3d{0, 0, 1});
+  const auto u = vm::normalize(vm::cross(normal, axis));
+  const auto v = vm::cross(normal, u);
+  constexpr auto Size = 128.0;
+  return {point, point + v * Size, point + u * Size};
+}
+
+McpResult<mdl::Brush> clippedBrush(
+  const mdl::Map& map,
+  const mdl::Brush& brush,
+  const vm::vec3d& point,
+  const vm::vec3d& normal)
+{
+  const auto points = planePoints(point, normal);
+  const auto& faceAttribsConfig = map.gameInfo().gameConfig.faceAttribsConfig;
+  auto face = mdl::BrushFace::create(
+    points[0],
+    points[1],
+    points[2],
+    map.currentMaterialName(),
+    faceAttribsConfig.defaultUvAttributes,
+    faceAttribsConfig.defaultSurfaceAttributes,
+    map.worldNode().mapFormat());
+  if (face.is_error())
+  {
+    return toolError(
+      "geometry_invalid", QString::fromStdString(std::get<Error>(face.error()).msg));
+  }
+  // planePoints orders the points for TrenchBroom's winding; a unit test pins it
+  if (!(vm::dot(face.value().boundary().normal, normal) > 0.0))
+  {
+    return toolError("operation_failed", "the clip plane could not be oriented");
+  }
+
+  auto result = brush;
+  if (auto clipped = result.clip(map.worldBounds(), std::move(face).value());
+      clipped.is_error())
+  {
+    return toolError(
+      "geometry_invalid",
+      QString::fromStdString(std::get<Error>(clipped.error()).msg),
+      "the plane must cut the brush into two parts with a volume");
+  }
+  return result;
+}
+
+McpResult<QJsonObject> clipBrush(McpCallContext& context, const QJsonObject& args)
+{
+  auto& doc = context.doc;
+  auto& map = doc.map;
+
+  auto brushes = resolveBrushes(doc, QJsonArray{args.value("id")});
+  if (brushes.is_error())
+  {
+    return errorOf(brushes);
+  }
+  if (brushes.value().size() != 1)
+  {
+    return toolError(
+      "invalid_argument",
+      "id must name one brush",
+      "pass a brush id, not a brush entity",
+      {{"pointer", "/id"}});
+  }
+  auto* brushNode = brushes.value().front();
+  const auto id = doc.nodes.idOf(*brushNode);
+
+  const auto plane = args.value("plane").toObject();
+  auto point = vec3(plane.value("point"), "/plane/point");
+  if (point.is_error())
+  {
+    return errorOf(point);
+  }
+  auto normalArg = vec3(plane.value("normal"), "/plane/normal");
+  if (normalArg.is_error())
+  {
+    return errorOf(normalArg);
+  }
+  const auto length = vm::length(normalArg.value());
+  if (!(length > 1e-9))
+  {
+    return toolError(
+      "invalid_argument",
+      "/plane/normal must not be zero",
+      {},
+      {{"pointer", "/plane/normal"}});
+  }
+  const auto normal = normalArg.value() / length;
+
+  auto front = false;
+  auto back = false;
+  for (const auto& vertex : brushNode->brush().vertexPositions())
+  {
+    const auto distance = vm::dot(vertex - point.value(), normal);
+    front = front || distance > ClipEpsilon;
+    back = back || distance < -ClipEpsilon;
+  }
+  if (!front || !back)
+  {
+    return toolError(
+      "operation_failed",
+      QString{"the plane does not cut %1"}.arg(id),
+      "check the plane against get_brush_geometry; it must pass through the brush",
+      {{"id", id}, {"side", front ? "front" : "back"}});
+  }
+
+  const auto keep = args.value("keep").toString("back");
+
+  // "back" keeps the part behind the plane, i.e. opposite the normal
+  auto kept = clippedBrush(
+    map, brushNode->brush(), point.value(), keep == u"front" ? -normal : normal);
+  if (kept.is_error())
+  {
+    return errorOf(kept);
+  }
+  auto other = std::optional<mdl::Brush>{};
+  if (keep == u"both")
+  {
+    auto frontPart = clippedBrush(map, brushNode->brush(), point.value(), -normal);
+    if (frontPart.is_error())
+    {
+      return errorOf(frontPart);
+    }
+    other = std::move(frontPart).value();
+  }
+
+  mdl::deselectAll(map);
+  if (!mdl::updateNodeContents(
+        map, "Clip", {{brushNode, mdl::NodeContents{std::move(kept).value()}}}))
+  {
+    return toolError("operation_failed", QString{"%1 could not be clipped"}.arg(id));
+  }
+
+  auto result = QJsonObject{
+    {"id", id},
+    {"bounds", toJson(brushNode->logicalBounds())},
+    {"kept", keep},
+  };
+  if (other)
+  {
+    auto* otherNode = mdl::addNode(
+      map, *brushNode->parent(), std::make_unique<mdl::BrushNode>(std::move(*other)));
+    if (!otherNode)
+    {
+      return toolError("operation_failed", "the front part could not be added");
+    }
+    result["front_id"] = doc.nodes.idOf(*otherNode);
+    result["front_bounds"] = toJson(otherNode->logicalBounds());
+  }
+
+  auto clipped = std::vector<mdl::BrushNode*>{brushNode};
+  if (result.contains("front_id"))
+  {
+    clipped.push_back(static_cast<mdl::BrushNode*>(
+      doc.nodes.lookup(result.value("front_id").toString()).node));
+  }
+  if (hasNonIntegerVertices(clipped))
+  {
+    context.warnings.push_back("some brush vertices are not on integer coordinates");
+  }
+  return result;
+}
+
+McpToolDef clipBrushTool()
+{
+  return {
+    .name = "clip_brush",
+    .title = "Clip Brush",
+    .description =
+      "Cuts a brush with a plane. keep back (default) keeps the part behind the plane "
+      "(opposite the normal) and front the part in front of it; both keeps the back "
+      "part under the brush's id and adds the front part as a new brush. The new face "
+      "gets the current material. Verify with get_brush_geometry.",
+    .inputSchema = schema::object(
+      {
+        {"id", schema::nodeId("the brush to clip")},
+        {"plane",
+         schema::object(
+           {
+             {"point", schema::vec3("a point on the plane")},
+             {"normal", schema::vec3("the plane normal; need not be normalized")},
+           },
+           {"point", "normal"})},
+        {"keep", schema::stringEnum({"back", "front", "both"}, "what to keep (back)")},
+      },
+      {"id", "plane"}),
+    .kind = McpToolKind::Mutate,
+    .annotations = Destructive,
+    .allowedInBatch = true,
+    .run = clipBrush,
+  };
+}
+
 } // namespace
 
 void registerMcpMapEditTools(McpToolDispatcher& dispatcher)
@@ -1935,6 +2148,7 @@ void registerMcpMapEditTools(McpToolDispatcher& dispatcher)
   dispatcher.add(replaceMaterialTool());
   dispatcher.add(csgTool());
   dispatcher.add(csgSubtractTool());
+  dispatcher.add(clipBrushTool());
 }
 
 } // namespace tb::ui

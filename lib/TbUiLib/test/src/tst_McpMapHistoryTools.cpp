@@ -23,6 +23,7 @@
 #include "McpTestUtils.h"
 #include "mdl/BrushNode.h"
 #include "mdl/CommandProcessor.h"
+#include "mdl/EntityNode.h"
 #include "mdl/Map.h"
 #include "mdl/Map_Geometry.h"
 #include "mdl/Map_Selection.h"
@@ -244,6 +245,120 @@ TEST_CASE("McpMapHistoryTools")
       f.ok("undo");
       f.map.startTransaction("drag", mdl::TransactionScope::LongRunning);
       CHECK(f.err("redo") == "editor_busy");
+      f.map.cancelTransaction();
+    }
+  }
+
+  SECTION("checkpoint_revert")
+  {
+    const auto diffIsEmpty = [&](const QString& name) {
+      const auto diff = f.ok("checkpoint_diff", QJsonObject{{"from", name}});
+      CHECK(diff.value("content_identical") == QJsonValue{true});
+      CHECK(diff.value("added") == QJsonValue{QJsonArray{}});
+      CHECK(diff.value("removed") == QJsonValue{QJsonArray{}});
+      CHECK(diff.value("modified") == QJsonValue{QJsonArray{}});
+      CHECK(diff.value("reidentified") == QJsonValue{QJsonArray{}});
+    };
+
+    SECTION("undoes the MCP steps since the checkpoint and restores the ids")
+    {
+      f.ok("checkpoint_create", R"({"name":"base"})");
+      const auto digest = contentDigest(f.doc->nodes, f.map);
+      const auto box = createBox(0);
+      f.ok("transform_nodes", R"({"ids":["B2"],"translate":[16,0,0]})");
+      f.ok("set_entity_properties", R"({"ids":["E4"],"set":{"speed":100}})");
+      f.ok("delete_nodes", R"({"ids":["E3","G8"]})");
+      CHECK(f.err("get_nodes", R"({"ids":["E3"]})") == "stale_node");
+
+      const auto result = f.ok("checkpoint_revert", R"({"name":"base"})");
+      CHECK(result.value("checkpoint") == QJsonValue{"base"});
+      CHECK(
+        result.value("undone")
+        == QJsonValue{QJsonArray{
+          "MCP: Delete Nodes",
+          "MCP: Set Entity Properties",
+          "MCP: Transform Nodes",
+          "MCP: Create Box Brush"}});
+      CHECK(result.value("identical") == QJsonValue{true});
+      CHECK(result.value("content_identical") == QJsonValue{true});
+      // E3, G8 and B7 were re-added by undoing the delete
+      CHECK(result.value("reidentified") == QJsonValue{3});
+      CHECK(result.value("can_redo") == QJsonValue{true});
+      CHECK(result.value("redo_label") == QJsonValue{"MCP: Create Box Brush"});
+      CHECK(!compactJson(result).contains("warnings"));
+
+      CHECK(contentDigest(f.doc->nodes, f.map) == digest);
+      diffIsEmpty("base");
+      CHECK(f.id(*scene.light) == "E3");
+      CHECK(
+        f.ok("get_nodes", R"({"ids":["E3","G8","B7"]})").value("nodes").toArray().size()
+        == 3);
+      CHECK(f.err("get_nodes", QJsonObject{{"ids", QJsonArray{box}}}) == "stale_node");
+      CHECK(f.doc->nodes.verifyBijection());
+
+      // the changes report the restored ids
+      const auto created = result.value("changes").toObject().value("created").toArray();
+      CHECK(created.contains(QJsonValue{"E3"}));
+      CHECK(created.contains(QJsonValue{"G8"}));
+      CHECK(created.contains(QJsonValue{"B7"}));
+
+      // the undone steps can be redone
+      CHECK(f.ok("redo", R"({"count":4})").value("redone").toArray().size() == 4);
+      CHECK(f.err("get_nodes", R"({"ids":["E3"]})") == "stale_node");
+    }
+
+    SECTION("nothing to revert")
+    {
+      f.ok("checkpoint_create", R"({"name":"now"})");
+      const auto result = f.ok("checkpoint_revert", R"({"name":"now"})");
+      CHECK(result.value("undone") == QJsonValue{QJsonArray{}});
+      CHECK(result.value("identical") == QJsonValue{true});
+      diffIsEmpty("now");
+    }
+
+    SECTION("refuses to undo user commands")
+    {
+      f.ok("checkpoint_create", R"({"name":"base"})");
+      createBox(0);
+      mdl::selectNodes(f.map, {scene.wall});
+      REQUIRE(mdl::translateSelection(f.map, {16, 0, 0}));
+      mdl::deselectAll(f.map);
+      createBox(32);
+      const auto before = snapshot(f.map);
+
+      const auto error = f.error("checkpoint_revert", R"({"name":"base"})");
+      CHECK(error.value("code") == QJsonValue{"history_mismatch"});
+      CHECK(details(error).value("reason") == QJsonValue{"user_command"});
+      // nothing was undone
+      CHECK(snapshot(f.map) == before);
+    }
+
+    SECTION("refuses if steps before the checkpoint were undone")
+    {
+      createBox(0);
+      f.ok("checkpoint_create", R"({"name":"after_box"})");
+      f.ok("undo");
+      auto error = f.error("checkpoint_revert", R"({"name":"after_box"})");
+      CHECK(error.value("code") == QJsonValue{"history_mismatch"});
+      CHECK(details(error).value("reason") == QJsonValue{"not_an_ancestor"});
+
+      // a new step replaces the undone one
+      createBox(64);
+      error = f.error("checkpoint_revert", R"({"name":"after_box"})");
+      CHECK(details(error).value("reason") == QJsonValue{"not_an_ancestor"});
+    }
+
+    SECTION("errors")
+    {
+      const auto error = f.error("checkpoint_revert", R"({"name":"missing"})");
+      CHECK(error.value("code") == QJsonValue{"unknown_checkpoint"});
+      CHECK(f.err("checkpoint_revert", R"({"name":"a b"})") == "invalid_argument");
+      CHECK(f.err("checkpoint_revert", R"({})") == "invalid_argument");
+
+      f.ok("checkpoint_create", R"({"name":"base"})");
+      createBox(0);
+      f.map.startTransaction("drag", mdl::TransactionScope::LongRunning);
+      CHECK(f.err("checkpoint_revert", R"({"name":"base"})") == "editor_busy");
       f.map.cancelTransaction();
     }
   }

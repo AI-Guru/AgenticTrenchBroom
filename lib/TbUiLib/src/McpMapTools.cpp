@@ -32,6 +32,7 @@ void registerMcpMapTools(McpToolDispatcher& dispatcher)
   registerMcpMapEditTools(dispatcher);
   registerMcpMapStructureTools(dispatcher);
   registerMcpMapHistoryTools(dispatcher);
+  registerMcpMapHelperTools(dispatcher);
   dispatcher.addBatchTool();
 }
 

@@ -85,6 +85,12 @@ TEST_CASE("McpDeterminism")
     Call{"find_nodes", R"({"text":"*"})"},
     Call{"get_nodes", R"({"ids":["world","L1","B2","E3","E4","G8","P9","L10","E11"]})"},
     Call{"get_brush_geometry", R"({"ids":["B2","B5","B6","B7"]})"},
+    Call{"checkpoint_create", R"({"name":"start"})"},
+    Call{"validate_map", "{}"},
+    Call{"get_map_stats", "{}"},
+    // the full text contains random linked group ids
+    Call{"export_map_text", R"({"strip_tb_properties":true})"},
+    Call{"export_map_text", R"({"ids":["B2","E3"]})"},
     Edit{[](McpMapToolsFixture& f, const McpTestScene& scene) {
       mdl::selectNodes(f.map, {scene.wall, scene.light});
     }},
@@ -106,6 +112,8 @@ TEST_CASE("McpDeterminism")
     Edit{[](McpMapToolsFixture& f, const McpTestScene&) { f.map.undoCommand(); }},
     Call{"find_nodes", R"({"classname":"func_door"})"},
     Call{"get_scene_tree", R"({"types":["entity"]})"},
+    Call{"checkpoint_diff", R"({"from":"start"})"},
+    Call{"checkpoint_list", "{}"},
     Call{"get_map_info", "{}"},
     Edit{[](McpMapToolsFixture& f, const McpTestScene&) {
       addBrush(f.map, vm::bbox3d{{256, 0, 0}, {320, 64, 64}}, "new");

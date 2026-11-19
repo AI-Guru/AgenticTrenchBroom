@@ -26,6 +26,7 @@ McpDocumentState::McpDocumentState(mdl::Map& map_, QString documentId_)
   : map{map_}
   , documentId{std::move(documentId_)}
   , nodes{map_}
+  , history{map_}
 {
 }
 

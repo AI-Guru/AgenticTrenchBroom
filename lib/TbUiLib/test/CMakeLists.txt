@@ -24,9 +24,11 @@ target_sources(TbUiLibTest
     ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_LayerListBox.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_MapViewBar.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_MapWindow.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_McpCheckpoints.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_McpDeterminism.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_McpDocumentState.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_McpJson.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_McpMapEvalTools.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_McpMapReadTools.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_McpNodeRegistry.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_McpPreconditions.cpp

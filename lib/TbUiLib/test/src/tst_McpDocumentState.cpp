@@ -38,6 +38,10 @@ TEST_CASE("McpDocumentState")
   CHECK(doc.documentId == QStringLiteral("d7"));
   CHECK(doc.nodes.liveCount() == 2);
   CHECK(doc.nodes.verifyBijection());
+  CHECK(doc.history.undoStack().empty());
+  // the history model does not know the command that added the brush
+  CHECK_FALSE(doc.history.consistent());
+  CHECK(doc.checkpoints.size() == 0);
 }
 
 } // namespace tb::ui

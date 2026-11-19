@@ -32,4 +32,11 @@ void registerMcpMapTools(McpToolDispatcher& dispatcher);
  */
 void registerMcpMapReadTools(McpToolDispatcher& dispatcher);
 
+/**
+ * Registers the evaluation and checkpoint tools: validate_map, get_map_stats,
+ * checkpoint_create, checkpoint_diff, checkpoint_list, checkpoint_delete and
+ * export_map_text.
+ */
+void registerMcpMapEvalTools(McpToolDispatcher& dispatcher);
+
 } // namespace tb::ui

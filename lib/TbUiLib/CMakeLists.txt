@@ -114,8 +114,10 @@ target_sources(TbUiLib
     ${CMAKE_CURRENT_SOURCE_DIR}/src/MaterialBrowser.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/MaterialBrowserView.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/MaterialCollectionEditor.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/McpCheckpoints.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/McpDocumentState.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/McpJson.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/McpMapEvalTools.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/McpMapReadTools.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/McpMapTools.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/McpNodeRegistry.cpp
@@ -310,6 +312,7 @@ target_sources(TbUiLib
     ${CMAKE_CURRENT_SOURCE_DIR}/include/ui/MaterialBrowser.h
     ${CMAKE_CURRENT_SOURCE_DIR}/include/ui/MaterialBrowserView.h
     ${CMAKE_CURRENT_SOURCE_DIR}/include/ui/MaterialCollectionEditor.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/ui/McpCheckpoints.h
     ${CMAKE_CURRENT_SOURCE_DIR}/include/ui/McpDocumentState.h
     ${CMAKE_CURRENT_SOURCE_DIR}/include/ui/McpJson.h
     ${CMAKE_CURRENT_SOURCE_DIR}/include/ui/McpMapTools.h

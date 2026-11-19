@@ -24,6 +24,7 @@
 
 #include "base/Logger.h"
 #include "mcp/Tool.h"
+#include "ui/McpCheckpoints.h"
 #include "ui/McpNodeRegistry.h"
 
 #include "kd/result.h"
@@ -43,9 +44,10 @@ template <typename T>
 using McpResult = kdl::result<T, mcp::ToolError>;
 
 /**
- * The MCP state of one live map: its node registry and the id under which MCP clients
- * refer to the document. A new state must be created whenever the map is replaced, e.g.
- * when a document is reloaded, so that ids start again at 1.
+ * The MCP state of one live map: its node registry, a model of its undo history, its
+ * checkpoints and the id under which MCP clients refer to the document. A new state must
+ * be created whenever the map is replaced, e.g. when a document is reloaded, so that ids
+ * start again at 1.
  */
 struct McpDocumentState
 {
@@ -56,7 +58,10 @@ struct McpDocumentState
 
   mdl::Map& map;
   QString documentId;
+  /** Connected to the map before any other MCP observer. */
   McpNodeRegistry nodes;
+  McpHistoryTracker history;
+  McpCheckpointStore checkpoints;
 };
 
 struct McpLogLine

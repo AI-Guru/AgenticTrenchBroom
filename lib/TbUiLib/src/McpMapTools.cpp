@@ -25,6 +25,7 @@ namespace tb::ui
 void registerMcpMapTools(McpToolDispatcher& dispatcher)
 {
   registerMcpMapReadTools(dispatcher);
+  registerMcpMapEvalTools(dispatcher);
 }
 
 } // namespace tb::ui

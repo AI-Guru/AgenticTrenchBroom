@@ -59,8 +59,12 @@ struct McpToolDef
   /** Runs an App tool. App tools need no document. */
   std::function<McpResult<QJsonObject>(const QJsonObject& args)> runApp = {};
 
-  /** Optional additional content for a successful result, e.g. an image. */
-  std::function<QJsonArray(const QJsonObject& structured)> extraContent = {};
+  /**
+   * Optional additional content for a successful result, e.g. an image. It may remove
+   * fields from the structured result, e.g. large image data that should only be sent
+   * as additional content.
+   */
+  std::function<QJsonArray(QJsonObject& structured)> extraContent = {};
 };
 
 /**

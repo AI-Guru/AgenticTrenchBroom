@@ -3,6 +3,7 @@ EMBED_UTF8_MANIFEST(TbUiLibTest)
 
 target_sources(TbUiLibTest
   PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/McpAppTestUtils.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/McpTestUtils.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/RunAllTests.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_ActionContext.cpp
@@ -24,10 +25,13 @@ target_sources(TbUiLibTest
     ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_LayerListBox.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_MapViewBar.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_MapWindow.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_McpAppTools.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_McpCheckpoints.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_McpController.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_McpDeterminism.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_McpDocumentState.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_McpJson.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_McpLogCapture.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_McpMapCreateTools.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_McpMapEditTools.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_McpMapEvalTools.cpp
@@ -40,6 +44,7 @@ target_sources(TbUiLibTest
     ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_McpSelectionGuard.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_McpToolDispatcher.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_McpToolFuzz.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_McpViewTools.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_MultiCompletionLineEdit.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_QPathUtils.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_QPreferenceStore.cpp

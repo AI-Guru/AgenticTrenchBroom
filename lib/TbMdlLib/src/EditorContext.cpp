@@ -42,6 +42,7 @@ void EditorContext::reset()
   m_hiddenTags = 0;
   m_hiddenEntityDefinitions.reset();
   m_blockSelection = false;
+  m_temporarilyHiddenNodes.clear();
   m_currentGroup = nullptr;
   m_currentLayer = nullptr;
 }
@@ -125,6 +126,20 @@ void EditorContext::setBlockSelection(const bool blockSelection)
   }
 }
 
+const std::unordered_set<const Node*>& EditorContext::temporarilyHiddenNodes() const
+{
+  return m_temporarilyHiddenNodes;
+}
+
+void EditorContext::setTemporarilyHiddenNodes(std::unordered_set<const Node*> nodes)
+{
+  if (m_temporarilyHiddenNodes != nodes)
+  {
+    m_temporarilyHiddenNodes = std::move(nodes);
+    editorContextDidChangeNotifier();
+  }
+}
+
 LayerNode* EditorContext::currentLayer() const
 {
   return m_currentLayer;
@@ -202,11 +217,16 @@ bool EditorContext::visible(const WorldNode& worldNode) const
 
 bool EditorContext::visible(const LayerNode& layerNode) const
 {
-  return layerNode.visible();
+  return !m_temporarilyHiddenNodes.contains(&layerNode) && layerNode.visible();
 }
 
 bool EditorContext::visible(const GroupNode& groupNode) const
 {
+  if (m_temporarilyHiddenNodes.contains(&groupNode))
+  {
+    return false;
+  }
+
   if (groupNode.selected())
   {
     return true;
@@ -220,6 +240,11 @@ bool EditorContext::visible(const GroupNode& groupNode) const
 
 bool EditorContext::visible(const EntityNode& entityNode) const
 {
+  if (m_temporarilyHiddenNodes.contains(&entityNode))
+  {
+    return false;
+  }
+
   if (entityNode.selected())
   {
     return true;
@@ -250,6 +275,11 @@ bool EditorContext::visible(const EntityNode& entityNode) const
 
 bool EditorContext::visible(const BrushNode& brushNode) const
 {
+  if (m_temporarilyHiddenNodes.contains(&brushNode))
+  {
+    return false;
+  }
+
   if (brushNode.selected())
   {
     return true;
@@ -286,6 +316,11 @@ bool EditorContext::visible(const BrushNode& brushNode, const BrushFace& face) c
 
 bool EditorContext::visible(const PatchNode& patchNode) const
 {
+  if (m_temporarilyHiddenNodes.contains(&patchNode))
+  {
+    return false;
+  }
+
   if (patchNode.selected())
   {
     return true;

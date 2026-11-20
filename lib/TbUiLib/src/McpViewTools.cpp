@@ -33,6 +33,7 @@
 #include "gl/Camera.h"
 #include "gl/PerspectiveCamera.h"
 #include "mdl/BrushNode.h"
+#include "mdl/EditorContext.h"
 #include "mdl/EntityNode.h"
 #include "mdl/GroupNode.h"
 #include "mdl/LayerNode.h"
@@ -63,10 +64,14 @@
 #include "vm/vec.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <filesystem>
+#include <functional>
 #include <optional>
 #include <system_error>
+#include <tuple>
+#include <unordered_set>
 #include <vector>
 
 namespace tb::ui
@@ -82,6 +87,7 @@ const auto Mutating =
 const auto ViewNames = QStringList{"3d", "window", "top", "front", "side", "iso"};
 
 constexpr auto MaxFrameIds = 1000;
+constexpr size_t MaxCutawayIds = 50;
 constexpr auto ImagesKey = "_images";
 
 /** The direction from which the iso view and frame look at their target. */
@@ -371,6 +377,345 @@ McpResult<ViewSetup> setUpView(
   return ViewSetup{view3D, "perspective", {}};
 }
 
+// cutaway
+
+/** The test hook that grab calls before rendering. */
+std::function<void(MapWindow&)>& grabHook()
+{
+  static auto hook = std::function<void(MapWindow&)>{};
+  return hook;
+}
+
+/** Tolerance for comparing brush bounds in the cutaway rules. */
+constexpr auto CutawayEpsilon = 1e-3;
+
+/** The minimum free height below a ceiling. */
+constexpr auto CeilingClearance = 1.0;
+
+struct CutawayArgs
+{
+  std::optional<double> aboveZ;
+  std::vector<mdl::Node*> hideNodes;
+  std::optional<vm::bbox3d> clipBounds;
+  bool automatic = false;
+};
+
+struct Cutaway
+{
+  /** The nodes to hide while rendering. */
+  std::unordered_set<const mdl::Node*> nodes;
+  /** The brushes, patches and point entities that were visible and are hidden. */
+  std::vector<const mdl::Node*> objects;
+  /** The z threshold that auto used, if auto was given. */
+  std::optional<double> autoAboveZ;
+};
+
+McpResult<std::optional<CutawayArgs>> cutawayArgument(
+  McpDocumentState& doc, const QJsonObject& args)
+{
+  if (!args.contains("cutaway"))
+  {
+    return std::optional<CutawayArgs>{};
+  }
+
+  const auto json = args.value("cutaway").toObject();
+  auto result = CutawayArgs{};
+  if (json.contains("above_z"))
+  {
+    result.aboveZ = json.value("above_z").toDouble();
+  }
+  if (json.contains("clip_bounds"))
+  {
+    auto clip = bounds(json.value("clip_bounds"), "/cutaway/clip_bounds");
+    if (clip.is_error())
+    {
+      return errorOf(clip);
+    }
+    result.clipBounds = clip.value();
+  }
+  if (json.contains("hide_ids"))
+  {
+    doc.nodes.reconcile();
+    auto nodes = resolveNodes(doc, json.value("hide_ids").toArray(), MaxFrameIds);
+    if (nodes.is_error())
+    {
+      return errorOf(nodes);
+    }
+    for (const auto* node : nodes.value())
+    {
+      if (node == &doc.map.worldNode())
+      {
+        return toolError(
+          "wrong_node_type",
+          "the world cannot be hidden",
+          "pass the ids of the nodes to hide, or use above_z, clip_bounds or auto",
+          {{"id", "world"},
+           {"pointer", "/cutaway/hide_ids"},
+           {"expected", "layer, group, entity, brush or patch"}});
+      }
+    }
+    result.hideNodes = std::move(nodes).value();
+  }
+  result.automatic = json.value("auto").toBool(false);
+
+  if (
+    !result.aboveZ && !result.clipBounds && result.hideNodes.empty() && !result.automatic)
+  {
+    return toolError(
+      "invalid_argument",
+      "the cutaway hides nothing",
+      "pass above_z, hide_ids, clip_bounds or auto:true",
+      {{"pointer", "/cutaway"}});
+  }
+  return std::optional{std::move(result)};
+}
+
+bool isWorldBrush(const mdl::BrushNode& brushNode)
+{
+  return dynamic_cast<const mdl::WorldNode*>(brushNode.entity()) != nullptr;
+}
+
+/** Whether the x/y extents of the boxes overlap by more than CutawayEpsilon. */
+bool overlapXY(const vm::bbox3d& lhs, const vm::bbox3d& rhs)
+{
+  for (size_t i = 0; i < 2; ++i)
+  {
+    if (
+      std::min(lhs.max[i], rhs.max[i]) - std::max(lhs.min[i], rhs.min[i])
+      <= CutawayEpsilon)
+    {
+      return false;
+    }
+  }
+  return true;
+}
+
+/** Whether the boxes intersect or touch. */
+bool touches(const vm::bbox3d& lhs, const vm::bbox3d& rhs)
+{
+  for (size_t i = 0; i < 3; ++i)
+  {
+    if (lhs.max[i] < rhs.min[i] - 1e-6 || rhs.max[i] < lhs.min[i] - 1e-6)
+    {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Whether the brush is a ceiling: no other brush rests on it (overlaps its x/y extent
+ * and starts at its top), something lies below it, and at most two of five sample
+ * points of its x/y extent (the center and the points at a quarter and three quarters
+ * of both extents) are supported, i.e. have the highest top of a brush that contains
+ * the point in x/y and lies below the brush less than CeilingClearance below it. A
+ * brush with nothing below it is not a ceiling, so that a lone floor slab stays; a
+ * single pillar or partition wall under a ceiling does not keep it. Brushes far above
+ * (such as the top of a box that seals the map) do not keep a ceiling either.
+ */
+bool isCeiling(const vm::bbox3d& brush, const std::vector<vm::bbox3d>& others)
+{
+  const auto lerp = [](const double min, const double max, const double t) {
+    return min + (max - min) * t;
+  };
+  const auto& mn = brush.min;
+  const auto& mx = brush.max;
+  const auto samples = std::array<vm::vec2d, 5>{
+    vm::vec2d{lerp(mn.x(), mx.x(), 0.5), lerp(mn.y(), mx.y(), 0.5)},
+    vm::vec2d{lerp(mn.x(), mx.x(), 0.25), lerp(mn.y(), mx.y(), 0.25)},
+    vm::vec2d{lerp(mn.x(), mx.x(), 0.75), lerp(mn.y(), mx.y(), 0.25)},
+    vm::vec2d{lerp(mn.x(), mx.x(), 0.25), lerp(mn.y(), mx.y(), 0.75)},
+    vm::vec2d{lerp(mn.x(), mx.x(), 0.75), lerp(mn.y(), mx.y(), 0.75)},
+  };
+  auto floors = std::array<std::optional<double>, 5>{};
+  for (const auto& other : others)
+  {
+    if (&other == &brush)
+    {
+      continue;
+    }
+    if (
+      overlapXY(brush, other)
+      && std::abs(other.min.z() - brush.max.z()) <= CutawayEpsilon)
+    {
+      return false;
+    }
+    if (other.max.z() > brush.min.z() + CutawayEpsilon)
+    {
+      continue;
+    }
+    for (size_t i = 0; i < samples.size(); ++i)
+    {
+      const auto& p = samples[i];
+      if (
+        other.min.x() <= p.x() && p.x() <= other.max.x() && other.min.y() <= p.y()
+        && p.y() <= other.max.y())
+      {
+        floors[i] = std::max(floors[i].value_or(other.max.z()), other.max.z());
+      }
+    }
+  }
+  const auto anyBelow =
+    std::ranges::any_of(floors, [](const auto& floor) { return floor.has_value(); });
+  const auto supported = std::ranges::count_if(floors, [&](const auto& floor) {
+    return floor && brush.min.z() - *floor < CeilingClearance;
+  });
+  return anyBelow && supported <= 2;
+}
+
+Cutaway computeCutaway(
+  const mdl::Map& map, const CutawayArgs& args, const vm::bbox3d& frame)
+{
+  const auto& editorContext = map.editorContext();
+
+  // the visible world brushes in DFS order
+  auto worldBrushes = std::vector<const mdl::BrushNode*>{};
+  auto allNodes = std::vector<std::tuple<const mdl::Node*, bool>>{};
+  const auto hidden =
+    std::unordered_set<const mdl::Node*>{args.hideNodes.begin(), args.hideNodes.end()};
+  const auto visit =
+    [&](const auto& self, const mdl::Node& node, const bool inHidden) -> void {
+    const auto hide = inHidden || hidden.contains(&node);
+    allNodes.emplace_back(&node, hide);
+    if (const auto* brushNode = dynamic_cast<const mdl::BrushNode*>(&node))
+    {
+      if (isWorldBrush(*brushNode) && editorContext.visible(*brushNode))
+      {
+        worldBrushes.push_back(brushNode);
+      }
+    }
+    for (const auto* child : node.children())
+    {
+      self(self, *child, hide);
+    }
+  };
+  visit(visit, map.worldNode(), false);
+
+  auto result = Cutaway{};
+  if (args.automatic)
+  {
+    result.autoAboveZ = frame.center().z();
+  }
+
+  auto ruleHidden = std::unordered_set<const mdl::Node*>{};
+  auto boundsList = std::vector<vm::bbox3d>{};
+  boundsList.reserve(worldBrushes.size());
+  for (const auto* brushNode : worldBrushes)
+  {
+    boundsList.push_back(brushNode->logicalBounds());
+  }
+  for (size_t i = 0; i < worldBrushes.size(); ++i)
+  {
+    const auto& b = boundsList[i];
+    const auto hide = (args.aboveZ && b.min.z() >= *args.aboveZ - 1e-6)
+                      || (args.clipBounds && !touches(b, *args.clipBounds))
+                      || (result.autoAboveZ && b.min.z() >= *result.autoAboveZ - 1e-6)
+                      || (args.automatic && isCeiling(b, boundsList));
+    if (hide)
+    {
+      ruleHidden.insert(worldBrushes[i]);
+    }
+  }
+
+  for (const auto& [node, inHidden] : allNodes)
+  {
+    if (!inHidden && !ruleHidden.contains(node))
+    {
+      continue;
+    }
+    const auto isObject = node->accept(kdl::overload(
+      [](const mdl::WorldNode&) { return false; },
+      [](const mdl::LayerNode&) { return false; },
+      [](const mdl::GroupNode&) { return false; },
+      [](const mdl::EntityNode& entityNode) { return !entityNode.hasChildren(); },
+      [](const mdl::BrushNode&) { return true; },
+      [](const mdl::PatchNode&) { return true; }));
+    if (isObject && editorContext.visible(*node))
+    {
+      result.objects.push_back(node);
+    }
+    result.nodes.insert(node);
+  }
+  return result;
+}
+
+/**
+ * Hides nodes in the editor context of the window's map while it exists, without
+ * changing the document, and restores the previous set afterwards, also on errors.
+ */
+class TemporaryHide
+{
+public:
+  TemporaryHide(MapWindow& window, std::unordered_set<const mdl::Node*> nodes)
+    : m_window{&window}
+    , m_map{&window.document().map()}
+    , m_previous{m_map->editorContext().temporarilyHiddenNodes()}
+  {
+    if (!nodes.empty())
+    {
+      auto merged = m_previous;
+      merged.insert(nodes.begin(), nodes.end());
+      m_map->editorContext().setTemporarilyHiddenNodes(std::move(merged));
+      m_active = true;
+    }
+  }
+
+  ~TemporaryHide()
+  {
+    // the map is only accessed if the window still shows the same map
+    if (m_active && m_window && &m_window->document().map() == m_map)
+    {
+      // notifies the renderers, which then redraw everything
+      m_map->editorContext().setTemporarilyHiddenNodes(std::move(m_previous));
+      for (auto* view : m_window->findChildren<MapViewBase*>())
+      {
+        view->update();
+      }
+    }
+  }
+
+  TemporaryHide(const TemporaryHide&) = delete;
+  TemporaryHide& operator=(const TemporaryHide&) = delete;
+
+private:
+  QPointer<MapWindow> m_window;
+  mdl::Map* m_map;
+  std::unordered_set<const mdl::Node*> m_previous;
+  bool m_active = false;
+};
+
+QJsonObject cutawayJson(const McpDocumentState& doc, const Cutaway& cutaway)
+{
+  auto ids = QJsonArray{};
+  for (size_t i = 0; i < cutaway.objects.size() && i < MaxCutawayIds; ++i)
+  {
+    ids.append(doc.nodes.idOf(*cutaway.objects[i]));
+  }
+  auto result = QJsonObject{
+    {"hidden_count", qint64(cutaway.objects.size())},
+    {"hidden_ids", ids},
+  };
+  if (cutaway.autoAboveZ)
+  {
+    result["auto_above_z"] = canon(*cutaway.autoAboveZ);
+  }
+  return result;
+}
+
+/** Computes the cutaway for the given frame, or nothing if no cutaway was requested. */
+std::optional<Cutaway> cutawayFor(
+  const mdl::Map& map,
+  const std::optional<CutawayArgs>& args,
+  const std::optional<vm::bbox3d>& frame)
+{
+  return args ? std::optional{computeCutaway(
+                  map, *args, frame ? *frame : contentBounds(map))}
+              : std::nullopt;
+}
+
+const auto NothingHiddenWarning =
+  QStringLiteral("the cutaway hid nothing; check above_z, hide_ids and clip_bounds");
+
 /** Whether the platform can render, i.e. is not a headless test platform. */
 bool canRender()
 {
@@ -381,6 +726,10 @@ bool canRender()
 /** Renders the given view, or the whole window if view is null. */
 QImage grab(MapWindow& window, const QPointer<MapViewBase>& view)
 {
+  if (const auto& hook = grabHook())
+  {
+    hook(window);
+  }
   if (!canRender())
   {
     return {};
@@ -601,6 +950,39 @@ void addFrameProperties(QJsonObject& properties)
     "Frame the camera on the union of the bounds of these nodes before the shot.");
   properties["frame_bounds"] =
     schema::bounds("Frame the camera on these bounds before the shot.");
+  properties["cutaway"] = schema::describe(
+    schema::object({
+      {"above_z",
+       schema::number(
+         -1e9,
+         1e9,
+         "Hide every world brush whose bounds' min z is >= above_z (world units).")},
+      {"hide_ids",
+       schema::nodeIds(
+         MaxFrameIds,
+         "Hide these nodes and everything in them (layers, groups, entities, brushes, "
+         "patches; not the world).")},
+      {"clip_bounds",
+       schema::bounds(
+         "Hide every world brush whose bounds do not intersect or touch these bounds.")},
+      {"auto",
+       schema::boolean(
+         "Hide every world brush whose bounds' min z is >= the center z of the framed "
+         "bounds (frame_ids, frame_bounds, else the whole map), plus every ceiling: a "
+         "visible world brush that no other one overlapping it in x/y rests on (starts "
+         "within 0.001 units of its top), that has a world brush below at least one "
+         "of five points of its bottom (the center and the points at a quarter and "
+         "three quarters of its x and y extents), and that is supported (less than 1 "
+         "unit of free space down to the next world brush below) at no more than two "
+         "of these points, so a pillar or a partition wall below does not keep it. "
+         "Walls, floors, steps and boxes standing on a floor stay unless they lie "
+         "entirely above the center z.")},
+    }),
+    "Hide nodes while rendering, to look into sealed rooms; the rules are combined (a "
+    "node is hidden if any rule hides it). Only rendering changes: the map, the undo "
+    "history, the selection and the visibility of nodes stay as they were. World "
+    "brushes include grouped brushes but not brush entities (use hide_ids for "
+    "those). The result's cutaway lists hidden_count and hidden_ids (at most 50).");
 }
 
 // get_camera
@@ -890,18 +1272,34 @@ McpResult<QJsonObject> screenshot(McpAppHost& host, const QJsonObject& args)
     path = std::move(result).value();
   }
 
+  auto cutawayResult = QJsonObject{};
   return host.target(McpToolKind::Read) | kdl::and_then([&](const McpTarget& target) {
            return frameArgument(*target.doc, args)
                   | kdl::and_then([&](const std::optional<vm::bbox3d>& frame) {
-                      auto restorer =
-                        CameraRestorer{args.value("restore_camera").toBool(true)};
-                      return takeShot(
-                        *target.window,
-                        target.doc->map,
-                        viewName,
-                        frame,
-                        maxWidth,
-                        restorer);
+                      return cutawayArgument(*target.doc, args)
+                             | kdl::and_then(
+                               [&](const std::optional<CutawayArgs>& cutawayArgs) {
+                                 const auto cutaway =
+                                   cutawayFor(target.doc->map, cutawayArgs, frame);
+                                 // restore the cameras after the nodes are shown again
+                                 auto restorer = CameraRestorer{
+                                   args.value("restore_camera").toBool(true)};
+                                 const auto hide = TemporaryHide{
+                                   *target.window,
+                                   cutaway ? cutaway->nodes
+                                           : std::unordered_set<const mdl::Node*>{}};
+                                 if (cutaway)
+                                 {
+                                   cutawayResult = cutawayJson(*target.doc, *cutaway);
+                                 }
+                                 return takeShot(
+                                   *target.window,
+                                   target.doc->map,
+                                   viewName,
+                                   frame,
+                                   maxWidth,
+                                   restorer);
+                               });
                     });
          })
          | kdl::and_then([&](Shot shot) -> McpResult<QJsonObject> {
@@ -912,6 +1310,14 @@ McpResult<QJsonObject> screenshot(McpAppHost& host, const QJsonObject& args)
                {"projection", shot.projection},
                {"camera", shot.camera},
              };
+             if (!cutawayResult.isEmpty())
+             {
+               result["cutaway"] = cutawayResult;
+               if (cutawayResult.value("hidden_count").toInteger() == 0)
+               {
+                 shot.warnings.push_back(NothingHiddenWarning);
+               }
+             }
 
              const auto png = encodePng(shot.image);
              if (path)
@@ -971,7 +1377,12 @@ McpToolDef screenshotTool(McpAppHost& host)
     .title = "Screenshot",
     .description =
       "Renders the target map window and returns a PNG image. Use frame_ids or "
-      "frame_bounds to look at specific nodes. The window must be visible on screen. "
+      "frame_bounds to look at specific nodes. To see inside a closed room, pass "
+      "cutaway {auto:true} (or above_z in world units) with view \"top\" or \"iso\" "
+      "and frame_ids on the room: it hides the ceilings and everything above the "
+      "frame's mid height for this shot only; check cutaway.hidden_count and "
+      "hidden_ids in the result to see what was hidden. The window must be visible on "
+      "screen. "
       "Screenshots are for showing results; verify geometry with get_brush_geometry, "
       "query tools and validate_map instead.",
     .inputSchema = schema::object(properties),
@@ -997,7 +1408,21 @@ McpResult<QJsonObject> screenshotSet(McpAppHost& host, const QJsonObject& args)
                   | kdl::and_then(
                     [&](
                       const std::optional<vm::bbox3d>& frame) -> McpResult<QJsonObject> {
+                      auto cutawayArgs = cutawayArgument(*target.doc, args);
+                      if (cutawayArgs.is_error())
+                      {
+                        return errorOf(cutawayArgs);
+                      }
+                      const auto cutaway =
+                        cutawayFor(target.doc->map, cutawayArgs.value(), frame);
+                      // before rendering, which processes events
+                      const auto cutawayResult =
+                        cutaway ? cutawayJson(*target.doc, *cutaway) : QJsonObject{};
                       auto restorer = CameraRestorer{true};
+                      const auto hide = TemporaryHide{
+                        *target.window,
+                        cutaway ? cutaway->nodes
+                                : std::unordered_set<const mdl::Node*>{}};
                       auto shots = QJsonArray{};
                       auto images = QJsonArray{};
                       auto warnings = std::vector<QString>{};
@@ -1028,6 +1453,14 @@ McpResult<QJsonObject> screenshotSet(McpAppHost& host, const QJsonObject& args)
                       }
 
                       auto result = QJsonObject{{"shots", shots}, {ImagesKey, images}};
+                      if (cutaway)
+                      {
+                        result["cutaway"] = cutawayResult;
+                        if (cutaway->objects.empty())
+                        {
+                          warnings.push_back(NothingHiddenWarning);
+                        }
+                      }
                       if (!warnings.empty())
                       {
                         result["warnings"] = warningsJson(warnings);
@@ -1052,7 +1485,8 @@ McpToolDef screenshotSetTool(McpAppHost& host)
     .title = "Screenshot Set",
     .description =
       "Renders several views of the target map window (see screenshot) and returns one "
-      "PNG image per view, in order. The cameras are restored afterwards.",
+      "PNG image per view, in order. The cameras are restored afterwards. cutaway (see "
+      "screenshot) applies to every view.",
     .inputSchema = schema::object(properties),
     .kind = McpToolKind::App,
     .annotations = ReadOnly,
@@ -1062,6 +1496,11 @@ McpToolDef screenshotSetTool(McpAppHost& host)
 }
 
 } // namespace
+
+void setMcpScreenshotHookForTesting(std::function<void(MapWindow&)> hook)
+{
+  grabHook() = std::move(hook);
+}
 
 void registerMcpViewTools(McpToolDispatcher& dispatcher, McpAppHost& host)
 {

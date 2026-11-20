@@ -95,7 +95,9 @@ const auto Instructions = QStringLiteral(
   not_standable) with its position; run it after building stairs, doors and upper floors instead of reasoning
   about step heights and ceilings.
   screenshot and screenshot_set (views 3d, iso, top, front, side; frame_ids to look at nodes) return PNG images to
-  show your work; set_camera and focus_nodes point the user's view at something.
+  show your work; a closed room only shows its outside, so add cutaway:{auto:true} (or above_z, hide_ids,
+  clip_bounds) to hide its ceiling for that shot only (the map, undo history and selection stay unchanged).
+  set_camera and focus_nodes point the user's view at something.
 - Use batch for multi-step edits that must succeed or fail together ("$0" refers to the first id created by
   operation 0, "$0.2" to the third); a failed batch changes nothing. batch with dry_run:true previews the results
   and issues and then rolls everything back.

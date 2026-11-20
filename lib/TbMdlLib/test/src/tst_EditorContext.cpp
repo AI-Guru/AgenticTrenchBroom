@@ -1303,6 +1303,85 @@ TEST_CASE("EditorContext")
     CHECK(context.visible(*patchNode));
   }
 
+  SECTION("setTemporarilyHiddenNodes")
+  {
+    auto notifications = 0;
+    auto connection =
+      context.editorContextDidChangeNotifier.connect([&]() { ++notifications; });
+
+    auto* brushNode = createTopLevelBrush(worldNode);
+    auto* patchNode = createTopLevelPatch(worldNode);
+    auto* pointEntityNode = createTopLevelPointEntity(worldNode);
+    auto [brushEntityNode, entityBrushNode] = createTopLevelBrushEntity(worldNode);
+    auto [groupNode, groupedBrushNode] = createGroupedBrush(worldNode);
+    auto* layerNode = worldNode.defaultLayer();
+
+    REQUIRE(context.temporarilyHiddenNodes().empty());
+
+    SECTION("hides the given nodes, even if they are selected")
+    {
+      brushNode->select();
+      patchNode->select();
+      pointEntityNode->select();
+      REQUIRE(context.visible(*brushNode));
+
+      context.setTemporarilyHiddenNodes({brushNode, patchNode, pointEntityNode});
+      CHECK(notifications == 1);
+      CHECK(!context.visible(*brushNode));
+      CHECK(!context.visible(*brushNode, brushNode->brush().face(0)));
+      CHECK(!context.visible(*patchNode));
+      CHECK(!context.visible(*pointEntityNode));
+      CHECK(!context.selectable(*brushNode));
+
+      // the visibility state of the nodes is not changed
+      CHECK(brushNode->visibilityState() == VisibilityState::Inherited);
+      CHECK(brushNode->visible());
+
+      // the others are still visible
+      CHECK(context.visible(*entityBrushNode));
+      CHECK(context.visible(*groupNode));
+      CHECK(context.visible(*layerNode));
+
+      // setting the same nodes again is a no-op
+      context.setTemporarilyHiddenNodes({brushNode, patchNode, pointEntityNode});
+      CHECK(notifications == 1);
+
+      context.setTemporarilyHiddenNodes({});
+      CHECK(notifications == 2);
+      CHECK(context.visible(*brushNode));
+      CHECK(context.visible(*patchNode));
+      CHECK(context.visible(*pointEntityNode));
+
+      brushNode->deselect();
+      patchNode->deselect();
+      pointEntityNode->deselect();
+    }
+
+    SECTION("hides entities and groups whose children are all hidden")
+    {
+      context.setTemporarilyHiddenNodes({entityBrushNode, groupedBrushNode});
+      CHECK(!context.visible(*brushEntityNode));
+      CHECK(!context.visible(*groupNode));
+    }
+
+    SECTION("hides a group or layer but not its children")
+    {
+      context.setTemporarilyHiddenNodes({groupNode, layerNode});
+      CHECK(!context.visible(*groupNode));
+      CHECK(!context.visible(*layerNode));
+      CHECK(context.visible(*groupedBrushNode));
+      CHECK(context.visible(*brushNode));
+    }
+
+    SECTION("reset clears the nodes")
+    {
+      context.setTemporarilyHiddenNodes({brushNode});
+      context.reset();
+      CHECK(context.temporarilyHiddenNodes().empty());
+      CHECK(context.visible(*brushNode));
+    }
+  }
+
   SECTION("setBlockSelection")
   {
     REQUIRE(!context.blockSelection());

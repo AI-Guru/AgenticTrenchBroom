@@ -19,8 +19,11 @@
 
 #pragma once
 
+#include <functional>
+
 namespace tb::ui
 {
+class MapWindow;
 class McpAppHost;
 class McpToolDispatcher;
 
@@ -29,5 +32,12 @@ class McpToolDispatcher;
  * screenshot_set. They need a map window with views and do nothing headless.
  */
 void registerMcpViewTools(McpToolDispatcher& dispatcher, McpAppHost& host);
+
+/**
+ * Sets a function that the screenshot tools call right before each view is rendered,
+ * also on headless platforms where nothing is rendered. For tests that check the
+ * editor state during a shot. Pass an empty function to remove it.
+ */
+void setMcpScreenshotHookForTesting(std::function<void(MapWindow&)> hook);
 
 } // namespace tb::ui

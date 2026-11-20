@@ -27,13 +27,29 @@
 
 #include "McpAppTestUtils.h"
 #include "McpTestUtils.h"
+#include "mdl/BrushNode.h"
+#include "mdl/EditorContext.h"
+#include "mdl/EntityNode.h"
+#include "mdl/GroupNode.h"
+#include "mdl/LayerNode.h"
 #include "mdl/Map.h"
+#include "mdl/Node.h"
 #include "mdl/Selection.h"
 #include "mdl/TransactionScope.h"
+#include "mdl/WorldNode.h"
 #include "ui/MapDocument.h"
 #include "ui/MapWindow.h"
+#include "ui/McpViewTools.h"
+
+#include "vm/bbox.h"
+#include "vm/bbox_io.h" // IWYU pragma: keep
 
 #include <cmath>
+#include <functional>
+#include <string>
+#include <tuple>
+#include <unordered_set>
+#include <vector>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -92,6 +108,130 @@ QImage decodeImage(const QJsonObject& content)
   const auto png = QByteArray::fromBase64(content.value("data").toString().toLatin1());
   REQUIRE(png.startsWith("\x89PNG"));
   return QImage::fromData(png, "PNG");
+}
+
+/** The visibility of every node: its state and whether the editor shows it. */
+std::vector<std::tuple<const mdl::Node*, mdl::VisibilityState, bool>> visibility(
+  const mdl::Map& map)
+{
+  auto result = std::vector<std::tuple<const mdl::Node*, mdl::VisibilityState, bool>>{};
+  const auto visit = [&](const auto& self, const mdl::Node& node) -> void {
+    result.emplace_back(&node, node.visibilityState(), map.editorContext().visible(node));
+    for (const auto* child : node.children())
+    {
+      self(self, *child);
+    }
+  };
+  visit(visit, map.worldNode());
+  return result;
+}
+
+/** Everything a cutaway must leave as it was. */
+struct CutawayState
+{
+  McpMapSnapshot map;
+  std::vector<std::tuple<const mdl::Node*, mdl::VisibilityState, bool>> visibility;
+  std::unordered_set<const mdl::Node*> temporarilyHidden;
+  const mdl::LayerNode* currentLayer;
+  const mdl::GroupNode* currentGroup;
+  std::string currentMaterial;
+  bool canRepeat;
+
+  bool operator==(const CutawayState&) const = default;
+};
+
+CutawayState cutawayState(mdl::Map& map)
+{
+  return {
+    snapshot(map),
+    visibility(map),
+    map.editorContext().temporarilyHiddenNodes(),
+    map.editorContext().currentLayer(),
+    map.editorContext().currentGroup(),
+    map.currentMaterialName(),
+    map.canRepeatCommands(),
+  };
+}
+
+const mdl::BrushNode* findBrush(const mdl::Map& map, const vm::bbox3d& bounds)
+{
+  const mdl::BrushNode* result = nullptr;
+  const auto visit = [&](const auto& self, const mdl::Node& node) -> void {
+    if (const auto* brushNode = dynamic_cast<const mdl::BrushNode*>(&node);
+        brushNode && brushNode->logicalBounds() == bounds)
+    {
+      result = brushNode;
+    }
+    for (const auto* child : node.children())
+    {
+      self(self, *child);
+    }
+  };
+  visit(visit, map.worldNode());
+  REQUIRE(result != nullptr);
+  return result;
+}
+
+/** Records what the editor hides while a screenshot is rendered. */
+class ShotRecorder
+{
+public:
+  explicit ShotRecorder(mdl::Map& map)
+    : m_map{map}
+  {
+    setMcpScreenshotHookForTesting([&](MapWindow&) {
+      ++shots;
+      hidden = m_map.editorContext().temporarilyHiddenNodes();
+      stateDuringShot = snapshot(m_map);
+      for (const auto& [node, state, visible] : ui::visibility(m_map))
+      {
+        if (!visible)
+        {
+          invisible.insert(node);
+        }
+      }
+    });
+  }
+
+  ~ShotRecorder() { setMcpScreenshotHookForTesting({}); }
+
+  ShotRecorder(const ShotRecorder&) = delete;
+  ShotRecorder& operator=(const ShotRecorder&) = delete;
+
+  void reset()
+  {
+    shots = 0;
+    hidden.clear();
+    invisible.clear();
+    stateDuringShot.reset();
+  }
+
+  int shots = 0;
+  std::unordered_set<const mdl::Node*> hidden;
+  std::unordered_set<const mdl::Node*> invisible;
+  std::optional<McpMapSnapshot> stateDuringShot;
+
+private:
+  mdl::Map& m_map;
+};
+
+/** The mean squared deviation of the pixel brightness from its mean. */
+double variance(const QImage& image)
+{
+  auto sum = 0.0;
+  auto sumSquares = 0.0;
+  for (int y = 0; y < image.height(); ++y)
+  {
+    for (int x = 0; x < image.width(); ++x)
+    {
+      const auto gray = double(qGray(image.pixel(x, y)));
+      sum += gray;
+      sumSquares += gray * gray;
+    }
+  }
+  const auto count = double(image.width()) * double(image.height());
+  const auto mean = sum / count;
+  return sumSquares / count - mean * mean;
 }
 
 } // namespace
@@ -332,6 +472,305 @@ TEST_CASE("McpViewTools")
       CHECK(error.value("code") == "view_unavailable");
       window.show();
     }
+  }
+
+  SECTION("cutaway")
+  {
+    auto& window = f.newMap();
+    auto& map = window.document().map();
+
+    // a sealed room with a box and an entity inside, next to the starter brush
+    const auto room = f.ok(
+      "create_room",
+      R"({"inner_bounds":{"min":[256,0,0],"max":[512,256,128]},"group_name":"room"})");
+    const auto group = room.value("group").toString();
+    const auto ceilingId = room.value("ceiling").toString();
+    const auto floorId = room.value("floor").toString();
+    const auto boxId =
+      f.ok("create_box_brush", R"({"bounds":{"min":[352,96,0],"max":[416,160,32]}})")
+        .value("id")
+        .toString();
+    const auto entityId =
+      f.ok("create_entity", R"({"classname":"light","origin":[300,40,64]})")
+        .value("id")
+        .toString();
+
+    const auto* ceiling = findBrush(map, vm::bbox3d{{240, -16, 128}, {528, 272, 144}});
+    const auto* floor = findBrush(map, vm::bbox3d{{240, -16, -16}, {528, 272, 0}});
+    const auto* box = findBrush(map, vm::bbox3d{{352, 96, 0}, {416, 160, 32}});
+    const auto* starter = findBrush(map, vm::bbox3d{{-64, -64, -16}, {64, 64, 16}});
+    const auto* groupNode = ceiling->parent();
+    REQUIRE(dynamic_cast<const mdl::GroupNode*>(groupNode));
+    const mdl::Node* entity = nullptr;
+    for (const auto* node : map.worldNode().defaultLayer()->children())
+    {
+      if (dynamic_cast<const mdl::EntityNode*>(node))
+      {
+        entity = node;
+      }
+    }
+    REQUIRE(entity != nullptr);
+
+    auto recorder = ShotRecorder{map};
+    const auto before = cutawayState(map);
+
+    // calls the tool and checks that nothing changed afterwards
+    const auto shoot = [&](const QString& tool, const QJsonObject& args) {
+      recorder.reset();
+      const auto result = f.call(tool, args);
+      CHECK(cutawayState(map) == before);
+      if (recorder.stateDuringShot)
+      {
+        CHECK(*recorder.stateDuringShot == before.map);
+      }
+      const auto structured = result.value("structuredContent").toObject();
+      if (result.value("isError").toBool())
+      {
+        CHECK(structured.value("error").toObject().value("code") == "render_failed");
+        CHECK_FALSE(canRender());
+        return QJsonObject{};
+      }
+      CHECK(canRender());
+      return structured;
+    };
+
+    const auto top = [&](const char* cutaway) {
+      return QJsonObject{
+        {"view", "top"},
+        {"frame_ids", QJsonArray{group}},
+        {"cutaway", parseObject(cutaway)},
+      };
+    };
+
+    SECTION("auto hides the ceiling and what lies above the frame's center")
+    {
+      const auto result = shoot("screenshot", top(R"({"auto":true})"));
+      CHECK(recorder.shots == 1);
+      CHECK(recorder.hidden == std::unordered_set<const mdl::Node*>{ceiling});
+      CHECK(recorder.invisible.contains(ceiling));
+      CHECK_FALSE(recorder.invisible.contains(floor));
+      CHECK_FALSE(recorder.invisible.contains(box));
+      CHECK_FALSE(recorder.invisible.contains(entity));
+      CHECK_FALSE(recorder.invisible.contains(starter));
+      if (!result.isEmpty())
+      {
+        const auto cutaway = result.value("cutaway").toObject();
+        CHECK(cutaway.value("hidden_count").toInt() == 1);
+        CHECK(cutaway.value("hidden_ids") == QJsonArray{ceilingId});
+        CHECK(cutaway.value("auto_above_z").toDouble() == 64.0);
+        CHECK_FALSE(result.contains("warnings"));
+      }
+    }
+
+    SECTION("auto hides the ceilings of rooms of every height")
+    {
+      // a low room far below the frame's center keeps its walls, but not its ceiling
+      f.ok("create_room", R"({"inner_bounds":{"min":[0,512,0],"max":[128,640,64]}})");
+      f.ok("create_box_brush", R"({"bounds":{"min":[0,1024,0],"max":[64,1088,2048]}})");
+      const auto* lowCeiling = findBrush(map, vm::bbox3d{{-16, 496, 64}, {144, 656, 80}});
+      const auto* lowFloor = findBrush(map, vm::bbox3d{{-16, 496, -16}, {144, 656, 0}});
+      const auto after = cutawayState(map);
+
+      recorder.reset();
+      f.call("screenshot", R"({"view":"top","cutaway":{"auto":true}})");
+      CHECK(cutawayState(map) == after);
+      CHECK(recorder.hidden.contains(lowCeiling));
+      CHECK(recorder.hidden.contains(ceiling));
+      CHECK_FALSE(recorder.hidden.contains(lowFloor));
+      CHECK_FALSE(recorder.hidden.contains(box));
+      CHECK_FALSE(recorder.hidden.contains(starter));
+    }
+
+    SECTION("auto finds ceilings above a pillar and below a far away slab")
+    {
+      // a low room with a pillar under the middle of its ceiling, and a slab high
+      // above all rooms (as in a map sealed in a hollow box)
+      f.ok("create_room", R"({"inner_bounds":{"min":[0,512,0],"max":[128,640,64]}})");
+      f.ok("create_box_brush", R"({"bounds":{"min":[56,568,0],"max":[72,584,64]}})");
+      f.ok(
+        "create_box_brush",
+        R"({"bounds":{"min":[-512,-512,2048],"max":[1024,1024,2064]}})");
+      const auto* lowCeiling = findBrush(map, vm::bbox3d{{-16, 496, 64}, {144, 656, 80}});
+      const auto* pillar = findBrush(map, vm::bbox3d{{56, 568, 0}, {72, 584, 64}});
+      const auto* hull =
+        findBrush(map, vm::bbox3d{{-512, -512, 2048}, {1024, 1024, 2064}});
+      const auto after = cutawayState(map);
+
+      recorder.reset();
+      f.call("screenshot", R"({"view":"top","cutaway":{"auto":true}})");
+      CHECK(cutawayState(map) == after);
+      CHECK(recorder.hidden.contains(lowCeiling));
+      CHECK(recorder.hidden.contains(ceiling));
+      CHECK(recorder.hidden.contains(hull));
+      CHECK_FALSE(recorder.hidden.contains(pillar));
+      CHECK_FALSE(recorder.hidden.contains(box));
+      CHECK_FALSE(recorder.hidden.contains(floor));
+      CHECK_FALSE(recorder.hidden.contains(starter));
+    }
+
+    SECTION("above_z hides world brushes that start at or above it")
+    {
+      shoot("screenshot", top(R"({"above_z":128})"));
+      CHECK(recorder.hidden == std::unordered_set<const mdl::Node*>{ceiling});
+
+      shoot("screenshot", top(R"({"above_z":-16})"));
+      // every world brush, but not the entity
+      CHECK(recorder.hidden.size() == 8);
+      CHECK(recorder.hidden.contains(starter));
+      CHECK(recorder.hidden.contains(floor));
+      CHECK_FALSE(recorder.invisible.contains(entity));
+    }
+
+    SECTION("hide_ids hides nodes and their contents, even if they are selected")
+    {
+      f.ok("focus_nodes", QJsonObject{{"ids", QJsonArray{group, entityId}}});
+      const auto selected = cutawayState(map);
+      REQUIRE(map.selection().nodes.size() == 2);
+
+      recorder.reset();
+      const auto result = f.call(
+        "screenshot",
+        QJsonObject{
+          {"view", "top"},
+          {"cutaway", QJsonObject{{"hide_ids", QJsonArray{"@selection"}}}}});
+      CHECK(cutawayState(map) == selected);
+      CHECK(recorder.invisible.contains(ceiling));
+      CHECK(recorder.invisible.contains(entity));
+      CHECK(recorder.invisible.contains(floor));
+      CHECK(recorder.invisible.contains(groupNode));
+      CHECK_FALSE(recorder.invisible.contains(box));
+      CHECK_FALSE(recorder.invisible.contains(starter));
+      if (!result.value("isError").toBool())
+      {
+        const auto cutaway =
+          result.value("structuredContent").toObject().value("cutaway").toObject();
+        // the six room brushes and the entity
+        CHECK(cutaway.value("hidden_count").toInt() == 7);
+      }
+    }
+
+    SECTION("clip_bounds hides world brushes outside of the bounds")
+    {
+      shoot(
+        "screenshot", top(R"({"clip_bounds":{"min":[256,0,0],"max":[512,256,128]}})"));
+      CHECK(recorder.hidden == std::unordered_set<const mdl::Node*>{starter});
+    }
+
+    SECTION("combines the rules")
+    {
+      shoot(
+        "screenshot",
+        QJsonObject{
+          {"view", "iso"},
+          {"cutaway",
+           QJsonObject{
+             {"above_z", 30},
+             {"hide_ids", QJsonArray{entityId}},
+             {"clip_bounds", parseObject(R"({"min":[0,0,0],"max":[1,1,1]})")}}}});
+      CHECK(recorder.invisible.contains(entity));
+      CHECK(recorder.hidden.contains(ceiling));
+      CHECK(recorder.hidden.contains(floor));
+      CHECK_FALSE(recorder.hidden.contains(starter));
+    }
+
+    SECTION("warns if nothing is hidden")
+    {
+      const auto result = shoot("screenshot", top(R"({"above_z":100000})"));
+      CHECK(recorder.hidden.empty());
+      if (!result.isEmpty())
+      {
+        CHECK(result.value("cutaway").toObject().value("hidden_count").toInt() == 0);
+        CHECK(result.value("warnings").toArray().size() == 1);
+      }
+    }
+
+    SECTION("screenshot_set hides the nodes for every view")
+    {
+      auto hiddenPerShot = std::vector<std::unordered_set<const mdl::Node*>>{};
+      setMcpScreenshotHookForTesting([&](MapWindow&) {
+        hiddenPerShot.push_back(map.editorContext().temporarilyHiddenNodes());
+      });
+      const auto result = shoot(
+        "screenshot_set",
+        QJsonObject{
+          {"views", QJsonArray{"top", "iso"}},
+          {"frame_ids", QJsonArray{group}},
+          {"cutaway", parseObject(R"({"auto":true})")}});
+      // offscreen, the first view fails and the second is not rendered
+      REQUIRE(!hiddenPerShot.empty());
+      CHECK(hiddenPerShot.size() == (canRender() ? 2u : 1u));
+      for (const auto& hidden : hiddenPerShot)
+      {
+        CHECK(hidden == std::unordered_set<const mdl::Node*>{ceiling});
+      }
+      if (!result.isEmpty())
+      {
+        CHECK(result.value("cutaway").toObject().value("hidden_count").toInt() == 1);
+      }
+    }
+
+    SECTION("restores the state when the window is not visible")
+    {
+      window.hide();
+      CHECK(f.err("screenshot", top(R"({"auto":true})")) == "view_unavailable");
+      window.show();
+      CHECK(cutawayState(map) == before);
+    }
+
+    SECTION("checks the arguments before hiding anything")
+    {
+      for (const auto* cutaway :
+           {R"({})",
+            R"({"auto":false})",
+            R"({"bogus":1})",
+            R"({"above_z":"high"})",
+            R"({"hide_ids":[]})",
+            R"({"hide_ids":["world"]})",
+            R"({"clip_bounds":{"min":[1,0,0],"max":[0,1,1]}})"})
+      {
+        INFO(cutaway);
+        recorder.reset();
+        CHECK(f.err("screenshot", top(cutaway)) != "render_failed");
+        CHECK(
+          f.err(
+            "screenshot_set",
+            QJsonObject{
+              {"frame_ids", QJsonArray{group}}, {"cutaway", parseObject(cutaway)}})
+          != "render_failed");
+        CHECK(recorder.shots == 0);
+        CHECK(cutawayState(map) == before);
+      }
+      CHECK(f.err("screenshot", top(R"({"hide_ids":["world"]})")) == "wrong_node_type");
+      CHECK(f.err("screenshot", top(R"({"hide_ids":["B999"]})")) == "unknown_node");
+      CHECK(f.err("screenshot", top(R"({})")) == "invalid_argument");
+    }
+
+    SECTION("shows the inside of a sealed room")
+    {
+      if (canRender())
+      {
+        const auto image = [&](const QJsonObject& args) {
+          const auto result = f.call("screenshot", args);
+          REQUIRE_FALSE(result.value("isError").toBool());
+          return decodeImage(result.value("content").toArray()[1].toObject());
+        };
+        auto args = QJsonObject{{"view", "top"}, {"frame_ids", QJsonArray{group}}};
+        const auto closed = image(args);
+        args["cutaway"] = parseObject(R"({"auto":true})");
+        const auto open = image(args);
+        CHECK(closed != open);
+        CHECK(variance(open) > variance(closed));
+        CHECK(cutawayState(map) == before);
+      }
+    }
+
+    CHECK(map.editorContext().temporarilyHiddenNodes().empty());
+    CHECK(
+      f.ok("get_nodes", QJsonObject{{"ids", QJsonArray{boxId, floorId}}})
+        .value("nodes")
+        .toArray()
+        .size()
+      == 2);
   }
 
   SECTION("screenshot_set")

@@ -197,6 +197,7 @@ TEST_CASE("McpDeterminism")
     Call{"clip_brush", R"({"id":"B2","plane":{"point":[16,0,0],"normal":[1,0.5,0]}})"},
     Call{
       "describe_region", R"({"bounds":{"min":[1000,-100,-100],"max":[1300,300,200]}})"},
+    Call{"check_leaks", R"({"resolution":16})"},
     Call{
       "batch",
       R"({"dry_run":true,"operations":[{"tool":"delete_nodes","arguments":{"ids":["B2"]}},

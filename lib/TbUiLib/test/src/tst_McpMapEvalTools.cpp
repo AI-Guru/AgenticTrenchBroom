@@ -32,6 +32,7 @@
 #include "mdl/Map_CopyPaste.h"
 #include "mdl/Map_Entities.h"
 #include "mdl/Map_Geometry.h"
+#include "mdl/Map_Layers.h"
 #include "mdl/Map_Nodes.h"
 #include "mdl/Map_Selection.h"
 #include "mdl/PasteType.h"
@@ -112,6 +113,40 @@ void rotate45(mdl::Map& map, mdl::Node* node)
   mdl::deselectAll(map);
 }
 
+
+/**
+ * Adds the floor (-z), ceiling (+z) and walls around the given interior, 16 units thick,
+ * except for the sides named in omit.
+ */
+std::vector<mdl::BrushNode*> addShell(
+  mdl::Map& map, const vm::bbox3d& inner, const std::vector<std::string>& omit = {})
+{
+  const auto& lo = inner.min;
+  const auto& hi = inner.max;
+  const auto boxes = std::vector<std::pair<std::string, vm::bbox3d>>{
+    {"-z", {{lo.x() - 16, lo.y() - 16, lo.z() - 16}, {hi.x() + 16, hi.y() + 16, lo.z()}}},
+    {"+z", {{lo.x() - 16, lo.y() - 16, hi.z()}, {hi.x() + 16, hi.y() + 16, hi.z() + 16}}},
+    {"-x", {{lo.x() - 16, lo.y() - 16, lo.z()}, {lo.x(), hi.y() + 16, hi.z()}}},
+    {"+x", {{hi.x(), lo.y() - 16, lo.z()}, {hi.x() + 16, hi.y() + 16, hi.z()}}},
+    {"-y", {{lo.x(), lo.y() - 16, lo.z()}, {hi.x(), lo.y(), hi.z()}}},
+    {"+y", {{lo.x(), hi.y(), lo.z()}, {hi.x(), hi.y() + 16, hi.z()}}},
+  };
+
+  auto result = std::vector<mdl::BrushNode*>{};
+  for (const auto& [side, box] : boxes)
+  {
+    if (std::ranges::find(omit, side) == omit.end())
+    {
+      result.push_back(addBrush(map, box));
+    }
+  }
+  return result;
+}
+
+QJsonArray jsonVec(const double x, const double y, const double z)
+{
+  return QJsonArray{x, y, z};
+}
 } // namespace
 
 TEST_CASE("McpMapEvalTools")
@@ -849,6 +884,7 @@ TEST_CASE("McpMapEvalTools")
            R"(["checkpoint_list",{}])",
            R"(["checkpoint_delete",{"name":"y"}])",
            R"(["export_map_text",{"ids":["@selection"]}])",
+           R"(["check_leaks",{}])",
          })
     {
       const auto args =
@@ -986,6 +1022,350 @@ TEST_CASE("McpMapEvalTools")
       CHECK(f.err("check_brush_overlaps", R"({"min_volume":-1})") == "invalid_argument");
       CHECK(
         f.err("check_brush_overlaps", R"({"ids":["@selection"]})") == "invalid_argument");
+    }
+  }
+
+  SECTION("check_leaks")
+  {
+    const auto room = vm::bbox3d{{0, 0, 0}, {128, 128, 128}};
+
+    SECTION("a hollow box is sealed")
+    {
+      addShell(map, room);
+      addPointEntity(map, "light", {64, 64, 64});
+
+      const auto result = f.ok("check_leaks");
+      CHECK(result.value("sealed") == QJsonValue{true});
+      CHECK(result.value("leaks") == QJsonValue{QJsonArray{}});
+      CHECK(result.value("start_points_checked") == QJsonValue{1});
+      CHECK(result.value("resolution") == QJsonValue{8});
+      // the brush bounds expanded by 2 * resolution
+      CHECK(
+        result.value("bounds")
+        == QJsonValue{
+          QJsonObject{{"min", jsonVec(-32, -32, -32)}, {"max", jsonVec(160, 160, 160)}}});
+      CHECK(result.value("grid") == QJsonValue{QJsonArray{24, 24, 24}});
+      CHECK(result.value("cells") == QJsonValue{24 * 24 * 24});
+      // the shell's volume in 8 unit cells
+      CHECK(
+        result.value("solid_cells")
+        == QJsonValue{(160 * 160 * 160 - 128 * 128 * 128) / 512});
+      // only the interior is flood filled
+      CHECK(result.value("elapsed_cells_visited") == QJsonValue{16 * 16 * 16});
+    }
+
+    SECTION("a gap narrower than the resolution leaks")
+    {
+      addShell(map, room, {"+x"});
+      // the +x wall in two pieces with a 1 unit gap at y 63..64
+      addBrush(map, vm::bbox3d{{128, -16, 0}, {144, 63, 128}});
+      addBrush(map, vm::bbox3d{{128, 64, 0}, {144, 144, 128}});
+      auto* light = addPointEntity(map, "light", {64, 64, 64});
+
+      const auto result = f.ok("check_leaks");
+      CHECK(result.value("sealed") == QJsonValue{false});
+      CHECK(result.value("leaks_total") == QJsonValue{1});
+      const auto leaks = result.value("leaks").toArray();
+      REQUIRE(leaks.size() == 1);
+      const auto leak = leaks[0].toObject();
+      CHECK(leak.value("start_point") == QJsonValue{jsonVec(64, 64, 64)});
+      CHECK(leak.value("start_entity_id") == QJsonValue{f.id(*light)});
+      // the nearest outermost cell behind the gap
+      CHECK(leak.value("exit_point") == QJsonValue{jsonVec(156, 60, 68)});
+
+      const auto path = leak.value("path").toArray();
+      REQUIRE(path.size() >= 3);
+      CHECK(path.size() <= 64);
+      CHECK(path.first() == leak.value("start_point"));
+      CHECK(path.last() == leak.value("exit_point"));
+      // the path turns towards the gap
+      CHECK(std::ranges::any_of(
+        path, [](const auto& point) { return point.toArray()[1] == QJsonValue{60}; }));
+      // 11 steps to the outside, one to the gap, plus the start's offset
+      CHECK(
+        std::abs(leak.value("path_length").toDouble() - (12 * 8 + std::sqrt(48.0)))
+        < 1e-5);
+
+      SECTION("explicit start points")
+      {
+        const auto explicitResult =
+          f.ok("check_leaks", R"({"start_points":[[100,100,100]]})");
+        CHECK(explicitResult.value("sealed") == QJsonValue{false});
+        const auto explicitLeak =
+          explicitResult.value("leaks").toArray().first().toObject();
+        CHECK(explicitLeak.value("start_point") == QJsonValue{jsonVec(100, 100, 100)});
+        CHECK(!explicitLeak.contains("start_entity_id"));
+      }
+    }
+
+    SECTION("brush entities do not seal")
+    {
+      addShell(map, room, {"+x"});
+      addBrushEntity(map, "func_wall", {vm::bbox3d{{128, -16, 0}, {144, 144, 128}}});
+      addPointEntity(map, "light", {64, 64, 64});
+
+      const auto result = f.ok("check_leaks");
+      CHECK(result.value("sealed") == QJsonValue{false});
+      CHECK(
+        result.value("leaks").toArray().first().toObject().value("exit_point")
+        == QJsonValue{jsonVec(156, 68, 68)});
+    }
+
+    SECTION("brushes in groups seal")
+    {
+      auto shell = addShell(map, room);
+      groupNodes(map, std::vector<mdl::Node*>{shell.begin(), shell.end()}, "room");
+      mdl::deselectAll(map);
+      addPointEntity(map, "light", {64, 64, 64});
+
+      CHECK(f.ok("check_leaks").value("sealed") == QJsonValue{true});
+    }
+
+    SECTION("two rooms joined by a doorway")
+    {
+      // room A [0..128], room B [144..272] share the wall at x 128..144 with a door
+      addShell(map, room, {"+x"});
+      auto b = addShell(map, vm::bbox3d{{144, 0, 0}, {272, 128, 128}}, {"-x"});
+      addBrush(map, vm::bbox3d{{128, -16, 0}, {144, 32, 128}});
+      addBrush(map, vm::bbox3d{{128, 96, 0}, {144, 144, 128}});
+      addBrush(map, vm::bbox3d{{128, 32, 96}, {144, 96, 128}});
+      auto* light = addPointEntity(map, "light", {64, 64, 64});
+      auto* playerStart = addPointEntity(map, "info_player_start", {208, 64, 24});
+
+      const auto sealed = f.ok("check_leaks");
+      CHECK(sealed.value("sealed") == QJsonValue{true});
+      CHECK(sealed.value("start_points_checked") == QJsonValue{2});
+      // both rooms and the doorway, filled once
+      CHECK(
+        sealed.value("elapsed_cells_visited")
+        == QJsonValue{2 * 16 * 16 * 16 + 2 * 8 * 12});
+
+      // without the ceiling of room B, both start points leak through it
+      f.ok("delete_nodes", QJsonObject{{"ids", QJsonArray{f.id(*b[1])}}});
+      const auto leaking = f.ok("check_leaks");
+      CHECK(leaking.value("sealed") == QJsonValue{false});
+      const auto leaks = leaking.value("leaks").toArray();
+      REQUIRE(leaks.size() == 1);
+      const auto leak = leaks[0].toObject();
+      CHECK(leak.value("start_entity_id") == QJsonValue{f.id(*light)});
+      CHECK(leak.value("exit_point").toArray()[2] == QJsonValue{156});
+      CHECK(
+        leak.value("shared_start_points")
+        == QJsonValue{QJsonArray{QJsonObject{
+          {"point", jsonVec(208, 64, 24)}, {"entity_id", f.id(*playerStart)}}}});
+      CHECK(leak.value("shared_start_points_count") == QJsonValue{1});
+    }
+
+    SECTION("start points inside solid are excluded")
+    {
+      addShell(map, room);
+      auto* buried = addPointEntity(map, "light", {-8, 64, 64});
+      addPointEntity(map, "light", {64, 64, 64});
+
+      const auto result = f.ok("check_leaks");
+      CHECK(result.value("sealed") == QJsonValue{true});
+      CHECK(result.value("start_points_checked") == QJsonValue{1});
+      CHECK(
+        result.value("excluded_start_points")
+        == QJsonValue{QJsonArray{QJsonObject{
+          {"point", jsonVec(-8, 64, 64)},
+          {"entity_id", f.id(*buried)},
+          {"reason", "inside_solid"}}}});
+      CHECK(result.value("excluded_start_points_count") == QJsonValue{1});
+
+      // a point on a face is not inside solid; the room next to it is filled
+      const auto onFace = f.ok("check_leaks", R"({"start_points":[[0,64,64]]})");
+      CHECK(onFace.value("start_points_checked") == QJsonValue{1});
+      CHECK(onFace.value("excluded_start_points") == QJsonValue{QJsonArray{}});
+      CHECK(onFace.value("sealed") == QJsonValue{true});
+      CHECK(onFace.value("elapsed_cells_visited") == QJsonValue{16 * 16 * 16});
+
+      // a point on the seam between two wall brushes is inside solid
+      const auto onSeam = f.ok("check_leaks", R"({"start_points":[[-8,64,0]]})");
+      CHECK(onSeam.value("start_points_checked") == QJsonValue{0});
+      CHECK(
+        onSeam.value("excluded_start_points")
+        == QJsonValue{QJsonArray{
+          QJsonObject{{"point", jsonVec(-8, 64, 0)}, {"reason", "inside_solid"}}}});
+      CHECK(onSeam.value("sealed") == QJsonValue{true});
+      CHECK(strings(onSeam.value("warnings")).size() == 1);
+    }
+
+    SECTION("explicit bounds")
+    {
+      addShell(map, room);
+      // the interior's outermost cells are the boundary
+      const auto inner = f.ok(
+        "check_leaks",
+        R"({"start_points":[[64,64,64]],"bounds":{"min":[0,0,0],"max":[128,128,128]}})");
+      CHECK(inner.value("sealed") == QJsonValue{false});
+      CHECK(inner.value("grid") == QJsonValue{QJsonArray{16, 16, 16}});
+      CHECK(
+        f.err(
+          "check_leaks",
+          R"({"start_points":[[500,0,0]],"bounds":{"min":[0,0,0],"max":[128,128,128]}})")
+        == "invalid_argument");
+    }
+
+    SECTION("an empty map has nothing to check")
+    {
+      const auto result = f.ok("check_leaks");
+      CHECK(result.value("sealed") == QJsonValue{true});
+      CHECK(result.value("cells") == QJsonValue{0});
+      CHECK(strings(result.value("warnings")).size() == 1);
+    }
+
+    SECTION("an entity without world brushes leaks")
+    {
+      addPointEntity(map, "light", {64, 64, 64});
+      CHECK(f.ok("check_leaks").value("sealed") == QJsonValue{false});
+    }
+
+    SECTION("is deterministic")
+    {
+      addShell(map, room, {"+x"});
+      addPointEntity(map, "light", {64, 64, 64});
+      addPointEntity(map, "light", {32, 96, 32});
+      addPointEntity(map, "light", {-8, 64, 64});
+      const auto first = compactJson(f.ok("check_leaks", R"({"resolution":4})"));
+      CHECK(compactJson(f.ok("check_leaks", R"({"resolution":4})")) == first);
+    }
+
+    SECTION("max_cells caps the work")
+    {
+      addShell(map, room);
+      addPointEntity(map, "light", {64, 64, 64});
+
+      // the bounds [-18..146] need 164^3 cells at resolution 1
+      const auto error =
+        f.error("check_leaks", R"({"resolution":1,"max_cells":4000000})");
+      CHECK(error.value("code") == QJsonValue{"invalid_argument"});
+      CHECK(
+        error.value("details").toObject().value("cells") == QJsonValue{164 * 164 * 164});
+      CHECK(f.err("check_leaks", R"({"max_cells":1000})") == "invalid_argument");
+      CHECK(
+        f.ok("check_leaks", R"({"resolution":2})").value("sealed") == QJsonValue{true});
+      CHECK(
+        f.ok("check_leaks", R"({"max_cells":13824})").value("sealed")
+        == QJsonValue{true});
+    }
+
+    SECTION("layers omitted from export do not seal")
+    {
+      // the compiler never sees these brushes and entities
+      auto* omitted = addLayer(map, "omitted");
+      mdl::setOmitLayerFromExport(map, omitted, true);
+      addShell(map, room, {"+x"});
+      addBrush(map, vm::bbox3d{{128, -16, 0}, {144, 144, 128}}, "material", omitted);
+      addPointEntity(map, "light", {64, 64, 64});
+      auto* hidden = addPointEntity(map, "light", {500, 500, 500}, omitted);
+
+      CHECK(
+        f.ok("check_leaks", R"({"start_points":[[64,64,64]]})").value("sealed")
+        == QJsonValue{false});
+      const auto result = f.ok("check_leaks");
+      CHECK(result.value("sealed") == QJsonValue{false});
+      CHECK(result.value("start_points_checked") == QJsonValue{1});
+      CHECK(
+        result.value("excluded_start_points")
+        == QJsonValue{QJsonArray{QJsonObject{
+          {"point", jsonVec(500, 500, 500)},
+          {"entity_id", f.id(*hidden)},
+          {"reason", "omitted_from_export"}}}});
+
+      mdl::setOmitLayerFromExport(map, omitted, false);
+      CHECK(f.ok("check_leaks").value("sealed") == QJsonValue{false});
+      CHECK(
+        f.ok("check_leaks", R"({"start_points":[[64,64,64]]})").value("sealed")
+        == QJsonValue{true});
+    }
+
+    SECTION("a start point on a face floods the space next to it")
+    {
+      // a sealed room with a player start next to a leaking room whose only entity
+      // stands exactly on its floor
+      addShell(map, room);
+      addPointEntity(map, "info_player_start", {64, 64, 24});
+      const auto other = vm::bbox3d{{300, 0, 0}, {428, 128, 128}};
+      addShell(map, other, {"+x"});
+      addPointEntity(map, "light", {364, 64, 0});
+
+      const auto result = f.ok("check_leaks");
+      CHECK(result.value("sealed") == QJsonValue{false});
+      CHECK(result.value("start_points_checked") == QJsonValue{2});
+      CHECK(result.value("leaks").toArray().size() == 1);
+
+      // on the ceiling's lower face, the cell containing the point is solid
+      CHECK(
+        f.ok("check_leaks", R"({"start_points":[[364,64,128]]})").value("sealed")
+        == QJsonValue{false});
+      // a point inside the wall stays excluded
+      CHECK(
+        f.ok("check_leaks", R"({"start_points":[[292,64,64]]})")
+          .value("start_points_checked")
+        == QJsonValue{0});
+    }
+
+    SECTION("solid cells of rotated brushes")
+    {
+      // slabs rotated about x and about z, so that the faces cut the cell lattice at
+      // angles and some planes are parallel to x
+      auto rotated = std::vector<mdl::BrushNode*>{};
+      for (const auto& [axis, z] : std::vector<std::pair<vm::vec3d, double>>{
+             {{1, 0, 0}, 0.0}, {{0, 0, 1}, 100.0}, {{0, 1, 1}, -150.0}})
+      {
+        auto* slab = addBrush(map, vm::bbox3d{{-100, -60, z}, {100, 60, z + 40}});
+        mdl::deselectAll(map);
+        mdl::selectNodes(map, {slab});
+        REQUIRE(mdl::rotateSelection(map, {0, 0, 0}, axis, vm::to_radians(37.0)));
+        mdl::deselectAll(map);
+        rotated.push_back(slab);
+      }
+      addPointEntity(map, "light", {300, 300, 300});
+
+      const auto result = f.ok("check_leaks", R"({"resolution":7})");
+      const auto min = result.value("bounds").toObject().value("min").toArray();
+      const auto grid = result.value("grid").toArray();
+
+      // a cell is solid if its eight corners are inside the same brush
+      auto expected = 0;
+      for (int z = 0; z < grid[2].toInt(); ++z)
+      {
+        for (int y = 0; y < grid[1].toInt(); ++y)
+        {
+          for (int x = 0; x < grid[0].toInt(); ++x)
+          {
+            expected += std::ranges::any_of(rotated, [&](const auto* brushNode) {
+              for (int k = 0; k < 8; ++k)
+              {
+                const auto corner = vm::vec3d{
+                  min[0].toDouble() + 7.0 * (x + (k & 1)),
+                  min[1].toDouble() + 7.0 * (y + ((k >> 1) & 1)),
+                  min[2].toDouble() + 7.0 * (z + ((k >> 2) & 1))};
+                if (!brushNode->brush().containsPoint(corner))
+                {
+                  return false;
+                }
+              }
+              return true;
+            });
+          }
+        }
+      }
+      CHECK(expected > 1000);
+      CHECK(result.value("solid_cells") == QJsonValue{expected});
+    }
+
+    SECTION("errors")
+    {
+      CHECK(f.err("check_leaks", R"({"resolution":0.5})") == "invalid_argument");
+      CHECK(f.err("check_leaks", R"({"max_cells":8000001})") == "invalid_argument");
+      CHECK(f.err("check_leaks", R"({"start_points":[]})") == "invalid_argument");
+      CHECK(
+        f.err("check_leaks", R"({"start_points":[[1e7,0,0]]})") == "invalid_argument");
+      CHECK(
+        f.err("check_leaks", R"({"bounds":{"min":[1,0,0],"max":[0,1,1]}})")
+        == "invalid_argument");
     }
   }
 }

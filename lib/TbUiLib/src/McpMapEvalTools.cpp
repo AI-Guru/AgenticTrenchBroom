@@ -32,6 +32,7 @@
 #include "mdl/LayerNode.h"
 #include "mdl/Map.h"
 #include "mdl/MapHeader.h"
+#include "mdl/ModelUtils.h"
 #include "mdl/NodeWriter.h"
 #include "mdl/PatchNode.h"
 #include "mdl/Validator.h"
@@ -46,9 +47,15 @@
 #include "kd/overload.h"
 
 #include "vm/bbox.h"
+#include "vm/constants.h"
+#include "vm/plane.h"
+#include "vm/vec.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <map>
 #include <optional>
@@ -1225,6 +1232,821 @@ McpToolDef checkBrushOverlapsTool()
   };
 }
 
+// check_leaks
+
+constexpr auto DefaultLeakResolution = 8.0;
+constexpr auto MaxLeakResolution = 4096.0;
+constexpr auto DefaultLeakMaxCells = 8000000;
+constexpr auto MaxLeakStartPoints = 256;
+constexpr auto MaxReportedLeaks = size_t(50);
+constexpr auto MaxReportedStarts = size_t(50);
+constexpr auto MaxLeakPathPoints = size_t(64);
+constexpr auto LeakGridEpsilon = 1e-6;
+
+constexpr auto CellSolid = uint8_t(1);
+constexpr auto CellVisited = uint8_t(2);
+// bits 2 to 4 of a visited cell: 1 + the direction from its parent, 0 for a start cell
+constexpr auto CellParentShift = 2;
+
+/** The neighbour directions in the order in which the flood fill visits them. */
+constexpr auto LeakDirections = std::array<std::array<int, 3>, 6>{{
+  {-1, 0, 0},
+  {1, 0, 0},
+  {0, -1, 0},
+  {0, 1, 0},
+  {0, 0, -1},
+  {0, 0, 1},
+}};
+
+using CellCoords = std::array<size_t, 3>;
+
+/** A grid of cubic cells whose first corner is origin. Indices are x fastest. */
+struct LeakGrid
+{
+  vm::vec3d origin;
+  double resolution;
+  CellCoords counts;
+
+  size_t size() const { return counts[0] * counts[1] * counts[2]; }
+
+  size_t index(const CellCoords& c) const
+  {
+    return c[0] + counts[0] * (c[1] + counts[1] * c[2]);
+  }
+
+  CellCoords coords(const size_t index) const
+  {
+    return {
+      index % counts[0],
+      (index / counts[0]) % counts[1],
+      index / (counts[0] * counts[1])};
+  }
+
+  vm::vec3d corner(const CellCoords& c) const
+  {
+    return {
+      origin.x() + resolution * double(c[0]),
+      origin.y() + resolution * double(c[1]),
+      origin.z() + resolution * double(c[2])};
+  }
+
+  vm::vec3d center(const size_t index) const
+  {
+    const auto c = coords(index);
+    return {
+      origin.x() + resolution * (double(c[0]) + 0.5),
+      origin.y() + resolution * (double(c[1]) + 0.5),
+      origin.z() + resolution * (double(c[2]) + 0.5)};
+  }
+
+  bool onBoundary(const size_t index) const
+  {
+    const auto c = coords(index);
+    for (size_t i = 0; i < 3; ++i)
+    {
+      if (c[i] == 0 || c[i] + 1 == counts[i])
+      {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Returns the cells whose closed boxes contain the given point, which must be inside
+   * the grid: one cell, or up to eight if the point is on cell boundaries.
+   */
+  std::vector<size_t> cellsTouching(const vm::vec3d& point) const
+  {
+    auto candidates = std::array<std::vector<size_t>, 3>{};
+    for (size_t i = 0; i < 3; ++i)
+    {
+      const auto f = (point[i] - origin[i]) / resolution;
+      const auto r = std::round(f);
+      // as close as brushContains counts a point as on a face
+      if (
+        std::abs(f - r) <= std::max(
+          LeakGridEpsilon, vm::constants<double>::point_status_epsilon() / resolution))
+      {
+        for (const auto c : {r - 1.0, r})
+        {
+          if (c >= 0.0 && c < double(counts[i]))
+          {
+            candidates[i].push_back(size_t(c));
+          }
+        }
+      }
+      else
+      {
+        candidates[i].push_back(
+          std::min(size_t(std::max(std::floor(f), 0.0)), counts[i] - 1));
+      }
+    }
+
+    auto result = std::vector<size_t>{};
+    for (const auto z : candidates[2])
+    {
+      for (const auto y : candidates[1])
+      {
+        for (const auto x : candidates[0])
+        {
+          result.push_back(index({x, y, z}));
+        }
+      }
+    }
+    return result;
+  }
+
+  /** Returns the cell containing the given point, or nullopt if it is outside. */
+  std::optional<size_t> cellOf(const vm::vec3d& point) const
+  {
+    auto c = CellCoords{};
+    for (size_t i = 0; i < 3; ++i)
+    {
+      const auto f = std::floor((point[i] - origin[i]) / resolution);
+      if (!(f >= 0.0) || f > double(counts[i]))
+      {
+        return std::nullopt;
+      }
+      // a point on the far side of the grid belongs to the last cell
+      c[i] = std::min(size_t(f), counts[i] - 1);
+    }
+    return index(c);
+  }
+};
+
+/** Whether the point is inside the brush or on its boundary. */
+bool brushContains(const mdl::Brush& brush, const vm::vec3d& point)
+{
+  return std::ranges::none_of(brush.faces(), [&](const auto& face) {
+    return face.boundary().point_status(point) == vm::plane_status::above;
+  });
+}
+
+/** Whether the point is inside the brush and not on its boundary. */
+bool brushStrictlyContains(const mdl::Brush& brush, const vm::vec3d& point)
+{
+  return brush.bounds().contains(point)
+         && std::ranges::all_of(brush.faces(), [&](const auto& face) {
+              return face.boundary().point_status(point) == vm::plane_status::below;
+            });
+}
+
+/**
+ * Marks the cells that lie entirely inside one of the given brushes as solid: all eight
+ * corners of the cell must be inside the same brush. A cell that two brushes cover only
+ * together stays empty, so that a gap between brushes is never closed by rounding.
+ * Returns the number of solid cells.
+ */
+size_t markSolidCells(
+  const LeakGrid& grid,
+  const std::vector<const mdl::Brush*>& brushes,
+  std::vector<uint8_t>& cells)
+{
+  auto solidCells = size_t(0);
+  auto lines = std::vector<std::pair<std::ptrdiff_t, std::ptrdiff_t>>{};
+
+  for (const auto* brush : brushes)
+  {
+    const auto& bounds = brush->bounds();
+    auto lo = CellCoords{};
+    auto hi = CellCoords{};
+    auto empty = false;
+    for (size_t i = 0; i < 3 && !empty; ++i)
+    {
+      // the cells whose corners are all inside the brush's bounds
+      const auto first =
+        std::ceil((bounds.min[i] - grid.origin[i]) / grid.resolution - LeakGridEpsilon);
+      const auto last =
+        std::floor((bounds.max[i] - grid.origin[i]) / grid.resolution + LeakGridEpsilon)
+        - 1.0;
+      const auto from = std::max(first, 0.0);
+      const auto to = std::min(last, double(grid.counts[i]) - 1.0);
+      if (from > to)
+      {
+        empty = true;
+      }
+      else
+      {
+        lo[i] = size_t(from);
+        hi[i] = size_t(to);
+      }
+    }
+    if (empty)
+    {
+      continue;
+    }
+
+    // For each line of corners parallel to x, the range of corners inside the brush. The
+    // planes give the range in O(faces) per line, so the work grows with the brush's
+    // cross section instead of its volume. The end corners are then checked with the
+    // same test as brushContains: if both ends are inside, every corner between them is
+    // too, because the brush is convex, so rounding can only make the range smaller.
+    const auto ny = hi[1] - lo[1] + 2;
+    const auto nz = hi[2] - lo[2] + 2;
+    const auto firstX = double(lo[0]);
+    const auto lastX = double(hi[0] + 1);
+    lines.resize(ny * nz);
+    for (size_t z = 0; z < nz; ++z)
+    {
+      for (size_t y = 0; y < ny; ++y)
+      {
+        const auto cy = lo[1] + y;
+        const auto cz = lo[2] + z;
+        const auto p = grid.corner({0, cy, cz});
+
+        auto from = firstX;
+        auto to = lastX;
+        for (const auto& face : brush->faces())
+        {
+          const auto& plane = face.boundary();
+          const auto nx = plane.normal.x();
+          // the corner at x index X is inside if nx * resolution * X <= rest
+          const auto rest = plane.distance + vm::constants<double>::point_status_epsilon()
+                            - vm::dot(plane.normal, p);
+          if (nx == 0.0)
+          {
+            if (rest < 0.0)
+            {
+              to = from - 1.0;
+            }
+          }
+          else
+          {
+            const auto bound = rest / (nx * grid.resolution);
+            if (nx > 0.0)
+            {
+              to = std::min(to, std::floor(bound));
+            }
+            else
+            {
+              from = std::max(from, std::ceil(bound));
+            }
+          }
+          if (!(from <= to))
+          {
+            break;
+          }
+        }
+
+        auto& line = lines[y + ny * z];
+        if (!(from <= to))
+        {
+          line = {1, 0};
+          continue;
+        }
+
+        const auto inside = [&](const std::ptrdiff_t x) {
+          return brushContains(*brush, grid.corner({size_t(x), cy, cz}));
+        };
+        auto first = std::ptrdiff_t(from);
+        auto last = std::ptrdiff_t(to);
+        while (first <= last && !inside(first))
+        {
+          ++first;
+        }
+        while (first <= last && !inside(last))
+        {
+          --last;
+        }
+        line = {first, last};
+      }
+    }
+
+    for (auto z = lo[2]; z <= hi[2]; ++z)
+    {
+      for (auto y = lo[1]; y <= hi[1]; ++y)
+      {
+        // a cell is solid if the four corner lines along its x edges contain both of
+        // its x corners
+        auto first = std::ptrdiff_t(lo[0]);
+        auto last = std::ptrdiff_t(hi[0] + 1);
+        for (size_t k = 0; k < 4; ++k)
+        {
+          const auto& line = lines[(y - lo[1] + (k & 1)) + ny * (z - lo[2] + (k >> 1))];
+          first = std::max(first, line.first);
+          last = std::min(last, line.second);
+        }
+        for (auto x = first; x < last; ++x)
+        {
+          auto& cell = cells[grid.index({size_t(x), y, z})];
+          if (!(cell & CellSolid))
+          {
+            cell |= CellSolid;
+            ++solidCells;
+          }
+        }
+      }
+    }
+  }
+
+  return solidCells;
+}
+
+/**
+ * Returns the polyline from the start point through the given cell centers: points
+ * where the path goes straight on are removed and, if more than MaxLeakPathPoints remain,
+ * evenly spaced points are kept. The first and the last point are always kept.
+ */
+std::vector<vm::vec3d> leakPath(
+  const vm::vec3d& start, const std::vector<vm::vec3d>& centers)
+{
+  auto points = std::vector<vm::vec3d>{start};
+  for (const auto& center : centers)
+  {
+    if (center != points.back())
+    {
+      points.push_back(center);
+    }
+  }
+
+  auto corners = std::vector<vm::vec3d>{points.front()};
+  for (size_t i = 1; i + 1 < points.size(); ++i)
+  {
+    const auto in = vm::normalize(points[i] - points[i - 1]);
+    const auto out = vm::normalize(points[i + 1] - points[i]);
+    if (vm::length(in - out) > LeakGridEpsilon)
+    {
+      corners.push_back(points[i]);
+    }
+  }
+  if (points.size() > 1)
+  {
+    corners.push_back(points.back());
+  }
+
+  if (corners.size() <= MaxLeakPathPoints)
+  {
+    return corners;
+  }
+
+  auto result = std::vector<vm::vec3d>{};
+  for (size_t i = 0; i < MaxLeakPathPoints; ++i)
+  {
+    result.push_back(corners[i * (corners.size() - 1) / (MaxLeakPathPoints - 1)]);
+  }
+  return result;
+}
+
+struct LeakStart
+{
+  vm::vec3d point;
+  // empty for start points given by the client
+  QString entityId;
+};
+
+QJsonObject leakStartJson(const LeakStart& start, const QString& pointKey)
+{
+  auto result = QJsonObject{{pointKey, toJson(start.point)}};
+  if (!start.entityId.isEmpty())
+  {
+    result[pointKey == u"point" ? "entity_id" : "start_entity_id"] = start.entityId;
+  }
+  return result;
+}
+
+/** Whether the node is in a layer that is omitted from export, so a compiler never sees
+ * it. */
+bool omittedFromExport(const mdl::Node& node)
+{
+  const auto* layerNode = mdl::findContainingLayer(node);
+  return layerNode && layerNode->layer().omitFromExport();
+}
+
+bool isFiniteCoordinate(const vm::vec3d& point)
+{
+  for (size_t i = 0; i < 3; ++i)
+  {
+    if (!std::isfinite(point[i]) || std::abs(point[i]) > MaxCoordinate)
+    {
+      return false;
+    }
+  }
+  return true;
+}
+
+McpResult<QJsonObject> checkLeaks(McpCallContext& context, const QJsonObject& args)
+{
+  auto& doc = context.doc;
+  auto& map = doc.map;
+
+  const auto resolution = args.value("resolution").toDouble(DefaultLeakResolution);
+  const auto maxCells = sizeArgument(args, "max_cells", size_t(DefaultLeakMaxCells));
+
+  // only world brushes seal, as in the Quake compilers, and only those that are exported
+  auto brushes = std::vector<const mdl::Brush*>{};
+  auto brushBounds = std::optional<vm::bbox3d>{};
+  for (const auto* brushNode : allBrushes(map))
+  {
+    if (isWorldBrush(*brushNode) && !omittedFromExport(*brushNode))
+    {
+      brushes.push_back(&brushNode->brush());
+      brushBounds = brushBounds ? vm::merge(*brushBounds, brushNode->brush().bounds())
+                                : brushNode->brush().bounds();
+    }
+  }
+
+  auto starts = std::vector<LeakStart>{};
+  auto excluded = std::vector<std::pair<LeakStart, QString>>{};
+  const auto explicitStarts = args.contains("start_points");
+  if (explicitStarts)
+  {
+    const auto pointsArg = args.value("start_points").toArray();
+    for (qsizetype i = 0; i < pointsArg.size(); ++i)
+    {
+      auto point = vec3(pointsArg[i], QString{"/start_points/%1"}.arg(i));
+      if (point.is_error())
+      {
+        return errorOf(point);
+      }
+      starts.push_back({point.value(), {}});
+    }
+  }
+  else
+  {
+    visitPreOrder(map.worldNode(), [&](mdl::Node& node) {
+      if (const auto* entityNode = dynamic_cast<const mdl::EntityNode*>(&node);
+          entityNode && entityNode->entity().pointEntity())
+      {
+        auto start =
+          LeakStart{entityNode->entity().origin(), doc.nodes.idOf(*entityNode)};
+        if (omittedFromExport(*entityNode))
+        {
+          excluded.emplace_back(std::move(start), "omitted_from_export");
+        }
+        else if (isFiniteCoordinate(start.point))
+        {
+          starts.push_back(std::move(start));
+        }
+        else
+        {
+          excluded.emplace_back(std::move(start), "invalid_origin");
+        }
+      }
+    });
+  }
+
+  auto box = vm::bbox3d{};
+  if (args.contains("bounds"))
+  {
+    auto boundsResult = bounds(args.value("bounds"), "/bounds");
+    if (boundsResult.is_error())
+    {
+      return errorOf(boundsResult);
+    }
+    box = boundsResult.value();
+    if (explicitStarts)
+    {
+      for (size_t i = 0; i < starts.size(); ++i)
+      {
+        if (!box.contains(starts[i].point))
+        {
+          return toolError(
+            "invalid_argument",
+            QString{"start point %1 is outside the bounds"}.arg(i),
+            "pass bounds that contain every start point, or omit bounds",
+            {{"pointer", QString{"/start_points/%1"}.arg(i)}});
+        }
+      }
+    }
+  }
+  else
+  {
+    auto merged = brushBounds;
+    for (const auto& start : starts)
+    {
+      const auto pointBounds = vm::bbox3d{start.point};
+      merged = merged ? vm::merge(*merged, pointBounds) : pointBounds;
+    }
+    if (!merged)
+    {
+      context.warnings.push_back(
+        "the map has no world brushes and no point entities, so there is nothing to "
+        "check");
+      return QJsonObject{
+        {"sealed", true},
+        {"leaks", QJsonArray{}},
+        {"leaks_total", 0},
+        {"start_points_checked", 0},
+        {"excluded_start_points", QJsonArray{}},
+        {"excluded_start_points_count", 0},
+        {"resolution", canon(resolution)},
+        {"bounds", QJsonValue{}},
+        {"grid", QJsonArray{0, 0, 0}},
+        {"cells", 0},
+        {"solid_cells", 0},
+        {"elapsed_cells_visited", 0},
+      };
+    }
+    const auto margin = vm::vec3d::fill(2.0 * resolution);
+    box = vm::bbox3d{merged->min - margin, merged->max + margin};
+  }
+
+  auto counts = CellCoords{};
+  auto totalCells = 1.0;
+  for (size_t i = 0; i < 3; ++i)
+  {
+    const auto count =
+      std::max(1.0, std::ceil((box.max[i] - box.min[i]) / resolution - LeakGridEpsilon));
+    totalCells *= count;
+    counts[i] = totalCells <= double(maxCells) ? size_t(count) : 0;
+  }
+  if (totalCells > double(maxCells))
+  {
+    return toolError(
+      "invalid_argument",
+      QString{"checking these bounds at resolution %1 needs %2 cells, more than "
+              "max_cells (%3)"}
+        .arg(canon(resolution))
+        .arg(QString::number(totalCells, 'g', 6))
+        .arg(maxCells),
+      "raise resolution (e.g. 16 or 32), pass smaller bounds or raise max_cells (at "
+      "most 8000000)",
+      {{"pointer", "/resolution"},
+       {"cells", totalCells},
+       {"max_cells", qint64(maxCells)}});
+  }
+
+  const auto grid = LeakGrid{box.min, resolution, counts};
+  auto cells = std::vector<uint8_t>(grid.size(), 0);
+  const auto solidCells = markSolidCells(grid, brushes, cells);
+
+  // the start points that are not inside solid, with the empty cells they touch
+  auto active = std::vector<std::pair<LeakStart, std::vector<size_t>>>{};
+  auto outsideBounds = size_t(0);
+  for (auto& start : starts)
+  {
+    if (!box.contains(start.point) || !grid.cellOf(start.point))
+    {
+      excluded.emplace_back(std::move(start), "outside_bounds");
+      ++outsideBounds;
+      continue;
+    }
+
+    // A point on a face (an entity standing on the floor) is not in solid: every empty
+    // cell it touches is filled, because the cell containing it may be on the wrong side.
+    auto seeds = std::vector<size_t>{};
+    if (std::ranges::none_of(
+          brushes, [&](const auto* brush) { return brush->containsPoint(start.point); }))
+    {
+      // in empty space, so its cell cannot be solid
+      seeds.push_back(*grid.cellOf(start.point));
+    }
+    else if (std::ranges::none_of(brushes, [&](const auto* brush) {
+               return brushStrictlyContains(*brush, start.point);
+             }))
+    {
+      for (const auto cell : grid.cellsTouching(start.point))
+      {
+        if (!(cells[cell] & CellSolid))
+        {
+          seeds.push_back(cell);
+        }
+      }
+    }
+
+    if (seeds.empty())
+    {
+      excluded.emplace_back(std::move(start), "inside_solid");
+    }
+    else
+    {
+      active.emplace_back(std::move(start), std::move(seeds));
+    }
+  }
+
+  struct Leak
+  {
+    size_t start;
+    std::vector<vm::vec3d> centers;
+    std::vector<size_t> sharedStarts;
+  };
+  auto leaks = std::vector<Leak>{};
+  auto flooded = std::vector<bool>(active.size(), false);
+  auto queue = std::vector<uint32_t>{};
+  auto visited = size_t(0);
+
+  for (size_t i = 0; i < active.size(); ++i)
+  {
+    if (flooded[i])
+    {
+      continue;
+    }
+
+    // breadth first, so the first boundary cell is a nearest one
+    auto exitCell = std::optional<size_t>{};
+    queue.clear();
+    for (const auto seed : active[i].second)
+    {
+      if (!(cells[seed] & CellVisited))
+      {
+        cells[seed] |= CellVisited;
+        queue.push_back(uint32_t(seed));
+      }
+    }
+    for (size_t head = 0; head < queue.size(); ++head)
+    {
+      const auto cell = size_t(queue[head]);
+      ++visited;
+      if (!exitCell && grid.onBoundary(cell))
+      {
+        exitCell = cell;
+      }
+
+      const auto c = grid.coords(cell);
+      for (size_t d = 0; d < LeakDirections.size(); ++d)
+      {
+        auto n = c;
+        auto inside = true;
+        for (size_t k = 0; k < 3; ++k)
+        {
+          const auto delta = LeakDirections[d][k];
+          if ((delta < 0 && c[k] == 0) || (delta > 0 && c[k] + 1 == grid.counts[k]))
+          {
+            inside = false;
+          }
+          n[k] = size_t(std::ptrdiff_t(c[k]) + delta);
+        }
+        if (!inside)
+        {
+          continue;
+        }
+        const auto neighbour = grid.index(n);
+        auto& state = cells[neighbour];
+        if (state & (CellSolid | CellVisited))
+        {
+          continue;
+        }
+        state |= CellVisited | uint8_t((d + 1) << CellParentShift);
+        queue.push_back(uint32_t(neighbour));
+      }
+    }
+
+    flooded[i] = true;
+    auto shared = std::vector<size_t>{};
+    for (size_t j = i + 1; j < active.size(); ++j)
+    {
+      if (!flooded[j] && std::ranges::all_of(active[j].second, [&](const auto seed) {
+            return (cells[seed] & CellVisited) != 0;
+          }))
+      {
+        flooded[j] = true;
+        shared.push_back(j);
+      }
+    }
+
+    if (exitCell)
+    {
+      auto pathCells = std::vector<size_t>{};
+      for (auto cell = *exitCell;;)
+      {
+        pathCells.push_back(cell);
+        const auto parent = (cells[cell] >> CellParentShift) & 7;
+        if (parent == 0)
+        {
+          break;
+        }
+        const auto& delta = LeakDirections[size_t(parent - 1)];
+        auto c = grid.coords(cell);
+        for (size_t k = 0; k < 3; ++k)
+        {
+          c[k] = size_t(std::ptrdiff_t(c[k]) - delta[k]);
+        }
+        cell = grid.index(c);
+      }
+      std::ranges::reverse(pathCells);
+
+      auto centers = std::vector<vm::vec3d>{};
+      for (const auto cell : pathCells)
+      {
+        centers.push_back(grid.center(cell));
+      }
+      leaks.push_back({i, std::move(centers), std::move(shared)});
+    }
+  }
+
+  auto leaksJson = QJsonArray{};
+  for (const auto& leak : leaks)
+  {
+    if (size_t(leaksJson.size()) >= MaxReportedLeaks)
+    {
+      break;
+    }
+    const auto& start = active[leak.start].first;
+    auto json = leakStartJson(start, "start_point");
+    json["exit_point"] = toJson(leak.centers.back());
+
+    auto length = vm::length(leak.centers.front() - start.point);
+    for (size_t i = 1; i < leak.centers.size(); ++i)
+    {
+      length += vm::length(leak.centers[i] - leak.centers[i - 1]);
+    }
+    json["path_length"] = canon(length);
+
+    auto path = QJsonArray{};
+    for (const auto& point : leakPath(start.point, leak.centers))
+    {
+      path.append(toJson(point));
+    }
+    json["path"] = path;
+
+    auto shared = QJsonArray{};
+    for (size_t k = 0; k < leak.sharedStarts.size() && k < MaxReportedStarts; ++k)
+    {
+      shared.append(leakStartJson(active[leak.sharedStarts[k]].first, "point"));
+    }
+    json["shared_start_points"] = shared;
+    json["shared_start_points_count"] = qint64(leak.sharedStarts.size());
+    leaksJson.append(json);
+  }
+
+  auto excludedJson = QJsonArray{};
+  for (size_t k = 0; k < excluded.size() && k < MaxReportedStarts; ++k)
+  {
+    auto json = leakStartJson(excluded[k].first, "point");
+    json["reason"] = excluded[k].second;
+    excludedJson.append(json);
+  }
+
+  if (outsideBounds > 0)
+  {
+    context.warnings.push_back(
+      QString{"%1 start point(s) outside the bounds were not checked; sealed only covers "
+              "the bounds"}
+        .arg(outsideBounds));
+  }
+  if (active.empty())
+  {
+    context.warnings.push_back(
+      "no start point outside solid geometry was flood filled, so sealed means nothing; "
+      "add a point entity (e.g. info_player_start) or pass start_points");
+  }
+
+  return QJsonObject{
+    {"sealed", leaks.empty()},
+    {"leaks", leaksJson},
+    {"leaks_total", qint64(leaks.size())},
+    {"start_points_checked", qint64(active.size())},
+    {"excluded_start_points", excludedJson},
+    {"excluded_start_points_count", qint64(excluded.size())},
+    {"resolution", canon(resolution)},
+    {"bounds", toJson(box)},
+    {"grid", QJsonArray{qint64(counts[0]), qint64(counts[1]), qint64(counts[2])}},
+    {"cells", qint64(grid.size())},
+    {"solid_cells", qint64(solidCells)},
+    {"elapsed_cells_visited", qint64(visited)},
+  };
+}
+
+McpToolDef checkLeaksTool()
+{
+  return {
+    .name = "check_leaks",
+    .title = "Check Leaks",
+    .description =
+      "Leak test like a Quake compiler: flood fills the empty space from each start "
+      "point (default: the origins of all point entities that are not inside solid) "
+      "through a voxel grid of resolution sized cells that starts at bounds.min; a "
+      "start point leaks if the fill reaches the outermost cells of the bounds "
+      "(default: all world brushes plus the start points, expanded by 2*resolution). "
+      "Each leak has the shortest path to the outside (at most 64 corner points), and "
+      "start points in the same space are listed with the first one. Only world "
+      "brushes seal, including grouped ones; brush entities such as func_door, "
+      "func_wall, triggers and even func_group do not; nodes in layers omitted from "
+      "export are ignored, and materials are not considered (liquid, clip or detail "
+      "world brushes seal here). A start point on a face fills the space next to it. "
+      "A cell is solid only if it lies "
+      "entirely inside one brush, so a gap is never closed by rounding, but walls "
+      "thinner than 2*resolution, walls off the grid and brushes that only together "
+      "cover a cell can show up as leaks: check them with query_point or a smaller "
+      "resolution.",
+    .inputSchema = schema::object({
+      {"start_points",
+       schema::array(
+         schema::vec3(),
+         1,
+         MaxLeakStartPoints,
+         "points to flood fill from (default: point entity origins)")},
+      {"resolution",
+       schema::number(1, MaxLeakResolution, "cell size in units (default 8)")},
+      {"bounds",
+       schema::bounds(
+         "the region to fill; reaching its outermost cells is a leak (default: world "
+         "brushes and start points plus 2*resolution)")},
+      {"max_cells",
+       schema::integer(
+         1,
+         DefaultLeakMaxCells,
+         "most cells to allocate (default and maximum 8000000); raise resolution for "
+         "big maps")},
+    }),
+    .kind = McpToolKind::Read,
+    .annotations = ReadOnly,
+    .allowedInBatch = true,
+    .run = checkLeaks,
+  };
+}
+
 } // namespace
 
 void registerMcpMapEvalTools(McpToolDispatcher& dispatcher)
@@ -1238,6 +2060,7 @@ void registerMcpMapEvalTools(McpToolDispatcher& dispatcher)
   dispatcher.add(exportMapTextTool());
   dispatcher.add(queryPointTool());
   dispatcher.add(checkBrushOverlapsTool());
+  dispatcher.add(checkLeaksTool());
 }
 
 } // namespace tb::ui

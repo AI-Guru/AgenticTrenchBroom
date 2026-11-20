@@ -34,8 +34,8 @@ void registerMcpMapReadTools(McpToolDispatcher& dispatcher);
 
 /**
  * Registers the evaluation and checkpoint tools: validate_map, get_map_stats,
- * checkpoint_create, checkpoint_diff, checkpoint_list, checkpoint_delete and
- * export_map_text.
+ * checkpoint_create, checkpoint_diff, checkpoint_list, checkpoint_delete,
+ * export_map_text, query_point, check_brush_overlaps and check_leaks.
  */
 void registerMcpMapEvalTools(McpToolDispatcher& dispatcher);
 

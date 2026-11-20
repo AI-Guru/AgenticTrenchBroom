@@ -77,6 +77,8 @@ const auto Instructions = QStringLiteral(
   group_nodes (open_group/close_group to edit inside) cover the rest.
 - checkpoint_create before big edits; checkpoint_revert undoes your steps back to it. Verify without screenshots:
   validate_map, query_point, check_brush_overlaps, checkpoint_diff, get_brush_geometry, find_nodes, get_map_stats.
+  check_leaks flood fills from the point entities like a Quake compiler and returns the path of every leak; only
+  world brushes seal, so run it after closing a room instead of reasoning about where brushes meet.
   screenshot and screenshot_set (views 3d, iso, top, front, side; frame_ids to look at nodes) return PNG images to
   show your work; set_camera and focus_nodes point the user's view at something.
 - Use batch for multi-step edits that must succeed or fail together ("$0" refers to the first id created by

@@ -158,8 +158,10 @@ if(TB_ENABLE_MCP_E2E_TEST)
     find_package(Python3 COMPONENTS Interpreter REQUIRED)
     add_test(NAME TrenchBroomMcpE2E
         COMMAND Python3::Interpreter ${CMAKE_CURRENT_SOURCE_DIR}/test/mcp_e2e.py --app $<TARGET_FILE:TrenchBroom>)
-    # the test uses the portable config directory next to the binary
-    set_tests_properties(TrenchBroomMcpE2E PROPERTIES LABELS e2e TIMEOUT 300 RUN_SERIAL TRUE)
+    add_test(NAME TrenchBroomMcpEvalOracle
+        COMMAND Python3::Interpreter ${CMAKE_CURRENT_SOURCE_DIR}/test/mcp_eval/oracle.py --app $<TARGET_FILE:TrenchBroom>)
+    # both tests use the portable config directory next to the binary
+    set_tests_properties(TrenchBroomMcpE2E TrenchBroomMcpEvalOracle PROPERTIES LABELS e2e TIMEOUT 300 RUN_SERIAL TRUE)
 endif()
 
 if(APPLE)

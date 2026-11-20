@@ -90,6 +90,10 @@ const auto Instructions = QStringLiteral(
   validate_map, query_point, check_brush_overlaps, checkpoint_diff, get_brush_geometry, find_nodes, get_map_stats.
   check_leaks flood fills from the point entities like a Quake compiler and returns the path of every leak; only
   world brushes seal, so run it after closing a room instead of reasoning about where brushes meet.
+  check_walkable {from, to:[...]} (feet positions) answers whether the player (32x56 hull, step 18, drop 256) can
+  walk there and returns the path, or the nearest reachable point and a blocker (headroom, step_too_high, gap,
+  not_standable) with its position; run it after building stairs, doors and upper floors instead of reasoning
+  about step heights and ceilings.
   screenshot and screenshot_set (views 3d, iso, top, front, side; frame_ids to look at nodes) return PNG images to
   show your work; set_camera and focus_nodes point the user's view at something.
 - Use batch for multi-step edits that must succeed or fail together ("$0" refers to the first id created by

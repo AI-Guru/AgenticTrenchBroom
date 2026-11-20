@@ -869,6 +869,513 @@ TEST_CASE("McpMapEvalTools")
     }
   }
 
+  SECTION("check_walkable")
+  {
+    const auto target = [](const QJsonObject& result, const qsizetype index = 0) {
+      return result.value("targets").toArray()[index].toObject();
+    };
+    const auto blocker = [&](const QJsonObject& result, const qsizetype index = 0) {
+      return target(result, index).value("blocker").toObject();
+    };
+    const auto details = [&](const QJsonObject& result, const qsizetype index = 0) {
+      return blocker(result, index).value("details").toObject();
+    };
+
+    SECTION("a flat room is walkable")
+    {
+      addShell(map, vm::bbox3d{{0, 0, 0}, {512, 256, 128}});
+
+      const auto result =
+        f.ok("check_walkable", R"({"from":[64,128,0],"to":[[448,128,0],[448,64,30]]})");
+      CHECK(result.value("reachable_count") == QJsonValue{2});
+      CHECK(result.value("unreachable_count") == QJsonValue{0});
+      CHECK(
+        result.value("from")
+        == QJsonValue{QJsonObject{
+          {"point", jsonVec(64, 128, 0)}, {"standing_point", jsonVec(64, 128, 0)}}});
+
+      const auto straight = target(result, 0);
+      CHECK(straight.value("reachable") == QJsonValue{true});
+      CHECK(straight.value("standing_point") == QJsonValue{jsonVec(448, 128, 0)});
+      CHECK(
+        straight.value("path")
+        == QJsonValue{QJsonArray{jsonVec(64, 128, 0), jsonVec(448, 128, 0)}});
+      CHECK(straight.value("path_length") == QJsonValue{384});
+      CHECK(!straight.contains("blocker"));
+
+      // a point above the floor is moved down to it
+      const auto above = target(result, 1);
+      CHECK(above.value("reachable") == QJsonValue{true});
+      CHECK(above.value("standing_point") == QJsonValue{jsonVec(448, 64, 0)});
+      CHECK(above.value("path").toArray().last() == QJsonValue{jsonVec(448, 64, 0)});
+      CHECK(above.value("path_length") == QJsonValue{384 + 64});
+      CHECK(strings(result.value("warnings")).size() == 1);
+
+      CHECK(
+        result.value("model")
+        == QJsonValue{QJsonObject{
+          {"hull", QJsonObject{{"width", 32}, {"height", 56}}},
+          {"step_height", 18},
+          {"max_drop", 256},
+          {"resolution", 8}}});
+      const auto stats = result.value("stats").toObject();
+      CHECK(stats.value("solid_brushes") == QJsonValue{6});
+      // the room's interior is 512 x 256; the hull stays 16 units from the walls
+      CHECK(
+        stats.value("positions_reachable") == QJsonValue{(480 / 8 + 1) * (224 / 8 + 1)});
+    }
+
+    SECTION("stairs with 16 unit steps are walkable, with 24 unit steps they are not")
+    {
+      addShell(map, vm::bbox3d{{0, 0, 0}, {512, 256, 256}});
+      const auto addStairs = [&](const double stepHeight) {
+        for (int k = 1; k <= 4; ++k)
+        {
+          addBrush(
+            map,
+            vm::bbox3d{
+              {96.0 + 32.0 * (k - 1), 64, 0}, {96.0 + 32.0 * k, 192, stepHeight * k}});
+        }
+        // the landing
+        addBrush(map, vm::bbox3d{{224, 0, 0}, {512, 256, stepHeight * 4}});
+      };
+
+      SECTION("16")
+      {
+        addStairs(16);
+        const auto result =
+          f.ok("check_walkable", R"({"from":[48,128,0],"to":[[448,128,64]]})");
+        const auto top = target(result);
+        CHECK(top.value("reachable") == QJsonValue{true});
+        CHECK(top.value("standing_point") == QJsonValue{jsonVec(448, 128, 64)});
+        const auto path = top.value("path").toArray();
+        CHECK(path.size() <= 64);
+        CHECK(path.first() == QJsonValue{jsonVec(48, 128, 0)});
+        CHECK(path.last() == QJsonValue{jsonVec(448, 128, 64)});
+        // the path climbs the steps one by one
+        for (const auto z : {16, 32, 48})
+        {
+          CHECK(std::ranges::any_of(path, [&](const auto& point) {
+            return point.toArray()[2] == QJsonValue{z};
+          }));
+        }
+
+        // a step_height below 16 blocks the stairs
+        const auto low = f.ok(
+          "check_walkable",
+          R"({"from":[48,128,0],"to":[[448,128,64]],"step_height":12})");
+        CHECK(target(low).value("reachable") == QJsonValue{false});
+        CHECK(blocker(low).value("kind") == QJsonValue{"step_too_high"});
+        CHECK(details(low).value("rise") == QJsonValue{16});
+      }
+
+      SECTION("24")
+      {
+        addStairs(24);
+        const auto result =
+          f.ok("check_walkable", R"({"from":[48,128,0],"to":[[448,128,96]]})");
+        CHECK(result.value("reachable_count") == QJsonValue{0});
+        const auto top = target(result);
+        CHECK(top.value("reachable") == QJsonValue{false});
+        CHECK(top.value("standing_point") == QJsonValue{jsonVec(448, 128, 96)});
+        CHECK(!top.contains("path"));
+        CHECK(top.value("nearest_reachable_point").toArray()[2] == QJsonValue{0});
+        CHECK(top.value("distance").toDouble() > 96);
+        // the first step on the way up the stairs
+        CHECK(blocker(result).value("kind") == QJsonValue{"step_too_high"});
+        CHECK(blocker(result).value("at").toArray()[2] == QJsonValue{24});
+        CHECK(blocker(result).value("at").toArray()[1] == QJsonValue{128});
+        CHECK(details(result).value("rise") == QJsonValue{24});
+        CHECK(details(result).value("step_height") == QJsonValue{18});
+        CHECK(details(result).value("from").toArray()[2] == QJsonValue{0});
+
+        // a higher step_height climbs them
+        CHECK(
+          target(f.ok(
+                   "check_walkable",
+                   R"({"from":[48,128,0],"to":[[448,128,96]],"step_height":24})"))
+            .value("reachable")
+          == QJsonValue{true});
+      }
+    }
+
+    SECTION("the blocker is on the way that exceeds the limits the least")
+    {
+      // free-standing stairs with 8 unit steps rising towards +y; from behind them, the
+      // shortest way is to climb the 32 unit back of the top step
+      addShell(map, vm::bbox3d{{0, 0, 0}, {512, 512, 256}});
+      for (int k = 1; k <= 4; ++k)
+      {
+        addBrush(
+          map,
+          vm::bbox3d{{192, 100.0 + 16.0 * (k - 1), 0}, {256, 100.0 + 16.0 * k, 8.0 * k}});
+      }
+      const auto args = R"({"from":[224,256,0],"to":[[224,160,32]],"step_height":4})";
+      const auto result = f.ok("check_walkable", args);
+      CHECK(blocker(result).value("kind") == QJsonValue{"step_too_high"});
+      CHECK(details(result).value("rise") == QJsonValue{8});
+      CHECK(details(result).value("from").toArray()[1].toDouble() < 100);
+    }
+
+    SECTION("a low ceiling blocks the hull")
+    {
+      addShell(map, vm::bbox3d{{0, 0, 0}, {576, 256, 128}});
+      // the ceiling of a passage at z 40 across the whole room
+      addBrush(map, vm::bbox3d{{256, 0, 40}, {320, 256, 128}});
+
+      const auto result =
+        f.ok("check_walkable", R"({"from":[64,128,0],"to":[[512,128,0]]})");
+      const auto far = target(result);
+      CHECK(far.value("reachable") == QJsonValue{false});
+      CHECK(far.value("standing_point") == QJsonValue{jsonVec(512, 128, 0)});
+      // the hull stops 16 units before the passage
+      CHECK(far.value("nearest_reachable_point") == QJsonValue{jsonVec(240, 128, 0)});
+      CHECK(far.value("distance") == QJsonValue{272});
+      CHECK(blocker(result).value("kind") == QJsonValue{"headroom"});
+      CHECK(blocker(result).value("at") == QJsonValue{jsonVec(248, 128, 0)});
+      CHECK(details(result).value("clearance") == QJsonValue{40});
+      CHECK(details(result).value("hull_height") == QJsonValue{56});
+
+      // a target under the low ceiling has no headroom itself
+      const auto under =
+        f.ok("check_walkable", R"({"from":[64,128,0],"to":[[288,128,0]]})");
+      CHECK(blocker(under).value("kind") == QJsonValue{"not_standable"});
+      CHECK(details(under).value("reason") == QJsonValue{"no_headroom"});
+      CHECK(details(under).value("clearance") == QJsonValue{40});
+
+      // a smaller hull fits through
+      CHECK(
+        target(f.ok(
+                 "check_walkable",
+                 R"({"from":[64,128,0],"to":[[512,128,0]],"hull":{"height":40}})"))
+          .value("reachable")
+        == QJsonValue{true});
+
+      // from under the low ceiling is an error
+      const auto error =
+        f.error("check_walkable", R"({"from":[288,128,0],"to":[[64,128,0]]})");
+      CHECK(error.value("code") == QJsonValue{"invalid_argument"});
+      const auto errorDetails = error.value("details").toObject();
+      CHECK(errorDetails.value("pointer") == QJsonValue{"/from"});
+      CHECK(errorDetails.value("reason") == QJsonValue{"no_headroom"});
+      CHECK(errorDetails.value("clearance") == QJsonValue{40});
+      CHECK(errorDetails.value("standing_point") == QJsonValue{jsonVec(288, 128, 0)});
+    }
+
+    SECTION("a second floor is reachable only via the stairs")
+    {
+      addShell(map, vm::bbox3d{{0, 0, 0}, {768, 256, 256}});
+      // the second floor, 128 above the ground floor, with room below it
+      addBrush(map, vm::bbox3d{{512, 0, 112}, {768, 256, 128}});
+      auto steps = std::vector<mdl::Node*>{};
+      for (int k = 1; k <= 8; ++k)
+      {
+        steps.push_back(addBrush(
+          map,
+          vm::bbox3d{
+            {256.0 + 32.0 * (k - 1), 96, 0}, {256.0 + 32.0 * k, 160, 16.0 * k}}));
+      }
+
+      const auto args = R"({"from":[64,128,0],"to":[[704,128,128],[704,128,0]]})";
+      const auto result = f.ok("check_walkable", args);
+      CHECK(result.value("reachable_count") == QJsonValue{2});
+      const auto upstairs = target(result, 0);
+      CHECK(upstairs.value("standing_point") == QJsonValue{jsonVec(704, 128, 128)});
+      CHECK(std::ranges::any_of(upstairs.value("path").toArray(), [](const auto& point) {
+        const auto z = point.toArray()[2].toDouble();
+        return z > 0 && z < 128;
+      }));
+      // below the second floor, on the ground floor
+      CHECK(
+        target(result, 1).value("standing_point") == QJsonValue{jsonVec(704, 128, 0)});
+      // around the stairs, 48 units to the side and back
+      CHECK(target(result, 1).value("path_length").toDouble() >= 640 + 2 * 48);
+
+      mdl::deselectAll(map);
+      mdl::selectNodes(map, steps);
+      mdl::removeSelectedNodes(map);
+      const auto without = f.ok("check_walkable", args);
+      CHECK(target(without, 0).value("reachable") == QJsonValue{false});
+      CHECK(blocker(without, 0).value("kind") == QJsonValue{"step_too_high"});
+      CHECK(details(without, 0).value("rise") == QJsonValue{128});
+      CHECK(target(without, 1).value("reachable") == QJsonValue{true});
+    }
+
+    SECTION("drops")
+    {
+      // two platforms in the open with a pit between them
+      addBrush(map, vm::bbox3d{{0, 0, -16}, {256, 256, 0}});
+      addBrush(map, vm::bbox3d{{320, 0, -16}, {576, 256, 0}});
+
+      SECTION("too deep")
+      {
+        addBrush(map, vm::bbox3d{{256, 0, -528}, {320, 256, -512}});
+        const auto result = f.ok(
+          "check_walkable", R"({"from":[64,128,0],"to":[[512,128,0],[288,128,-512]]})");
+        CHECK(blocker(result, 0).value("kind") == QJsonValue{"gap"});
+        CHECK(details(result, 0).value("drop") == QJsonValue{512});
+        CHECK(details(result, 0).value("max_drop") == QJsonValue{256});
+        CHECK(blocker(result, 1).value("kind") == QJsonValue{"gap"});
+        CHECK(blocker(result, 1).value("at").toArray()[2] == QJsonValue{-512});
+
+        // a higher max_drop jumps into the pit, but there is no way out
+        const auto deeper = f.ok(
+          "check_walkable",
+          R"({"from":[64,128,0],"to":[[512,128,0],[288,128,-512]],"max_drop":1000})");
+        CHECK(target(deeper, 1).value("reachable") == QJsonValue{true});
+        CHECK(blocker(deeper, 0).value("kind") == QJsonValue{"step_too_high"});
+        CHECK(details(deeper, 0).value("rise") == QJsonValue{512});
+      }
+
+      SECTION("no floor")
+      {
+        const auto result =
+          f.ok("check_walkable", R"({"from":[64,128,0],"to":[[512,128,0],[288,128,0]]})");
+        CHECK(blocker(result, 0).value("kind") == QJsonValue{"gap"});
+        CHECK(details(result, 0).value("reason") == QJsonValue{"no_floor"});
+        CHECK(blocker(result, 1).value("kind") == QJsonValue{"not_standable"});
+        CHECK(details(result, 1).value("reason") == QJsonValue{"no_floor"});
+        CHECK(target(result, 1).value("standing_point") == QJsonValue{});
+      }
+
+      SECTION("a narrow gap is stepped over")
+      {
+        // the hull is 32 wide and stands on any part of a floor
+        addBrush(map, vm::bbox3d{{256, 0, -16}, {304, 256, 0}});
+        CHECK(
+          target(f.ok("check_walkable", R"({"from":[64,128,0],"to":[[512,128,0]]})"))
+            .value("reachable")
+          == QJsonValue{true});
+      }
+    }
+
+    SECTION("targets inside solid are not standable")
+    {
+      addShell(map, vm::bbox3d{{0, 0, 0}, {512, 256, 128}});
+      addBrush(map, vm::bbox3d{{200, 64, 0}, {264, 192, 64}});
+
+      const auto result = f.ok(
+        "check_walkable",
+        R"({"from":[64,128,0],"to":[[232,128,32],[64,128,-8],[232,128,64],[1000,128,0]],
+            "bounds":{"min":[-64,-64,-64],"max":[600,320,200]}})");
+      CHECK(blocker(result, 0).value("kind") == QJsonValue{"not_standable"});
+      CHECK(details(result, 0).value("reason") == QJsonValue{"inside_solid"});
+      CHECK(blocker(result, 0).value("at") == QJsonValue{jsonVec(232, 128, 32)});
+      CHECK(target(result, 0).value("nearest_reachable_point").isArray());
+      CHECK(details(result, 1).value("reason") == QJsonValue{"inside_solid"});
+      // the top of the block is standable but 64 high
+      CHECK(blocker(result, 2).value("kind") == QJsonValue{"step_too_high"});
+      CHECK(details(result, 3).value("reason") == QJsonValue{"outside_bounds"});
+
+      // a hull next to a wall does not fit
+      const auto wall = f.ok("check_walkable", R"({"from":[64,128,0],"to":[[4,128,0]]})");
+      CHECK(details(wall).value("reason") == QJsonValue{"blocked"});
+    }
+
+    SECTION("brush entities")
+    {
+      addShell(map, vm::bbox3d{{0, 0, 0}, {512, 256, 128}});
+      const auto args = R"({"from":[64,128,0],"to":[[448,128,0]]})";
+
+      // a door counts as open
+      addBrushEntity(map, "func_door", {vm::bbox3d{{240, 0, 0}, {256, 256, 128}}});
+      CHECK(target(f.ok("check_walkable", args)).value("reachable") == QJsonValue{true});
+
+      // a func_wall blocks, like a wall
+      addBrushEntity(map, "func_wall", {vm::bbox3d{{240, 0, 0}, {256, 256, 128}}});
+      const auto walled = f.ok("check_walkable", args);
+      CHECK(target(walled).value("reachable") == QJsonValue{false});
+      CHECK(blocker(walled).value("kind") == QJsonValue{"step_too_high"});
+      CHECK(
+        details(walled).value("message")
+        == QJsonValue{"a wall or obstacle blocks the way"});
+    }
+
+    SECTION("ramps")
+    {
+      addShell(map, vm::bbox3d{{0, 0, 0}, {512, 256, 256}});
+      // a ramp rising by 64 over 128 units up to a platform
+      f.ok(
+        "create_brush_from_points",
+        R"({"points":[[128,64,0],[256,64,0],[256,64,64],[128,192,0],[256,192,0],[256,192,64]]})");
+      addBrush(map, vm::bbox3d{{256, 0, 0}, {512, 256, 64}});
+      const auto ramp =
+        f.ok("check_walkable", R"({"from":[64,128,0],"to":[[448,128,64]]})");
+      CHECK(target(ramp).value("reachable") == QJsonValue{true});
+      // the path goes up the ramp, not around it
+      CHECK(
+        std::ranges::any_of(target(ramp).value("path").toArray(), [](const auto& point) {
+          return point.toArray()[1] == QJsonValue{128}
+                 && point.toArray()[2].toDouble() > 0
+                 && point.toArray()[2].toDouble() < 64;
+        }));
+    }
+
+    SECTION("rotated brushes")
+    {
+      addShell(map, vm::bbox3d{{0, 0, 0}, {512, 256, 128}});
+      // a pillar rotated by 45 degrees around z, walked around
+      auto* pillar = addBrush(map, vm::bbox3d{{-24, -24, 0}, {24, 24, 128}});
+      rotate45(map, pillar);
+      mdl::selectNodes(map, {pillar});
+      REQUIRE(mdl::translateSelection(map, {128, 128, 0}));
+      mdl::deselectAll(map);
+
+      const auto around =
+        f.ok("check_walkable", R"({"from":[48,128,0],"to":[[208,128,0]]})");
+      CHECK(target(around).value("reachable") == QJsonValue{true});
+      CHECK(target(around).value("path").toArray().size() > 2);
+      CHECK(target(around).value("path_length").toDouble() > 160);
+
+      // the hull does not fit between the pillar and a wall 40 units away from its edge
+      addBrush(map, vm::bbox3d{{0, 0, 0}, {512, 128 - 34 - 24, 128}});
+      addBrush(map, vm::bbox3d{{0, 128 + 34 + 24, 0}, {512, 256, 128}});
+      const auto blocked =
+        f.ok("check_walkable", R"({"from":[48,128,0],"to":[[208,128,0]]})");
+      CHECK(target(blocked).value("reachable") == QJsonValue{false});
+    }
+
+    SECTION("bounds and max_cells")
+    {
+      addShell(map, vm::bbox3d{{0, 0, 0}, {512, 256, 128}});
+
+      const auto bounded = f.ok(
+        "check_walkable",
+        R"({"from":[64,128,0],"to":[[448,128,0]],"bounds":{"min":[0,0,-8],"max":[256,256,128]}})");
+      CHECK(details(bounded).value("reason") == QJsonValue{"outside_bounds"});
+      CHECK(
+        f.err(
+          "check_walkable",
+          R"({"from":[64,128,0],"to":[[448,128,0]],"bounds":{"min":[100,0,0],"max":[256,256,128]}})")
+        == "invalid_argument");
+
+      const auto error = f.error(
+        "check_walkable", R"({"from":[64,128,0],"to":[[448,128,0]],"max_cells":1000})");
+      CHECK(error.value("code") == QJsonValue{"invalid_argument"});
+      CHECK(
+        error.value("details").toObject().value("pointer") == QJsonValue{"/resolution"});
+      CHECK(error.value("hint").toString().contains("resolution"));
+      CHECK(
+        f.ok(
+           "check_walkable",
+           R"({"from":[64,128,0],"to":[[448,128,0]],"resolution":32,"max_cells":5000})")
+          .value("reachable_count")
+        == QJsonValue{1});
+    }
+
+    SECTION("errors")
+    {
+      addShell(map, vm::bbox3d{{0, 0, 0}, {512, 256, 128}});
+      const auto reason = [&](const char* args) {
+        return f.error("check_walkable", args)
+          .value("details")
+          .toObject()
+          .value("reason")
+          .toString();
+      };
+      CHECK(reason(R"({"from":[64,128,-8],"to":[[64,128,0]]})") == "inside_solid");
+      CHECK(reason(R"({"from":[-100,128,0],"to":[[64,128,0]]})") == "no_floor");
+      CHECK(reason(R"({"from":[4,128,0],"to":[[64,128,0]]})") == "blocked");
+      CHECK(
+        f.error(
+           "check_walkable", R"({"from":[64,128,0],"to":[[64,128,0]],"resolution":40})")
+          .value("details")
+          .toObject()
+          .value("pointer")
+        == QJsonValue{"/resolution"});
+      CHECK(
+        f.err("check_walkable", R"({"from":[64,128,0],"to":[]})") == "invalid_argument");
+      CHECK(f.err("check_walkable", R"({"to":[[64,128,0]]})") == "invalid_argument");
+      CHECK(
+        f.err("check_walkable", R"({"from":[64,128,0],"to":[[1e300,0,0]]})")
+        == "invalid_argument");
+      CHECK(
+        f.err(
+          "check_walkable", R"({"from":[64,128,0],"to":[[0,0,0]],"hull":{"width":0}})")
+        == "invalid_argument");
+    }
+
+    SECTION("is deterministic and leaves the map unchanged")
+    {
+      addShell(map, vm::bbox3d{{0, 0, 0}, {576, 256, 128}});
+      addBrush(map, vm::bbox3d{{256, 0, 40}, {320, 256, 128}});
+      addBrush(map, vm::bbox3d{{96, 64, 0}, {128, 192, 24}});
+      const auto before = snapshot(map);
+      const auto args =
+        R"({"from":[64,128,0],"to":[[512,128,0],[112,128,24],[200,200,0],[288,128,0]]})";
+      const auto first = compactJson(f.ok("check_walkable", args));
+      CHECK(compactJson(f.ok("check_walkable", args)) == first);
+      CHECK(snapshot(map) == before);
+    }
+
+    SECTION("points on stairs narrower than the hull rest on the next step")
+    {
+      addShell(map, vm::bbox3d{{0, 0, 0}, {512, 256, 256}});
+      // 8 unit steps that are 16 deep, so the hull always rests on two of them
+      for (int k = 1; k <= 8; ++k)
+      {
+        addBrush(
+          map,
+          vm::bbox3d{{96.0 + 16.0 * (k - 1), 0, 0}, {96.0 + 16.0 * k, 256, 8.0 * k}});
+      }
+      addBrush(map, vm::bbox3d{{224, 0, 0}, {512, 256, 64}});
+
+      // the middle of the third step; the hull there also rests on the fourth
+      const auto result =
+        f.ok("check_walkable", R"({"from":[48,128,0],"to":[[136,128,24],[448,128,64]]})");
+      CHECK(result.value("reachable_count") == QJsonValue{2});
+      CHECK(
+        target(result, 0).value("standing_point") == QJsonValue{jsonVec(136, 128, 32)});
+      CHECK(
+        target(result, 0).value("path").toArray().last()
+        == QJsonValue{jsonVec(136, 128, 32)});
+      CHECK(!result.contains("warnings"));
+
+      const auto fromStep =
+        f.ok("check_walkable", R"({"from":[136,128,24],"to":[[448,128,64]]})");
+      CHECK(
+        fromStep.value("from").toObject().value("standing_point")
+        == QJsonValue{jsonVec(136, 128, 32)});
+      CHECK(target(fromStep).value("reachable") == QJsonValue{true});
+
+      // not more than step_height up
+      const auto low = f.ok(
+        "check_walkable", R"({"from":[48,128,0],"to":[[136,128,24]],"step_height":4})");
+      CHECK(blocker(low).value("kind") == QJsonValue{"not_standable"});
+      CHECK(details(low).value("reason") == QJsonValue{"blocked"});
+      CHECK(target(low).value("standing_point") == QJsonValue{jsonVec(136, 128, 24)});
+    }
+
+    SECTION("a point near the edge of the bounds uses the column inside them")
+    {
+      addShell(map, vm::bbox3d{{0, 0, 0}, {512, 256, 128}});
+      // the column centers are at 64 + 8 i, the last one inside the bounds at 296
+      const auto result = f.ok(
+        "check_walkable",
+        R"({"from":[64,128,0],"to":[[300,128,0]],"bounds":{"min":[-16,-16,-16],"max":[302,272,144]}})");
+      CHECK(target(result).value("reachable") == QJsonValue{true});
+      CHECK(target(result).value("standing_point") == QJsonValue{jsonVec(296, 128, 0)});
+    }
+
+    SECTION("thin bounds count at least the hull height in max_cells")
+    {
+      addShell(map, vm::bbox3d{{0, 0, 0}, {512, 256, 128}});
+      // the work is per column, and the hull boxes reach 56 above the floor
+      const auto result = f.ok(
+        "check_walkable",
+        R"({"from":[64,128,0],"to":[[448,128,0]],"bounds":{"min":[0,0,0],"max":[512,256,1]}})");
+      CHECK(
+        result.value("stats").toObject().value("grid")
+        == QJsonValue{QJsonArray{65, 33, 7}});
+      CHECK(result.value("stats").toObject().value("cells") == QJsonValue{65 * 33 * 7});
+      CHECK(
+        f.err(
+          "check_walkable",
+          R"({"from":[64,128,0],"to":[[448,128,0]],"bounds":{"min":[0,0,0],"max":[512,256,1]},"max_cells":15000})")
+        == "invalid_argument");
+    }
+  }
+
   SECTION("every eval tool leaves the map unchanged")
   {
     const auto scene = populateTestScene(f);
@@ -885,6 +1392,7 @@ TEST_CASE("McpMapEvalTools")
            R"(["checkpoint_delete",{"name":"y"}])",
            R"(["export_map_text",{"ids":["@selection"]}])",
            R"(["check_leaks",{}])",
+           R"(["check_walkable",{"from":[32,160,16],"to":[[32,32,64]]}])",
          })
     {
       const auto args =

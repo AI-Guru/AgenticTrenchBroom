@@ -53,15 +53,19 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <map>
 #include <optional>
+#include <queue>
 #include <set>
 #include <sstream>
 #include <tuple>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace tb::ui
@@ -2055,6 +2059,1314 @@ McpToolDef checkLeaksTool()
   };
 }
 
+// check_walkable
+
+constexpr auto MaxWalkTargets = 64;
+constexpr auto DefaultWalkMaxCells = 4000000;
+constexpr auto MaxWalkMaxCells = 16000000;
+constexpr auto DefaultHullWidth = 32.0;
+constexpr auto DefaultHullHeight = 56.0;
+constexpr auto DefaultStepHeight = 18.0;
+constexpr auto DefaultMaxDrop = 256.0;
+constexpr auto DefaultWalkResolution = 8.0;
+constexpr auto MaxWalkResolution = 64.0;
+// boxes are shrunk by this much, so that touching a floor or a wall is not a collision
+constexpr auto WalkEpsilon = 1e-3;
+constexpr auto WalkBucketColumns = int64_t(8);
+
+/** The four neighbour columns in the order in which the search visits them. */
+constexpr auto WalkDirections = std::array<std::array<int64_t, 2>, 4>{{
+  {-1, 0},
+  {1, 0},
+  {0, -1},
+  {0, 1},
+}};
+
+/** An axis-aligned box that may be empty; vm::bbox asserts on inverted boxes. */
+struct WalkBox
+{
+  vm::vec3d min;
+  vm::vec3d max;
+};
+
+/** A brush that the player collides with, prepared for the box tests. */
+struct WalkSolid
+{
+  const mdl::Brush* brush;
+  vm::bbox3d bounds;
+  std::vector<vm::plane3d> planes;
+  std::vector<vm::vec3d> vertices;
+  // one per parallel class of edges
+  std::vector<vm::vec3d> edgeDirections;
+  // whether every face is axis-aligned, so that the brush is its bounds
+  bool box;
+};
+
+/**
+ * Whether the player collides with the brush: world brushes (also in groups) and the
+ * brushes of func_group, func_detail* and func_wall, unless their layer is omitted from
+ * export. Doors, platforms, triggers and other brush entities are ignored.
+ */
+bool isWalkSolid(const mdl::BrushNode& brushNode)
+{
+  if (omittedFromExport(brushNode))
+  {
+    return false;
+  }
+  if (isWorldBrush(brushNode))
+  {
+    return true;
+  }
+  const auto* entityNode = brushNode.entity();
+  if (!entityNode)
+  {
+    return false;
+  }
+  auto classname = entityNode->entity().classname();
+  std::ranges::transform(
+    classname, classname.begin(), [](const unsigned char c) { return std::tolower(c); });
+  return classname == "func_group" || classname == "func_wall"
+         || classname.starts_with("func_detail");
+}
+
+WalkSolid makeWalkSolid(const mdl::Brush& brush)
+{
+  auto solid = WalkSolid{&brush, brush.bounds(), {}, brush.vertexPositions(), {}, true};
+  for (const auto& face : brush.faces())
+  {
+    const auto& plane = face.boundary();
+    solid.planes.push_back(plane);
+    auto axes = size_t(0);
+    for (size_t i = 0; i < 3; ++i)
+    {
+      axes += std::abs(plane.normal[i]) > 1e-9 ? 1 : 0;
+    }
+    solid.box = solid.box && axes == 1;
+  }
+  if (!solid.box)
+  {
+    for (const auto* edge : brush.edges())
+    {
+      const auto direction =
+        vm::normalize(edge->secondVertex()->position() - edge->firstVertex()->position());
+      if (std::ranges::none_of(solid.edgeDirections, [&](const auto& other) {
+            return vm::length(vm::cross(direction, other)) < 1e-9;
+          }))
+      {
+        solid.edgeDirections.push_back(direction);
+      }
+    }
+  }
+  return solid;
+}
+
+/**
+ * Whether the box, shrunk by WalkEpsilon on every side, overlaps the inside of the
+ * brush. Uses the separating axis test, which is exact for convex polyhedra.
+ */
+bool boxHitsSolid(const WalkBox& box, const WalkSolid& solid)
+{
+  auto lo = box.min + vm::vec3d::fill(WalkEpsilon);
+  auto hi = box.max - vm::vec3d::fill(WalkEpsilon);
+  for (size_t i = 0; i < 3; ++i)
+  {
+    if (!(lo[i] < hi[i]) || hi[i] <= solid.bounds.min[i] || lo[i] >= solid.bounds.max[i])
+    {
+      return false;
+    }
+  }
+  if (solid.box)
+  {
+    return true;
+  }
+
+  const auto center = (lo + hi) / 2.0;
+  const auto half = (hi - lo) / 2.0;
+  const auto radius = [&](const vm::vec3d& axis) {
+    return std::abs(axis.x()) * half.x() + std::abs(axis.y()) * half.y()
+           + std::abs(axis.z()) * half.z();
+  };
+  for (const auto& plane : solid.planes)
+  {
+    if (vm::dot(plane.normal, center) - radius(plane.normal) >= plane.distance)
+    {
+      return false;
+    }
+  }
+  for (const auto& direction : solid.edgeDirections)
+  {
+    for (size_t k = 0; k < 3; ++k)
+    {
+      auto unit = vm::vec3d{0, 0, 0};
+      unit[k] = 1.0;
+      const auto axis = vm::cross(direction, unit);
+      if (vm::squared_length(axis) < 1e-12)
+      {
+        continue;
+      }
+      auto min = std::numeric_limits<double>::max();
+      auto max = std::numeric_limits<double>::lowest();
+      for (const auto& vertex : solid.vertices)
+      {
+        const auto d = vm::dot(axis, vertex);
+        min = std::min(min, d);
+        max = std::max(max, d);
+      }
+      const auto c = vm::dot(axis, center);
+      const auto r = radius(axis);
+      if (c + r <= min || c - r >= max)
+      {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+/**
+ * Returns the top of the brush on the vertical line through (x, y), or nullopt if the
+ * line does not pass through the brush's inside.
+ */
+std::optional<double> solidTopAt(const WalkSolid& solid, const double x, const double y)
+{
+  auto lo = std::numeric_limits<double>::lowest();
+  auto hi = std::numeric_limits<double>::max();
+  for (const auto& plane : solid.planes)
+  {
+    const auto& n = plane.normal;
+    const auto rest = plane.distance - n.x() * x - n.y() * y;
+    if (n.z() > 1e-9)
+    {
+      hi = std::min(hi, rest / n.z());
+    }
+    else if (n.z() < -1e-9)
+    {
+      lo = std::max(lo, rest / n.z());
+    }
+    else if (rest < -1e-6)
+    {
+      return std::nullopt;
+    }
+  }
+  return lo < hi - WalkEpsilon ? std::optional{hi} : std::nullopt;
+}
+
+/**
+ * The indices of the first and the last column center inside the bounds along the given
+ * horizontal axis, counted from the origin in resolution steps.
+ */
+std::pair<int64_t, int64_t> walkIndexRange(
+  const vm::bbox3d& bounds,
+  const vm::vec2d& origin,
+  const double resolution,
+  const size_t axis)
+{
+  return {
+    int64_t(std::ceil((bounds.min[axis] - origin[axis]) / resolution - 1e-9)),
+    int64_t(std::floor((bounds.max[axis] - origin[axis]) / resolution + 1e-9))};
+}
+
+size_t walkColumnCount(
+  const vm::bbox3d& bounds,
+  const vm::vec2d& origin,
+  const double resolution,
+  const size_t axis)
+{
+  const auto [first, last] = walkIndexRange(bounds, origin, resolution, axis);
+  return size_t(std::max(last - first + 1, int64_t(1)));
+}
+
+struct WalkColumn
+{
+  // indices into the solids, ascending, of the brushes that overlap the footprint
+  std::vector<uint32_t> solids;
+  // the tops of those brushes under the footprint, ascending
+  std::vector<double> floors;
+  // per floor, the position index if the hull fits on it, else -1
+  std::vector<int32_t> positions;
+};
+
+struct WalkPosition
+{
+  size_t column;
+  double z;
+};
+
+/** A move from a reachable position into a column that has no reachable floor. */
+struct WalkFailure
+{
+  uint32_t position;
+  // the neighbour column, or nullopt at the edge of the bounds
+  std::optional<size_t> column;
+};
+
+struct WalkBlocker
+{
+  QString kind;
+  vm::vec3d at;
+  QJsonObject details;
+};
+
+/**
+ * The navigation model of check_walkable. The columns are the hull positions on a grid of
+ * resolution spaced points in the xy plane, one of which is the from point. A column's
+ * floors are the tops of the solid brushes under the hull's footprint; a position is a
+ * floor on which the whole hull is free of solid. The search moves between positions in
+ * the four neighbour columns. Columns are evaluated on demand and cached.
+ */
+class WalkGraph
+{
+public:
+  struct Params
+  {
+    double width;
+    double height;
+    double step;
+    double drop;
+    double resolution;
+  };
+
+private:
+  Params m_params;
+  vm::bbox3d m_bounds;
+  vm::vec2d m_origin;
+  int64_t m_i0;
+  int64_t m_j0;
+  size_t m_nx;
+  size_t m_ny;
+  std::vector<WalkSolid> m_solids;
+  size_t m_nbx;
+  std::vector<std::vector<uint32_t>> m_buckets;
+  std::unordered_map<size_t, WalkColumn> m_columns;
+  std::vector<WalkPosition> m_positions;
+
+public:
+  WalkGraph(
+    const Params& params,
+    const vm::bbox3d& bounds,
+    const vm::vec2d& origin,
+    std::vector<WalkSolid> solids)
+    : m_params{params}
+    , m_bounds{bounds}
+    , m_origin{origin}
+    , m_i0{walkIndexRange(bounds, origin, params.resolution, 0).first}
+    , m_j0{walkIndexRange(bounds, origin, params.resolution, 1).first}
+    , m_nx{walkColumnCount(bounds, origin, params.resolution, 0)}
+    , m_ny{walkColumnCount(bounds, origin, params.resolution, 1)}
+    , m_solids{std::move(solids)}
+    , m_nbx{(m_nx + size_t(WalkBucketColumns) - 1) / size_t(WalkBucketColumns)}
+  {
+    const auto nby = (m_ny + size_t(WalkBucketColumns) - 1) / size_t(WalkBucketColumns);
+    m_buckets.resize(m_nbx * nby);
+    const auto half = m_params.width / 2.0;
+    for (size_t s = 0; s < m_solids.size(); ++s)
+    {
+      const auto& b = m_solids[s].bounds;
+      // the columns whose footprint overlaps the brush by more than WalkEpsilon
+      const auto range = [&](const size_t axis, const int64_t first, const size_t count) {
+        const auto lo =
+          int64_t(std::floor(
+            (b.min[axis] + WalkEpsilon - half - m_origin[axis]) / m_params.resolution))
+          + 1;
+        const auto hi =
+          int64_t(std::ceil(
+            (b.max[axis] - WalkEpsilon + half - m_origin[axis]) / m_params.resolution))
+          - 1;
+        return std::pair{
+          std::max(lo, first) - first, std::min(hi, first + int64_t(count) - 1) - first};
+      };
+      const auto [xlo, xhi] = range(0, m_i0, m_nx);
+      const auto [ylo, yhi] = range(1, m_j0, m_ny);
+      if (xlo > xhi || ylo > yhi)
+      {
+        continue;
+      }
+      for (auto by = ylo / WalkBucketColumns; by <= yhi / WalkBucketColumns; ++by)
+      {
+        for (auto bx = xlo / WalkBucketColumns; bx <= xhi / WalkBucketColumns; ++bx)
+        {
+          m_buckets[size_t(bx) + m_nbx * size_t(by)].push_back(uint32_t(s));
+        }
+      }
+    }
+  }
+
+  const Params& params() const { return m_params; }
+  size_t solidCount() const { return m_solids.size(); }
+  const WalkSolid& solid(const size_t index) const { return m_solids[index]; }
+  size_t columnsEvaluated() const { return m_columns.size(); }
+  const std::vector<WalkPosition>& positions() const { return m_positions; }
+
+  /**
+   * The column whose center is nearest to the point, or nullopt if the point is outside
+   * the bounds. Near the edge of the bounds, the nearest center can be outside of them;
+   * then the column inside is used.
+   */
+  std::optional<size_t> columnAt(const vm::vec3d& point) const
+  {
+    if (!m_bounds.contains(point))
+    {
+      return std::nullopt;
+    }
+    const auto i = std::clamp(
+      int64_t(std::llround((point.x() - m_origin.x()) / m_params.resolution)) - m_i0,
+      int64_t(0),
+      int64_t(m_nx) - 1);
+    const auto j = std::clamp(
+      int64_t(std::llround((point.y() - m_origin.y()) / m_params.resolution)) - m_j0,
+      int64_t(0),
+      int64_t(m_ny) - 1);
+    return size_t(i) + m_nx * size_t(j);
+  }
+
+  std::optional<size_t> neighbour(const size_t column, const size_t direction) const
+  {
+    const auto i = int64_t(column % m_nx) + WalkDirections[direction][0];
+    const auto j = int64_t(column / m_nx) + WalkDirections[direction][1];
+    if (i < 0 || j < 0 || i >= int64_t(m_nx) || j >= int64_t(m_ny))
+    {
+      return std::nullopt;
+    }
+    return size_t(i) + m_nx * size_t(j);
+  }
+
+  vm::vec3d point(const size_t column, const double z) const
+  {
+    return {
+      m_origin.x() + m_params.resolution * double(m_i0 + int64_t(column % m_nx)),
+      m_origin.y() + m_params.resolution * double(m_j0 + int64_t(column / m_nx)),
+      z};
+  }
+
+  vm::vec3d point(const WalkPosition& position) const
+  {
+    return point(position.column, position.z);
+  }
+
+  /** The hull's box at the column from z to z + height. */
+  WalkBox hull(const size_t column, const double z, const double height) const
+  {
+    const auto center = point(column, z);
+    const auto half = m_params.width / 2.0;
+    return {
+      {center.x() - half, center.y() - half, z},
+      {center.x() + half, center.y() + half, z + height}};
+  }
+
+  bool isFree(const WalkBox& box, const std::vector<uint32_t>& solids) const
+  {
+    return std::ranges::none_of(
+      solids, [&](const auto s) { return boxHitsSolid(box, m_solids[s]); });
+  }
+
+  /** Evaluates the column if needed. References stay valid. */
+  const WalkColumn& column(const size_t key)
+  {
+    if (const auto it = m_columns.find(key); it != m_columns.end())
+    {
+      return it->second;
+    }
+
+    auto result = WalkColumn{};
+    const auto i = key % m_nx;
+    const auto j = key / m_nx;
+    const auto& bucket =
+      m_buckets[i / size_t(WalkBucketColumns) + m_nbx * (j / size_t(WalkBucketColumns))];
+    const auto footprint = hull(key, 0.0, 0.0);
+    for (const auto s : bucket)
+    {
+      const auto& b = m_solids[s].bounds;
+      if (
+        b.max.x() > footprint.min.x() + WalkEpsilon
+        && b.min.x() < footprint.max.x() - WalkEpsilon
+        && b.max.y() > footprint.min.y() + WalkEpsilon
+        && b.min.y() < footprint.max.y() - WalkEpsilon)
+      {
+        result.solids.push_back(s);
+      }
+    }
+
+    for (const auto s : result.solids)
+    {
+      const auto top = solidTop(m_solids[s], footprint);
+      if (
+        top && *top >= m_bounds.min.z() - WalkEpsilon
+        && *top <= m_bounds.max.z() + WalkEpsilon)
+      {
+        result.floors.push_back(*top);
+      }
+    }
+    std::ranges::sort(result.floors);
+    const auto [first, last] = std::ranges::unique(
+      result.floors, [](const auto a, const auto b) { return b - a <= 1e-6; });
+    result.floors.erase(first, last);
+
+    for (const auto z : result.floors)
+    {
+      if (isFree(hull(key, z, m_params.height), result.solids))
+      {
+        result.positions.push_back(int32_t(m_positions.size()));
+        m_positions.push_back({key, z});
+      }
+      else
+      {
+        result.positions.push_back(-1);
+      }
+    }
+
+    return m_columns.emplace(key, std::move(result)).first->second;
+  }
+
+  /**
+   * Whether the hull can move from (a, z1) to (b, z2) with the given hull height: the
+   * box spanning both footprints at the higher floor and the lower column's footprint
+   * from the lower floor up to the higher one must be free.
+   */
+  bool canMove(
+    const size_t a, const double z1, const size_t b, const double z2, const double height)
+  {
+    const auto& ca = column(a);
+    const auto& cb = column(b);
+    const auto zh = std::max(z1, z2);
+    const auto ha = hull(a, zh, height);
+    const auto hb = hull(b, zh, height);
+    const auto span = WalkBox{vm::min(ha.min, hb.min), vm::max(ha.max, hb.max)};
+    if (!isFree(span, ca.solids) || !isFree(span, cb.solids))
+    {
+      return false;
+    }
+    const auto zl = std::min(z1, z2);
+    if (zh - zl > WalkEpsilon)
+    {
+      const auto lower = z1 < z2 ? a : b;
+      const auto& solids = z1 < z2 ? ca.solids : cb.solids;
+      auto box = hull(lower, zl, height);
+      box.max[2] = zh + height;
+      return isFree(box, solids);
+    }
+    return true;
+  }
+
+  /** Whether a step from z1 to z2 is within the given limits. */
+  static bool inReach(
+    const double z1, const double z2, const double step, const double drop)
+  {
+    return z2 - z1 <= step + 1e-6 && z1 - z2 <= drop + 1e-6;
+  }
+
+private:
+  /**
+   * The highest top of the brush under the footprint, sampled on a 3x3 grid inside the
+   * footprint and at the brush's vertices inside it. A top that is missed can only make
+   * the hull collide with the brush, so the model stays conservative.
+   */
+  std::optional<double> solidTop(const WalkSolid& solid, const WalkBox& footprint) const
+  {
+    if (solid.box)
+    {
+      return solid.bounds.max.z();
+    }
+    auto top = std::optional<double>{};
+    const auto sample = [&](const double x, const double y) {
+      if (const auto z = solidTopAt(solid, x, y))
+      {
+        top = top ? std::max(*top, *z) : *z;
+      }
+    };
+    for (size_t v = 0; v < 3; ++v)
+    {
+      for (size_t u = 0; u < 3; ++u)
+      {
+        const auto fu = double(u) / 2.0;
+        const auto fv = double(v) / 2.0;
+        sample(
+          (footprint.min.x() + WalkEpsilon) * (1.0 - fu)
+            + (footprint.max.x() - WalkEpsilon) * fu,
+          (footprint.min.y() + WalkEpsilon) * (1.0 - fv)
+            + (footprint.max.y() - WalkEpsilon) * fv);
+      }
+    }
+    for (const auto& vertex : solid.vertices)
+    {
+      if (
+        vertex.x() > footprint.min.x() && vertex.x() < footprint.max.x()
+        && vertex.y() > footprint.min.y() && vertex.y() < footprint.max.y())
+      {
+        sample(vertex.x(), vertex.y());
+      }
+    }
+    return top;
+  }
+};
+
+/**
+ * The largest height in [0, max] for which isFree holds, to 1/1000 of a unit. The boxes
+ * are shrunk by WalkEpsilon, which is taken off again.
+ */
+double freeHeight(const std::function<bool(double)>& isFree, const double max)
+{
+  if (isFree(max))
+  {
+    return max;
+  }
+  auto lo = 0.0;
+  auto hi = max;
+  for (size_t i = 0; i < 32; ++i)
+  {
+    const auto mid = (lo + hi) / 2.0;
+    (isFree(mid) ? lo : hi) = mid;
+  }
+  return std::max(0.0, std::round((lo - WalkEpsilon) * 1000.0) / 1000.0);
+}
+
+/** The height of the box that tells headroom (free near the floor) from a wall. */
+double probeHeight(const WalkGraph::Params& params)
+{
+  return std::min(params.height, std::max(params.step, 1.0));
+}
+
+struct WalkSnap
+{
+  std::optional<uint32_t> position;
+  // the floor under the point, also if the hull does not fit on it
+  std::optional<vm::vec3d> standingPoint;
+  // empty if the hull fits
+  QString reason;
+  QString message;
+  std::optional<double> clearance;
+};
+
+/**
+ * Moves the point down to the highest floor in its column at or below it. If the hull
+ * does not fit there but it fits on a higher floor at most step_height above the point,
+ * such as the edge of the next step of stairs that are narrower than the hull, the point
+ * is moved up to the lowest such floor instead, because the player rests on that edge.
+ */
+WalkSnap snapToFloor(WalkGraph& graph, const vm::vec3d& point)
+{
+  const auto column = graph.columnAt(point);
+  if (!column)
+  {
+    return {{}, {}, "outside_bounds", "the point is outside the bounds", {}};
+  }
+  for (size_t s = 0; s < graph.solidCount(); ++s)
+  {
+    if (brushStrictlyContains(*graph.solid(s).brush, point))
+    {
+      return {{}, {}, "inside_solid", "the point is inside a solid brush", {}};
+    }
+  }
+
+  const auto& c = graph.column(*column);
+  auto floor = std::optional<size_t>{};
+  for (size_t k = 0; k < c.floors.size() && c.floors[k] <= point.z() + WalkEpsilon; ++k)
+  {
+    floor = k;
+  }
+  if (!floor || c.positions[*floor] < 0)
+  {
+    for (auto k = floor ? *floor + 1 : size_t(0);
+         k < c.floors.size() && c.floors[k] <= point.z() + graph.params().step + 1e-6;
+         ++k)
+    {
+      if (c.positions[k] >= 0)
+      {
+        return {uint32_t(c.positions[k]), graph.point(*column, c.floors[k]), {}, {}, {}};
+      }
+    }
+  }
+  if (!floor)
+  {
+    return {{}, {}, "no_floor", "there is no floor below the point in the bounds", {}};
+  }
+
+  const auto z = c.floors[*floor];
+  const auto standingPoint = graph.point(*column, z);
+  if (c.positions[*floor] >= 0)
+  {
+    return {uint32_t(c.positions[*floor]), standingPoint, {}, {}, {}};
+  }
+
+  const auto& params = graph.params();
+  const auto clearance = freeHeight(
+    [&](const double h) { return graph.isFree(graph.hull(*column, z, h), c.solids); },
+    params.height);
+  if (graph.isFree(graph.hull(*column, z, probeHeight(params)), c.solids))
+  {
+    return {
+      {},
+      standingPoint,
+      "no_headroom",
+      QString{"only %1 of the %2 units of hull height are free above the floor"}
+        .arg(canon(clearance))
+        .arg(canon(params.height)),
+      clearance};
+  }
+  return {
+    {},
+    standingPoint,
+    "blocked",
+    "a wall or obstacle next to the point does not leave room for the hull's width",
+    clearance};
+}
+
+/** Parents of the visited positions: -1 for the root, -2 if not visited. */
+using WalkParents = std::vector<int32_t>;
+
+/**
+ * Breadth first search over the positions from the root within the step and drop limits.
+ * Records a failure for every move into a column that has no floor in reach.
+ */
+WalkParents walkSearch(
+  WalkGraph& graph, const uint32_t root, std::vector<WalkFailure>& failures)
+{
+  const auto& params = graph.params();
+  auto parents = WalkParents(graph.positions().size(), -2);
+  parents[root] = -1;
+  auto queue = std::vector<uint32_t>{root};
+  for (size_t head = 0; head < queue.size(); ++head)
+  {
+    const auto p = queue[head];
+    const auto [a, z1] = graph.positions()[p];
+    for (size_t d = 0; d < WalkDirections.size(); ++d)
+    {
+      const auto b = graph.neighbour(a, d);
+      if (!b)
+      {
+        failures.push_back({p, std::nullopt});
+        continue;
+      }
+
+      const auto& cb = graph.column(*b);
+      parents.resize(graph.positions().size(), -2);
+      auto moved = false;
+      for (size_t k = 0; k < cb.floors.size(); ++k)
+      {
+        const auto q = cb.positions[k];
+        const auto z2 = cb.floors[k];
+        if (
+          q >= 0 && WalkGraph::inReach(z1, z2, params.step, params.drop)
+          && graph.canMove(a, z1, *b, z2, params.height))
+        {
+          moved = true;
+          if (parents[size_t(q)] == -2)
+          {
+            parents[size_t(q)] = int32_t(p);
+            queue.push_back(uint32_t(q));
+          }
+        }
+      }
+      if (!moved)
+      {
+        failures.push_back({p, *b});
+      }
+    }
+  }
+  parents.resize(graph.positions().size(), -2);
+  return parents;
+}
+
+/** How far a move from z1 to z2 exceeds the step or drop limit, 0 if it does not. */
+double walkViolation(const WalkGraph::Params& params, const double z1, const double z2)
+{
+  return std::max({0.0, z2 - z1 - params.step, z1 - z2 - params.drop});
+}
+
+/**
+ * Searches the positions from the root without step and drop limits for the paths whose
+ * largest violation of the limits is smallest, and among those the ones with the fewest
+ * moves (Dijkstra on the pair). Ties are broken by position index.
+ */
+WalkParents walkMinimaxSearch(WalkGraph& graph, const uint32_t root)
+{
+  using Entry = std::tuple<double, uint32_t, uint32_t>;
+  const auto& params = graph.params();
+  auto parents = WalkParents(graph.positions().size(), -2);
+  auto best = std::vector<std::pair<double, uint32_t>>(
+    graph.positions().size(), {std::numeric_limits<double>::max(), 0});
+  auto done = std::vector<bool>(graph.positions().size(), false);
+  auto queue = std::priority_queue<Entry, std::vector<Entry>, std::greater<>>{};
+
+  parents[root] = -1;
+  best[root] = {0.0, 0};
+  queue.emplace(0.0, 0, root);
+  while (!queue.empty())
+  {
+    const auto [violation, moves, p] = queue.top();
+    queue.pop();
+    if (done[p])
+    {
+      continue;
+    }
+    done[p] = true;
+
+    const auto [a, z1] = graph.positions()[p];
+    for (size_t d = 0; d < WalkDirections.size(); ++d)
+    {
+      const auto b = graph.neighbour(a, d);
+      if (!b)
+      {
+        continue;
+      }
+      const auto& cb = graph.column(*b);
+      const auto size = graph.positions().size();
+      parents.resize(size, -2);
+      best.resize(size, {std::numeric_limits<double>::max(), 0});
+      done.resize(size, false);
+      for (size_t k = 0; k < cb.floors.size(); ++k)
+      {
+        const auto q = cb.positions[k];
+        const auto z2 = cb.floors[k];
+        if (q < 0 || done[size_t(q)] || !graph.canMove(a, z1, *b, z2, params.height))
+        {
+          continue;
+        }
+        const auto cost =
+          std::pair{std::max(violation, walkViolation(params, z1, z2)), moves + 1};
+        if (cost < best[size_t(q)])
+        {
+          best[size_t(q)] = cost;
+          parents[size_t(q)] = int32_t(p);
+          queue.emplace(cost.first, cost.second, uint32_t(q));
+        }
+      }
+    }
+  }
+  parents.resize(graph.positions().size(), -2);
+  return parents;
+}
+
+/** The positions from the root to the given position. */
+std::vector<uint32_t> walkPathTo(const WalkParents& parents, const uint32_t position)
+{
+  auto result = std::vector<uint32_t>{};
+  for (auto p = int32_t(position); p >= 0; p = parents[size_t(p)])
+  {
+    result.push_back(uint32_t(p));
+  }
+  std::ranges::reverse(result);
+  return result;
+}
+
+bool isReached(const WalkParents& parents, const size_t position)
+{
+  return position < parents.size() && parents[position] != -2;
+}
+
+int blockerPriority(const QString& kind)
+{
+  return kind == u"headroom" ? 0 : kind == u"step_too_high" ? 1 : 2;
+}
+
+/** Why the move from the failure's position into its column is not possible. */
+WalkBlocker classifyFailure(WalkGraph& graph, const WalkFailure& failure)
+{
+  const auto& params = graph.params();
+  const auto [a, z1] = graph.positions()[failure.position];
+  if (!failure.column)
+  {
+    return {
+      "gap",
+      graph.point(a, z1),
+      {{"reason", "bounds"},
+       {"message", "the search reached the edge of the bounds; pass larger bounds"}}};
+  }
+
+  const auto b = *failure.column;
+  const auto& cb = graph.column(b);
+  const auto probe = probeHeight(params);
+
+  // the floors in reach, nearest to z1 first
+  auto inReach = std::vector<size_t>{};
+  for (size_t k = 0; k < cb.floors.size(); ++k)
+  {
+    if (WalkGraph::inReach(z1, cb.floors[k], params.step, params.drop))
+    {
+      inReach.push_back(k);
+    }
+  }
+  std::ranges::stable_sort(inReach, [&](const auto l, const auto r) {
+    return std::abs(cb.floors[l] - z1) < std::abs(cb.floors[r] - z1);
+  });
+
+  auto obstacle = false;
+  for (const auto k : inReach)
+  {
+    const auto z2 = cb.floors[k];
+    const auto fits = cb.positions[k] >= 0;
+    const auto isFree = [&](const double h) {
+      return fits ? graph.canMove(a, z1, b, z2, h)
+                  : graph.isFree(graph.hull(b, z2, h), cb.solids);
+    };
+    if (!isFree(probe))
+    {
+      obstacle = true;
+      continue;
+    }
+    const auto clearance = freeHeight(isFree, params.height);
+    return {
+      "headroom",
+      graph.point(b, z2),
+      {{"clearance", clearance},
+       {"hull_height", canon(params.height)},
+       {"message",
+        QString{"only %1 of the %2 units of hull height are free %3"}
+          .arg(canon(clearance))
+          .arg(canon(params.height))
+          .arg(fits ? "along the move" : "above the floor")}}};
+  }
+
+  auto above = std::optional<double>{};
+  auto below = std::optional<double>{};
+  for (const auto z2 : cb.floors)
+  {
+    if (z2 > z1 + params.step + 1e-6 && !above)
+    {
+      above = z2;
+    }
+    if (z2 < z1 - params.drop - 1e-6)
+    {
+      below = z2;
+    }
+  }
+
+  if (above || obstacle)
+  {
+    auto details = QJsonObject{{"step_height", canon(params.step)}};
+    if (above)
+    {
+      details["rise"] = canon(*above - z1);
+    }
+    details["message"] =
+      obstacle ? QString{"a wall or obstacle blocks the way"}
+               : QString{"the floor rises by %1 units, more than step_height %2"}
+                   .arg(canon(*above - z1))
+                   .arg(canon(params.step));
+    return {"step_too_high", graph.point(b, above ? *above : z1), details};
+  }
+  if (below)
+  {
+    return {
+      "gap",
+      graph.point(b, *below),
+      {{"drop", canon(z1 - *below)},
+       {"max_drop", canon(params.drop)},
+       {"message",
+        QString{"the floor drops by %1 units, more than max_drop %2"}
+          .arg(canon(z1 - *below))
+          .arg(canon(params.drop))}}};
+  }
+  return {
+    "gap",
+    graph.point(b, z1),
+    {{"reason", "no_floor"}, {"message", "there is no floor to walk on"}}};
+}
+
+QJsonObject blockerJson(const WalkBlocker& blocker)
+{
+  return {
+    {"kind", blocker.kind}, {"at", toJson(blocker.at)}, {"details", blocker.details}};
+}
+
+McpResult<QJsonObject> checkWalkable(McpCallContext& context, const QJsonObject& args)
+{
+  auto& map = context.doc.map;
+
+  const auto hullArg = args.value("hull").toObject();
+  const auto params = WalkGraph::Params{
+    .width = hullArg.value("width").toDouble(DefaultHullWidth),
+    .height = hullArg.value("height").toDouble(DefaultHullHeight),
+    .step = args.value("step_height").toDouble(DefaultStepHeight),
+    .drop = args.value("max_drop").toDouble(DefaultMaxDrop),
+    .resolution = args.value("resolution").toDouble(DefaultWalkResolution),
+  };
+  if (params.resolution > params.width)
+  {
+    return toolError(
+      "invalid_argument",
+      QString{"resolution %1 is larger than the hull width %2"}
+        .arg(canon(params.resolution))
+        .arg(canon(params.width)),
+      "pass a resolution of at most the hull width (default 8)",
+      {{"pointer", "/resolution"}});
+  }
+  const auto maxCells = sizeArgument(args, "max_cells", size_t(DefaultWalkMaxCells));
+
+  auto from = vec3(args.value("from"), "/from");
+  if (from.is_error())
+  {
+    return errorOf(from);
+  }
+  auto targets = std::vector<vm::vec3d>{};
+  const auto toArg = args.value("to").toArray();
+  for (qsizetype i = 0; i < toArg.size(); ++i)
+  {
+    auto target = vec3(toArg[i], QString{"/to/%1"}.arg(i));
+    if (target.is_error())
+    {
+      return errorOf(target);
+    }
+    targets.push_back(target.value());
+  }
+
+  auto solids = std::vector<WalkSolid>{};
+  auto box = std::optional<vm::bbox3d>{};
+  for (const auto* brushNode : allBrushes(map))
+  {
+    if (isWalkSolid(*brushNode))
+    {
+      solids.push_back(makeWalkSolid(brushNode->brush()));
+      box = box ? vm::merge(*box, solids.back().bounds) : solids.back().bounds;
+    }
+  }
+
+  if (args.contains("bounds"))
+  {
+    auto boundsResult = bounds(args.value("bounds"), "/bounds");
+    if (boundsResult.is_error())
+    {
+      return errorOf(boundsResult);
+    }
+    box = boundsResult.value();
+    if (!box->contains(from.value()))
+    {
+      return toolError(
+        "invalid_argument",
+        "from is outside the bounds",
+        "pass bounds that contain from, or omit bounds",
+        {{"pointer", "/from"}});
+    }
+  }
+  else
+  {
+    auto merged = box ? vm::merge(*box, from.value()) : vm::bbox3d{from.value()};
+    for (const auto& target : targets)
+    {
+      merged = vm::merge(merged, target);
+    }
+    const auto margin = params.width / 2.0 + params.resolution;
+    box = vm::bbox3d{
+      merged.min - vm::vec3d{margin, margin, params.resolution},
+      merged.max + vm::vec3d{margin, margin, params.height}};
+  }
+
+  const auto origin = vm::vec2d{from.value().x(), from.value().y()};
+  const auto nx = walkColumnCount(*box, origin, params.resolution, 0);
+  const auto ny = walkColumnCount(*box, origin, params.resolution, 1);
+  // the hull boxes reach up to a hull height above the floors, so thin bounds still cost
+  // at least that many levels per column
+  const auto nz = std::max(
+    1.0,
+    std::ceil(
+      std::max(box->max.z() - box->min.z(), params.height) / params.resolution - 1e-9));
+  const auto totalCells = double(nx) * double(ny) * nz;
+  if (totalCells > double(maxCells))
+  {
+    return toolError(
+      "invalid_argument",
+      QString{"checking these bounds at resolution %1 needs %2 cells, more than "
+              "max_cells (%3)"}
+        .arg(canon(params.resolution))
+        .arg(QString::number(totalCells, 'g', 6))
+        .arg(maxCells),
+      "raise resolution (e.g. 16), pass bounds around from and the targets, or raise "
+      "max_cells (at most 16000000)",
+      {{"pointer", "/resolution"},
+       {"cells", totalCells},
+       {"max_cells", qint64(maxCells)}});
+  }
+
+  auto graph = WalkGraph{params, *box, origin, std::move(solids)};
+
+  const auto start = snapToFloor(graph, from.value());
+  if (!start.position)
+  {
+    auto details = QJsonObject{{"pointer", "/from"}, {"reason", start.reason}};
+    if (start.standingPoint)
+    {
+      details["standing_point"] = toJson(*start.standingPoint);
+    }
+    if (start.clearance)
+    {
+      details["clearance"] = *start.clearance;
+    }
+    return toolError(
+      "invalid_argument",
+      QString{"from is not a standable position: %1"}.arg(start.message),
+      "pass the player's feet position on a floor (z of the floor surface) with room for "
+      "the hull",
+      details);
+  }
+
+  auto failures = std::vector<WalkFailure>{};
+  const auto parents = walkSearch(graph, *start.position, failures);
+  // the way that exceeds the step and drop limits the least, computed when needed
+  auto relaxed = std::optional<WalkParents>{};
+
+  const auto fromPoint = *start.standingPoint;
+  const auto& positions = graph.positions();
+  auto reachedCount = size_t(0);
+  for (size_t p = 0; p < parents.size(); ++p)
+  {
+    reachedCount += isReached(parents, p) ? 1 : 0;
+  }
+
+  auto targetsJson = QJsonArray{};
+  auto reachableCount = 0;
+  for (size_t t = 0; t < targets.size(); ++t)
+  {
+    const auto& target = targets[t];
+    const auto snap = snapToFloor(graph, target);
+    auto json = QJsonObject{
+      {"target", toJson(target)},
+      {"standing_point", snap.standingPoint ? toJson(*snap.standingPoint) : QJsonValue{}},
+    };
+
+    if (snap.standingPoint && target.z() - snap.standingPoint->z() > params.step)
+    {
+      context.warnings.push_back(
+        QString{"target %1 is %2 units above its floor and was moved down to it"}
+          .arg(t)
+          .arg(canon(target.z() - snap.standingPoint->z())));
+    }
+
+    if (snap.position && isReached(parents, *snap.position))
+    {
+      ++reachableCount;
+      const auto path = walkPathTo(parents, *snap.position);
+      auto centers = std::vector<vm::vec3d>{};
+      auto length = 0.0;
+      for (size_t i = 1; i < path.size(); ++i)
+      {
+        centers.push_back(graph.point(positions[path[i]]));
+        length += vm::length(
+          graph.point(positions[path[i]]) - graph.point(positions[path[i - 1]]));
+      }
+      auto pathJson = QJsonArray{};
+      for (const auto& point : leakPath(fromPoint, centers))
+      {
+        pathJson.append(toJson(point));
+      }
+      json["reachable"] = true;
+      json["path"] = pathJson;
+      json["path_length"] = canon(length);
+      targetsJson.append(json);
+      continue;
+    }
+
+    json["reachable"] = false;
+
+    // the reachable position nearest to the target
+    auto nearest = size_t(*start.position);
+    auto nearestDistance = vm::length(graph.point(positions[nearest]) - target);
+    for (size_t p = 0; p < parents.size(); ++p)
+    {
+      const auto distance = vm::length(graph.point(positions[p]) - target);
+      if (isReached(parents, p) && distance < nearestDistance - 1e-9)
+      {
+        nearest = p;
+        nearestDistance = distance;
+      }
+    }
+    json["nearest_reachable_point"] = toJson(graph.point(positions[nearest]));
+    json["distance"] = canon(nearestDistance);
+
+    auto blocker = std::optional<WalkBlocker>{};
+    if (!snap.position)
+    {
+      auto details = QJsonObject{{"reason", snap.reason}, {"message", snap.message}};
+      if (snap.clearance)
+      {
+        details["clearance"] = *snap.clearance;
+      }
+      blocker =
+        WalkBlocker{"not_standable", snap.standingPoint.value_or(target), details};
+    }
+    else
+    {
+      // the failed moves from the reachable positions nearest to the target into
+      // columns that are not reachable at all
+      // by kind, then by distance to the target, then in search order
+      auto best = std::optional<std::tuple<int, double, size_t>>{};
+      const auto unreached = [&](const WalkFailure& failure) {
+        if (!failure.column)
+        {
+          return true;
+        }
+        const auto& c = graph.column(*failure.column);
+        return std::ranges::none_of(c.positions, [&](const auto q) {
+          return q >= 0 && isReached(parents, size_t(q));
+        });
+      };
+      auto minDistance = std::numeric_limits<double>::max();
+      for (const auto& failure : failures)
+      {
+        if (unreached(failure))
+        {
+          minDistance = std::min(
+            minDistance, vm::length(graph.point(positions[failure.position]) - target));
+        }
+      }
+      for (size_t f = 0; f < failures.size(); ++f)
+      {
+        const auto& failure = failures[f];
+        if (
+          !unreached(failure)
+          || vm::length(graph.point(positions[failure.position]) - target)
+               > minDistance + 1e-6)
+        {
+          continue;
+        }
+        auto candidate = classifyFailure(graph, failure);
+        const auto key = std::tuple{
+          blockerPriority(candidate.kind), vm::length(candidate.at - target), f};
+        if (!best || key < *best)
+        {
+          best = key;
+          blocker = std::move(candidate);
+        }
+      }
+
+      // Unless the nearest failure is a lack of headroom, the first move that is too high
+      // or too deep on the way that exceeds the limits the least names the blocker.
+      if (!blocker || blocker->kind != u"headroom")
+      {
+        if (!relaxed)
+        {
+          relaxed = walkMinimaxSearch(graph, *start.position);
+        }
+        if (isReached(*relaxed, *snap.position))
+        {
+          const auto path = walkPathTo(*relaxed, *snap.position);
+          for (size_t i = 1; i < path.size(); ++i)
+          {
+            const auto& p = positions[path[i - 1]];
+            const auto& q = positions[path[i]];
+            if (!WalkGraph::inReach(p.z, q.z, params.step, params.drop))
+            {
+              const auto rise = q.z - p.z;
+              auto details = QJsonObject{{"from", toJson(graph.point(p))}};
+              if (rise > 0)
+              {
+                details["rise"] = canon(rise);
+                details["step_height"] = canon(params.step);
+                details["message"] =
+                  QString{"the floor rises by %1 units, more than step_height %2"}
+                    .arg(canon(rise))
+                    .arg(canon(params.step));
+              }
+              else
+              {
+                details["drop"] = canon(-rise);
+                details["max_drop"] = canon(params.drop);
+                details["message"] =
+                  QString{"the floor drops by %1 units, more than max_drop %2"}
+                    .arg(canon(-rise))
+                    .arg(canon(params.drop));
+              }
+              blocker =
+                WalkBlocker{rise > 0 ? "step_too_high" : "gap", graph.point(q), details};
+              break;
+            }
+          }
+        }
+      }
+    }
+
+    json["blocker"] = blocker ? QJsonValue{blockerJson(*blocker)} : QJsonValue{};
+    targetsJson.append(json);
+  }
+
+  return QJsonObject{
+    {"from",
+     QJsonObject{{"point", toJson(from.value())}, {"standing_point", toJson(fromPoint)}}},
+    {"targets", targetsJson},
+    {"reachable_count", reachableCount},
+    {"unreachable_count", qint64(targets.size()) - reachableCount},
+    {"model",
+     QJsonObject{
+       {"hull",
+        QJsonObject{{"width", canon(params.width)}, {"height", canon(params.height)}}},
+       {"step_height", canon(params.step)},
+       {"max_drop", canon(params.drop)},
+       {"resolution", canon(params.resolution)},
+     }},
+    {"bounds", toJson(*box)},
+    {"stats",
+     QJsonObject{
+       {"solid_brushes", qint64(graph.solidCount())},
+       {"grid", QJsonArray{qint64(nx), qint64(ny), qint64(nz)}},
+       {"cells", totalCells},
+       {"columns_evaluated", qint64(graph.columnsEvaluated())},
+       {"positions_found", qint64(positions.size())},
+       {"positions_reachable", qint64(reachedCount)},
+     }},
+  };
+}
+
+McpToolDef checkWalkableTool()
+{
+  return {
+    .name = "check_walkable",
+    .title = "Check Walkable",
+    .description =
+      "Can the player walk from 'from' to each point in 'to'? All values are world "
+      "units; points are FEET positions (z of the floor surface; a point above a floor "
+      "is moved down to it; if the hull does not fit there, it is moved up by at most "
+      "step_height onto a higher floor the hull rests on, such as the next stair's "
+      "edge; see standing_point). Model (conservative and deterministic): solid = "
+      "world brushes incl. grouped ones plus func_group, func_detail* and func_wall "
+      "brushes "
+      "(doors, triggers and other brush entities count as open; layers omitted from "
+      "export are ignored; materials are not considered). Positions are the hull "
+      "(width x width x height, default 32x32x56) standing on a brush top on a grid of "
+      "resolution spaced columns through 'from' with no solid inside the hull. The "
+      "player moves to the 4 neighbour columns if the floor rises by at most "
+      "step_height (18) or drops by at most max_drop (256) and the hull is free along "
+      "the move; no jumping, crouching, swimming or ladders, and slopes count as "
+      "steps. A reachable target has a path (at most 64 corner points) and "
+      "path_length; an unreachable one has nearest_reachable_point, distance and a "
+      "blocker {kind: headroom (clearance), step_too_high (rise), gap (drop or no "
+      "floor) or not_standable (reason inside_solid, no_floor, no_headroom, blocked, "
+      "outside_bounds), at, details}. Errors if 'from' itself is not standable. "
+      "Verify a fix by calling it again; query_point and describe_region show what is "
+      "at 'at'.",
+    .inputSchema = schema::object(
+      {
+        {"from", schema::vec3("the player's feet position to start from")},
+        {"to",
+         schema::array(schema::vec3(), 1, MaxWalkTargets, "feet positions to reach")},
+        {"hull",
+         schema::object({
+           {"width", schema::number(1, 1024, "hull width and depth (default 32)")},
+           {"height", schema::number(1, 1024, "hull height (default 56)")},
+         })},
+        {"step_height",
+         schema::number(0, 1024, "highest step the player climbs (default 18)")},
+        {"max_drop",
+         schema::number(0, 65536, "deepest drop the player takes (default 256)")},
+        {"resolution",
+         schema::number(
+           1, MaxWalkResolution, "column spacing, at most the hull width (default 8)")},
+        {"bounds",
+         schema::bounds(
+           "the region to search (default: all solid brushes, from and the targets plus "
+           "a margin)")},
+        {"max_cells",
+         schema::integer(
+           1,
+           MaxWalkMaxCells,
+           "most columns x height levels of resolution size, counting at least the "
+           "hull height (default 4000000, at most 16000000)")},
+      },
+      {"from", "to"}),
+    .kind = McpToolKind::Read,
+    .annotations = ReadOnly,
+    .allowedInBatch = true,
+    .run = checkWalkable,
+  };
+}
+
 } // namespace
 
 void registerMcpMapEvalTools(McpToolDispatcher& dispatcher)
@@ -2069,6 +3381,7 @@ void registerMcpMapEvalTools(McpToolDispatcher& dispatcher)
   dispatcher.add(queryPointTool());
   dispatcher.add(checkBrushOverlapsTool());
   dispatcher.add(checkLeaksTool());
+  dispatcher.add(checkWalkableTool());
 }
 
 } // namespace tb::ui

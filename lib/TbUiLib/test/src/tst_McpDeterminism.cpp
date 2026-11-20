@@ -215,6 +215,9 @@ TEST_CASE("McpDeterminism")
       "describe_region", R"({"bounds":{"min":[1000,-100,-100],"max":[1300,300,200]}})"},
     Call{"check_leaks", R"({"resolution":16})"},
     Call{
+      "check_walkable",
+      R"({"from":[1100,140,100],"to":[[1100,100,0],[1100,160,40],[1300,0,0]]})"},
+    Call{
       "batch",
       R"({"dry_run":true,"operations":[{"tool":"delete_nodes","arguments":{"ids":["B2"]}},
                                       {"tool":"get_map_stats"}]})"},

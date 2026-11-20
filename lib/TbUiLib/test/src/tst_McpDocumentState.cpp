@@ -38,9 +38,10 @@ TEST_CASE("McpDocumentState")
   CHECK(doc.documentId == QStringLiteral("d7"));
   CHECK(doc.nodes.liveCount() == 2);
   CHECK(doc.nodes.verifyBijection());
-  CHECK(doc.history.undoStack().empty());
-  // the history model does not know the command that added the brush
-  CHECK_FALSE(doc.history.consistent());
+  // the command that added the brush is modelled by a non-MCP placeholder
+  CHECK(doc.history.undoStack().size() == 1);
+  CHECK_FALSE(doc.history.undoStack().front().mcp);
+  CHECK(doc.history.consistent());
   CHECK(doc.checkpoints.size() == 0);
   CHECK(doc.logHistory.lines().empty());
 }

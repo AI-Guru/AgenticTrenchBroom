@@ -307,6 +307,32 @@ TEST_CASE("McpMapHistoryTools")
       CHECK(f.err("get_nodes", R"({"ids":["E3"]})") == "stale_node");
     }
 
+    SECTION("works if the document had user history before the first MCP call")
+    {
+      // the user edits and undoes in the GUI, then an agent connects
+      mdl::selectNodes(f.map, {scene.wall});
+      REQUIRE(mdl::translateSelection(f.map, {16, 0, 0}));
+      REQUIRE(mdl::translateSelection(f.map, {16, 0, 0}));
+      mdl::deselectAll(f.map);
+      f.map.undoCommand();
+      REQUIRE(f.map.canRedoCommand());
+      f.doc = std::make_unique<McpDocumentState>(f.map, "d1");
+      const auto wallId = f.id(*scene.wall);
+
+      f.ok("checkpoint_create", R"({"name":"start"})");
+      const auto digest = contentDigest(f.doc->nodes, f.map);
+      f.ok(
+        "transform_nodes",
+        QJsonObject{{"ids", QJsonArray{wallId}}, {"translate", QJsonArray{0, 0, 32}}});
+
+      const auto result = f.ok("checkpoint_revert", R"({"name":"start"})");
+      CHECK(result.value("undone") == QJsonValue{QJsonArray{"MCP: Transform Nodes"}});
+      CHECK(contentDigest(f.doc->nodes, f.map) == digest);
+      // the user's own step is still there
+      CHECK(f.map.canUndoCommand());
+      CHECK(*f.map.undoCommandName() != "MCP: Transform Nodes");
+    }
+
     SECTION("nothing to revert")
     {
       f.ok("checkpoint_create", R"({"name":"now"})");

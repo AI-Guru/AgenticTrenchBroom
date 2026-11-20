@@ -73,6 +73,10 @@ public:
     bool operator==(const Entry&) const = default;
   };
 
+  /**
+   * Starts tracking the history of the given map. If the map already has undo or redo
+   * history, the top of each stack is modelled by one non-MCP placeholder entry.
+   */
   explicit McpHistoryTracker(mdl::Map& map);
   ~McpHistoryTracker();
 

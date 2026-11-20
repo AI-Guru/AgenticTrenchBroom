@@ -303,17 +303,33 @@ TEST_CASE("McpHistoryTracker")
       CHECK(history.consistent());
     }
 
+    SECTION("a tracker created late models the existing history with placeholders")
+    {
+      addBrushIn(map, "User A", {{0, 0, 0}, {16, 16, 16}});
+      addBrushIn(map, "User B", {{32, 0, 0}, {48, 16, 16}});
+      map.undoCommand();
+      auto lateTracker = McpHistoryTracker{map};
+      CHECK(lateTracker.consistent());
+      CHECK(labels(lateTracker.undoStack()) == std::vector<std::string>{"User A"});
+      CHECK(labels(lateTracker.redoStack()) == std::vector<std::string>{"User B"});
+      CHECK(lateTracker.mcpDepth() == 0);
+      CHECK_FALSE(lateTracker.undoStack().front().mcp);
+
+      addBrushIn(map, "MCP: C", {{64, 0, 0}, {80, 16, 16}});
+      CHECK(lateTracker.consistent());
+      CHECK(
+        labels(lateTracker.undoStack()) == std::vector<std::string>{"User A", "MCP: C"});
+      CHECK(lateTracker.redoStack().empty());
+    }
+
     SECTION("false if the tracker missed commands")
     {
       addBrushIn(map, "MCP: A", {{0, 0, 0}, {16, 16, 16}});
-      auto lateTracker = McpHistoryTracker{map};
-      CHECK_FALSE(lateTracker.consistent());
-
-      // only the top entries are compared
       addBrushIn(map, "MCP: B", {{32, 0, 0}, {48, 16, 16}});
+      auto lateTracker = McpHistoryTracker{map};
       CHECK(lateTracker.consistent());
 
-      map.undoCommand();
+      // only the top entry is modelled; undoing below it is noticed
       map.undoCommand();
       CHECK(lateTracker.undoStack().empty());
       CHECK(labels(lateTracker.redoStack()) == std::vector<std::string>{"MCP: B"});

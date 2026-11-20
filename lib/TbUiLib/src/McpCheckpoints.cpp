@@ -65,6 +65,22 @@ McpHistoryTracker::McpHistoryTracker(mdl::Map& map)
     this, &McpHistoryTracker::transactionDone);
   m_notifierConnection += commandProcessor.transactionUndoneNotifier.connect(
     this, &McpHistoryTracker::transactionUndone);
+
+  // The tracker is created on the first MCP call for a document, which may already have
+  // undo or redo history. Model the top of each stack with a non-MCP placeholder, so
+  // that the model agrees with the map and checkpoints taken now can be reverted. The
+  // placeholders are never undone by checkpoint_revert because they are not MCP entries;
+  // undoing past them makes the model inconsistent, which only causes refusals.
+  if (const auto* undoName = m_map.undoCommandName())
+  {
+    m_undoStack.push_back(
+      Entry{.serial = m_nextSerial++, .label = *undoName, .mcp = false});
+  }
+  if (const auto* redoName = m_map.redoCommandName())
+  {
+    m_redoStack.push_back(
+      Entry{.serial = m_nextSerial++, .label = *redoName, .mcp = false});
+  }
 }
 
 McpHistoryTracker::~McpHistoryTracker() = default;

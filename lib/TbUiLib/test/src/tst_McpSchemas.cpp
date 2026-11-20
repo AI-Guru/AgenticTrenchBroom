@@ -150,16 +150,10 @@ TEST_CASE("McpSchemas")
     CHECK_FALSE(valid(schema::faceRef(), R"({"brush":"B1","index":-1})"));
   }
 
-  SECTION("material and propValue")
+  SECTION("material")
   {
     CHECK(valid(schema::material(), R"("base")"));
     CHECK_FALSE(valid(schema::material(), R"("")"));
-    CHECK(valid(schema::propValue(), R"("x")"));
-    CHECK(valid(schema::propValue(), "3"));
-    CHECK(valid(schema::propValue(), "true"));
-    CHECK(valid(schema::propValue(), "[1,2,3]"));
-    CHECK_FALSE(valid(schema::propValue(), "{}"));
-    CHECK_FALSE(valid(schema::propValue(), "null"));
   }
 
   SECTION("addPaging")
@@ -191,8 +185,7 @@ TEST_CASE("McpSchemas")
           schema::side(),
           schema::axis(),
           schema::faceRef(),
-          schema::material(),
-          schema::propValue()})
+          schema::material()})
     {
       CAPTURE(compactJson(schema));
       CHECK(mcp::usesOnlySupportedKeywords(schema));

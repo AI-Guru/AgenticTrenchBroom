@@ -94,9 +94,6 @@ QJsonObject faceRef(const QString& description = {});
 /** A material name. */
 QJsonObject material(const QString& description = {});
 
-/** A string, number, boolean or array value for an entity property. */
-QJsonObject propValue(const QString& description = {});
-
 /** Adds the paging properties offset and limit to the given properties. */
 void addPaging(QJsonObject& properties);
 

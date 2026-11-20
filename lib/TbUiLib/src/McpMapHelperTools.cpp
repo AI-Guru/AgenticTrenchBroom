@@ -51,6 +51,7 @@
 #include "ui/McpMapTools.h"
 #include "ui/McpPreconditions.h"
 #include "ui/McpSchemas.h"
+#include "ui/McpSelectionGuard.h"
 #include "ui/McpToolDispatcher.h"
 
 #include "kd/overload.h"
@@ -85,11 +86,6 @@ constexpr auto MinSize = 0.001;
 constexpr auto MaxSize = 65536.0;
 
 // shared by the helper tools
-
-std::optional<QString> optionalString(const QJsonObject& args, const QString& key)
-{
-  return args.contains(key) ? std::optional{args.value(key).toString()} : std::nullopt;
-}
 
 /** Returns the material named by the first of the given keys that is present. */
 McpResult<std::string> materialArgument(
@@ -250,26 +246,6 @@ McpResult<QString> groupNewNodes(
     return toolError("operation_failed", "the brushes could not be grouped");
   }
   return doc.nodes.idOf(*groupNode);
-}
-
-QJsonArray idsOf(const McpNodeRegistry& registry, const auto& nodes)
-{
-  auto result = QJsonArray{};
-  for (const auto* node : nodes)
-  {
-    result.append(registry.idOf(*node));
-  }
-  return result;
-}
-
-/** Replaces the selection with the given nodes. */
-void selectOnly(mdl::Map& map, const std::vector<mdl::Node*>& nodes)
-{
-  mdl::deselectAll(map);
-  if (!nodes.empty())
-  {
-    mdl::selectNodes(map, nodes);
-  }
 }
 
 size_t sideAxis(const QString& side)
@@ -940,19 +916,6 @@ McpResult<std::vector<MoveUnit>> resolveMoveUnits(
     return errorOf(check);
   }
   return result;
-}
-
-McpResult<void> requireNoVertexHandlesSelected(const mdl::Map& map)
-{
-  if (map.nodeHandles().anyHandleSelected<mdl::VertexHandle>())
-  {
-    return toolError(
-      "editor_busy",
-      "brush vertices are selected in the vertex tool",
-      "ask the user to exit the vertex/clip tool",
-      {{"reason", "modal_tool_active"}});
-  }
-  return kdl::void_success;
 }
 
 QJsonObject movedJson(const QString& id, const vm::vec3d& delta)

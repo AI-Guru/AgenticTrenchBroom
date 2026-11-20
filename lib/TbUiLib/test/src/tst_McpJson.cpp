@@ -99,23 +99,6 @@ TEST_CASE("McpJson")
     CHECK(fromUnicode(map, unicode) == bytes);
   }
 
-  SECTION("sha256Hex")
-  {
-    const auto digest = sha256Hex(QJsonObject{{"a", 1}});
-    CHECK(digest.size() == 64);
-    CHECK(digest == sha256Hex(QJsonObject{{"a", 1}}));
-    CHECK(digest != sha256Hex(QJsonObject{{"a", 2}}));
-
-    // SHA-256 of the compact text {"a":1}
-    CHECK(
-      digest
-      == QStringLiteral(
-        "015abd7f5cc57a2dd94b7590f04ad8084273905ee33ec5cebeae62276a97f862"));
-
-    // scalars are wrapped in an array
-    CHECK(sha256Hex(QJsonValue{1}) == sha256Hex(QJsonArray{1}));
-  }
-
   SECTION("sideName")
   {
     CHECK(sideName(vm::vec3d{1, 0, 0}) == QStringLiteral("+x"));

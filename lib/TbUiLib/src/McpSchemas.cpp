@@ -215,12 +215,6 @@ QJsonObject material(const QString& description)
   return string(1, 256, description);
 }
 
-QJsonObject propValue(const QString& description)
-{
-  return withDescription(
-    {{"type", QJsonArray{"string", "number", "boolean", "array"}}}, description);
-}
-
 void addPaging(QJsonObject& properties)
 {
   properties["offset"] = QJsonObject{

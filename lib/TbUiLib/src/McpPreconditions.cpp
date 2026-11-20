@@ -37,6 +37,8 @@
 #include "mdl/LinkedGroupUtils.h"
 #include "mdl/Map.h"
 #include "mdl/Map_Nodes.h"
+#include "mdl/NodeHandleManager.h"
+#include "mdl/NodeHandles.h"
 #include "mdl/PatchNode.h"
 #include "mdl/Selection.h"
 #include "mdl/WorldNode.h"
@@ -883,6 +885,19 @@ McpResult<QString> propValueText(const QJsonValue& value, const QString& pointer
     return error;
   }
   return *text;
+}
+
+McpResult<void> requireNoVertexHandlesSelected(const mdl::Map& map)
+{
+  if (map.nodeHandles().anyHandleSelected<mdl::VertexHandle>())
+  {
+    return toolError(
+      "editor_busy",
+      "brush vertices are selected in the vertex tool",
+      "ask the user to exit the vertex/clip tool",
+      {{"reason", "modal_tool_active"}});
+  }
+  return kdl::void_success;
 }
 
 McpResult<void> checkEntityPropertyKeyNotReserved(

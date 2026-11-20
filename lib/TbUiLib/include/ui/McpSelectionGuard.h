@@ -34,6 +34,9 @@ namespace tb::ui
 {
 class McpNodeRegistry;
 
+/** Replaces the selection of the map with the given nodes (none: deselects all). */
+void selectOnly(mdl::Map& map, const std::vector<mdl::Node*>& nodes);
+
 /**
  * Saves the selection of a map and restores it later. Replaces mdl::PushSelection for
  * MCP tools: restoring checks every saved node against the registry before touching it,

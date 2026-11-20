@@ -34,6 +34,7 @@
 #include "ui/McpMapTools.h"
 #include "ui/McpPreconditions.h"
 #include "ui/McpSchemas.h"
+#include "ui/McpSelectionGuard.h"
 #include "ui/McpToolDispatcher.h"
 
 #include <algorithm>
@@ -185,16 +186,6 @@ const auto Mutating =
 
 constexpr auto MaxNameLength = 128;
 
-QJsonArray idsOf(const McpNodeRegistry& registry, const auto& nodes)
-{
-  auto result = QJsonArray{};
-  for (const auto* node : nodes)
-  {
-    result.append(registry.idOf(*node));
-  }
-  return result;
-}
-
 McpResult<std::string> nameArgument(
   const mdl::Map& map, const QJsonObject& args, const QString& key)
 {
@@ -206,16 +197,6 @@ McpResult<std::string> nameArgument(
     return error;
   }
   return fromUnicode(map, name);
-}
-
-/** Replaces the selection with the given nodes. */
-void selectOnly(mdl::Map& map, const std::vector<mdl::Node*>& nodes)
-{
-  mdl::deselectAll(map);
-  if (!nodes.empty())
-  {
-    mdl::selectNodes(map, nodes);
-  }
 }
 
 // group_nodes

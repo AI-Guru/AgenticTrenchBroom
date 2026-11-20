@@ -235,6 +235,12 @@ McpResult<void> checkEntityPropertyValue(
  * read-only in the entity inspector and parsed without validation. Returns
  * invalid_argument with the pointer.
  */
+/**
+ * Returns editor_busy (reason modal_tool_active) if brush vertices are selected in the
+ * vertex tool: transforming the selected nodes would then move the vertices instead.
+ */
+McpResult<void> requireNoVertexHandlesSelected(const mdl::Map& map);
+
 McpResult<void> checkEntityPropertyKeyNotReserved(
   const QString& key, const QString& pointer);
 

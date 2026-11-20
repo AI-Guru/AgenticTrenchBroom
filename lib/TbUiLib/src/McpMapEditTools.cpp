@@ -51,6 +51,7 @@
 #include "ui/McpMapTools.h"
 #include "ui/McpPreconditions.h"
 #include "ui/McpSchemas.h"
+#include "ui/McpSelectionGuard.h"
 #include "ui/McpToolDispatcher.h"
 
 #include "kd/string_compare.h"
@@ -154,29 +155,6 @@ QJsonArray propertiesJson(const mdl::Map& map, const mdl::Entity& entity)
     });
   }
   return result;
-}
-
-McpResult<void> requireNoVertexHandlesSelected(const mdl::Map& map)
-{
-  if (map.nodeHandles().anyHandleSelected<mdl::VertexHandle>())
-  {
-    return toolError(
-      "editor_busy",
-      "brush vertices are selected in the vertex tool",
-      "ask the user to exit the vertex/clip tool",
-      {{"reason", "modal_tool_active"}});
-  }
-  return kdl::void_success;
-}
-
-/** Replaces the selection with the given nodes. */
-void selectOnly(mdl::Map& map, const std::vector<mdl::Node*>& nodes)
-{
-  mdl::deselectAll(map);
-  if (!nodes.empty())
-  {
-    mdl::selectNodes(map, nodes);
-  }
 }
 
 // transform_nodes
@@ -1264,16 +1242,6 @@ McpToolDef setFaceAttributesTool()
 }
 
 // shared by the brush editing tools
-
-QJsonArray idsOf(const McpNodeRegistry& registry, const auto& nodes)
-{
-  auto result = QJsonArray{};
-  for (const auto* node : nodes)
-  {
-    result.append(registry.idOf(*node));
-  }
-  return result;
-}
 
 
 /**

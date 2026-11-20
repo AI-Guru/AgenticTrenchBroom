@@ -34,6 +34,15 @@
 namespace tb::ui
 {
 
+void selectOnly(mdl::Map& map, const std::vector<mdl::Node*>& nodes)
+{
+  mdl::deselectAll(map);
+  if (!nodes.empty())
+  {
+    mdl::selectNodes(map, nodes);
+  }
+}
+
 McpSelectionGuard::McpSelectionGuard(mdl::Map& map, const McpNodeRegistry& registry)
   : m_map{map}
   , m_registry{registry}

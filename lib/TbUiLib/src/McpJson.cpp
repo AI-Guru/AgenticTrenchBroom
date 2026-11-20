@@ -19,9 +19,6 @@
 
 #include "ui/McpJson.h"
 
-#include <QCryptographicHash>
-#include <QJsonDocument>
-
 #include "mdl/BezierPatch.h"
 #include "mdl/Brush.h"
 #include "mdl/BrushFace.h"
@@ -35,6 +32,7 @@
 #include "mdl/Map.h"
 #include "mdl/PatchNode.h"
 #include "mdl/Selection.h"
+#include "mdl/SurfaceAttributes.h"
 #include "mdl/WorldNode.h"
 #include "ui/McpNodeRegistry.h"
 #include "ui/QStringUtils.h"
@@ -44,6 +42,7 @@
 #include "vm/vec.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <set>
 
@@ -91,15 +90,49 @@ std::string fromUnicode(const mdl::Map& map, const QString& str)
   return mapStringFromUnicode(map.encoding(), str);
 }
 
-QString sha256Hex(const QJsonValue& value)
+QJsonArray sortedVertices(const std::vector<vm::vec3d>& positions)
 {
-  const auto document = value.isObject()  ? QJsonDocument{value.toObject()}
-                        : value.isArray() ? QJsonDocument{value.toArray()}
-                                          : QJsonDocument{QJsonArray{value}};
-  return QString::fromLatin1(
-    QCryptographicHash::hash(
-      document.toJson(QJsonDocument::Compact), QCryptographicHash::Sha256)
-      .toHex());
+  auto canonical = std::vector<std::array<double, 3>>{};
+  canonical.reserve(positions.size());
+  for (const auto& p : positions)
+  {
+    canonical.push_back({canon(p.x()), canon(p.y()), canon(p.z())});
+  }
+  std::ranges::sort(canonical);
+
+  auto result = QJsonArray{};
+  for (const auto& p : canonical)
+  {
+    result.append(QJsonArray{p[0], p[1], p[2]});
+  }
+  return result;
+}
+
+QJsonObject surfaceJson(const mdl::SurfaceAttributes& surface)
+{
+  auto result = QJsonObject{};
+  if (surface.contents)
+  {
+    result["contents"] = *surface.contents;
+  }
+  if (surface.flags)
+  {
+    result["flags"] = *surface.flags;
+  }
+  if (surface.value)
+  {
+    result["value"] = canon(double(*surface.value));
+  }
+  if (surface.color)
+  {
+    result["color"] = QString::fromStdString(surface.color->toString());
+  }
+  return result;
+}
+
+std::optional<QString> optionalString(const QJsonObject& args, const QString& key)
+{
+  return args.contains(key) ? std::optional{args.value(key).toString()} : std::nullopt;
 }
 
 std::optional<QString> sideName(const vm::vec3d& normal)

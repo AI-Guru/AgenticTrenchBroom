@@ -19,6 +19,7 @@
 
 #include "gl/Material.h"
 #include "gl/MaterialManager.h"
+#include "mcp/Server.h"
 #include "mdl/BezierPatch.h"
 #include "mdl/Brush.h"
 #include "mdl/BrushFace.h"
@@ -87,16 +88,6 @@ QJsonValue idOrNull(const McpNodeRegistry& registry, const mdl::Node* node)
   return node ? QJsonValue{registry.idOf(*node)} : QJsonValue{};
 }
 
-QJsonArray idArray(const McpNodeRegistry& registry, const auto& nodes)
-{
-  auto result = QJsonArray{};
-  for (const auto* node : nodes)
-  {
-    result.append(registry.idOf(*node));
-  }
-  return result;
-}
-
 /** Returns the given page of the given items and adds total, truncated and next_offset.
  */
 QJsonArray page(const QJsonArray& items, const QJsonObject& args, QJsonObject& result)
@@ -161,24 +152,6 @@ QJsonObject brushValidity(const mdl::Map& map, const mdl::Brush& brush)
   };
 }
 
-QJsonArray sortedVertices(const std::vector<vm::vec3d>& positions)
-{
-  auto canonical = std::vector<std::array<double, 3>>{};
-  canonical.reserve(positions.size());
-  for (const auto& p : positions)
-  {
-    canonical.push_back({canon(p.x()), canon(p.y()), canon(p.z())});
-  }
-  std::ranges::sort(canonical);
-
-  auto result = QJsonArray{};
-  for (const auto& p : canonical)
-  {
-    result.append(QJsonArray{p[0], p[1], p[2]});
-  }
-  return result;
-}
-
 QJsonArray vertexArray(const std::vector<vm::vec3d>& positions)
 {
   auto result = QJsonArray{};
@@ -198,24 +171,6 @@ QJsonArray entityProperties(const mdl::Map& map, const mdl::Entity& entity)
       {"key", toUnicode(map, property.key())},
       {"value", toUnicode(map, property.value())},
     });
-  }
-  return result;
-}
-
-QJsonObject surfaceJson(const mdl::SurfaceAttributes& surface)
-{
-  auto result = QJsonObject{};
-  if (surface.contents)
-  {
-    result["contents"] = *surface.contents;
-  }
-  if (surface.flags)
-  {
-    result["flags"] = *surface.flags;
-  }
-  if (surface.value)
-  {
-    result["value"] = canon(double(*surface.value));
   }
   return result;
 }
@@ -448,7 +403,7 @@ QJsonObject nodeDetail(
     physicalBounds ? QJsonValue{toJson(*physicalBounds)} : QJsonValue{};
   result["line_number"] =
     node.lineNumber() > 0 ? QJsonValue{qint64(node.lineNumber())} : QJsonValue{};
-  result["child_ids"] = idArray(registry, node.children());
+  result["child_ids"] = idsOf(registry, node.children());
 
   node.accept(kdl::overload(
     [&](const mdl::WorldNode& worldNode) {
@@ -1108,30 +1063,6 @@ McpToolDef listEntityDefinitionsTool()
 
 // get_entity_definition
 
-size_t editDistance(const QString& lhs, const QString& rhs)
-{
-  auto previous = std::vector<size_t>(size_t(rhs.size()) + 1);
-  auto current = std::vector<size_t>(size_t(rhs.size()) + 1);
-  for (size_t j = 0; j < previous.size(); ++j)
-  {
-    previous[j] = j;
-  }
-  for (qsizetype i = 0; i < lhs.size(); ++i)
-  {
-    current[0] = size_t(i) + 1;
-    for (qsizetype j = 0; j < rhs.size(); ++j)
-    {
-      const auto cost = lhs[i].toLower() == rhs[j].toLower() ? 0u : 1u;
-      current[size_t(j) + 1] = std::min(
-        {previous[size_t(j) + 1] + 1,
-         current[size_t(j)] + 1,
-         previous[size_t(j)] + cost});
-    }
-    std::swap(previous, current);
-  }
-  return previous.back();
-}
-
 QString propertyKind(const mdl::PropertyValueType& valueType)
 {
   return std::visit(
@@ -1219,7 +1150,7 @@ McpResult<QJsonObject> getEntityDefinition(
     for (const auto* other : sortedDefinitions(map))
     {
       const auto name = toUnicode(map, other->name);
-      candidates.emplace_back(editDistance(classname, name), name);
+      candidates.emplace_back(mcp::editDistance(classname, name), name);
     }
     std::ranges::stable_sort(
       candidates, [](const auto& lhs, const auto& rhs) { return lhs.first < rhs.first; });

@@ -75,11 +75,6 @@ namespace
 const auto Mutating =
   mcp::ToolAnnotations{.readOnly = false, .destructive = false, .idempotent = false};
 
-std::optional<QString> optionalString(const QJsonObject& args, const QString& key)
-{
-  return args.contains(key) ? std::optional{args.value(key).toString()} : std::nullopt;
-}
-
 /** Returns the material argument or the current material. */
 McpResult<std::string> materialArgument(
   const mdl::Map& map, const QJsonObject& args, const QString& key)

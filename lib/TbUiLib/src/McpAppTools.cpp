@@ -183,11 +183,6 @@ McpResult<void> toToolResult(const Result<void>& result, const F& makeError)
   return kdl::void_success;
 }
 
-std::optional<QString> optionalString(const QJsonObject& args, const QString& key)
-{
-  return args.contains(key) ? std::optional{args.value(key).toString()} : std::nullopt;
-}
-
 McpResult<std::filesystem::path> absolutePath(const QString& text, const QString& pointer)
 {
   auto path = pathFromQString(text);

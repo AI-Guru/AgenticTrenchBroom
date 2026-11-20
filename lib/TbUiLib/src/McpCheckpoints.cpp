@@ -321,45 +321,6 @@ QJsonArray matrixJson(const vm::mat4x4d& matrix)
   return result;
 }
 
-QJsonArray sortedVertices(const std::vector<vm::vec3d>& positions)
-{
-  auto canonical = std::vector<std::array<double, 3>>{};
-  canonical.reserve(positions.size());
-  for (const auto& p : positions)
-  {
-    canonical.push_back({canon(p.x()), canon(p.y()), canon(p.z())});
-  }
-  std::ranges::sort(canonical);
-
-  auto result = QJsonArray{};
-  for (const auto& p : canonical)
-  {
-    result.append(QJsonArray{p[0], p[1], p[2]});
-  }
-  return result;
-}
-
-QJsonObject surfaceJson(const mdl::SurfaceAttributes& surface)
-{
-  auto result = QJsonObject{};
-  if (surface.contents)
-  {
-    result["contents"] = *surface.contents;
-  }
-  if (surface.flags)
-  {
-    result["flags"] = *surface.flags;
-  }
-  if (surface.value)
-  {
-    result["value"] = canon(double(*surface.value));
-  }
-  if (surface.color)
-  {
-    result["color"] = QString::fromStdString(surface.color->toString());
-  }
-  return result;
-}
 
 QJsonObject faceJson(const mdl::Map& map, const mdl::BrushFace& face)
 {

@@ -24,18 +24,22 @@
 #include <QJsonValue>
 #include <QString>
 
+#include "ui/McpNodeRegistry.h"
+
 #include "vm/bbox.h"
 #include "vm/plane.h"
 #include "vm/vec.h"
 
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace tb::mdl
 {
 class Brush;
 class Map;
 class Node;
+struct SurfaceAttributes;
 } // namespace tb::mdl
 
 namespace tb::ui
@@ -59,17 +63,34 @@ QJsonObject toJson(const vm::bbox3d& bounds);
 /** Returns {"normal":[x,y,z],"distance":d}. */
 QJsonObject toJson(const vm::plane3d& plane);
 
+/**
+ * Returns the given positions as canonical [x,y,z] arrays (see canon), sorted. Checkpoint
+ * digests and get_brush_geometry use this, so equal geometry gives equal output.
+ */
+QJsonArray sortedVertices(const std::vector<vm::vec3d>& positions);
+
+/** Returns the set surface attributes: contents, flags, value and color. */
+QJsonObject surfaceJson(const mdl::SurfaceAttributes& surface);
+
+/** Returns the string argument with the given key, or nullopt if it is absent. */
+std::optional<QString> optionalString(const QJsonObject& args, const QString& key);
+
+/** Returns the ids of the given nodes, which must be registered with the registry. */
+QJsonArray idsOf(const McpNodeRegistry& registry, const auto& nodes)
+{
+  auto result = QJsonArray{};
+  for (const auto* node : nodes)
+  {
+    result.append(registry.idOf(*node));
+  }
+  return result;
+}
+
 /** Decodes a string stored in the map using the map's text encoding. */
 QString toUnicode(const mdl::Map& map, const std::string& str);
 
 /** Encodes a string for storing it in the map using the map's text encoding. */
 std::string fromUnicode(const mdl::Map& map, const QString& str);
-
-/**
- * Returns the lower case hex SHA-256 digest of the compact JSON serialization of the
- * given value. Scalars are wrapped in an array before hashing.
- */
-QString sha256Hex(const QJsonValue& value);
 
 /**
  * Returns "+x", "-x", "+y", "-y", "+z" or "-z" if the given unit normal points along

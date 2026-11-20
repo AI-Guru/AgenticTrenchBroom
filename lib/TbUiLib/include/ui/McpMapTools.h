@@ -28,7 +28,7 @@ void registerMcpMapTools(McpToolDispatcher& dispatcher);
 
 /**
  * Registers the read-only inspection tools: get_map_info, get_scene_tree, get_nodes,
- * get_brush_geometry, find_nodes and get_selection.
+ * get_brush_geometry, find_nodes, find_faces and get_selection.
  */
 void registerMcpMapReadTools(McpToolDispatcher& dispatcher);
 

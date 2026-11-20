@@ -144,6 +144,12 @@ TEST_CASE("McpDeterminism")
     Call{"transform_nodes", R"({"ids":["G8"],"scale":{"factors":[1.5,1,1]}})"},
     Call{"set_entity_properties", R"({"ids":["E3"],"set":{"light":0.5}})"},
     Call{"set_face_attributes", R"({"brushes":["B2"],"rotation":17,"fit":true})"},
+    Call{"find_faces", "{}"},
+    Call{"find_faces", R"({"facing":"horizontal","exposed_only":true})"},
+    Call{"find_faces", R"({"ids":["world"],"facing":[1,1,0],"tolerance_degrees":60})"},
+    Call{
+      "set_face_attributes",
+      R"({"face_filter":{"facing":"up","exposed_only":true},"material":"top"})"},
     Call{"select_nodes", R"({"ids":["E3"]})"},
     Call{"delete_nodes", R"({"ids":["@selection","P9"]})"},
     Call{"undo", R"({"count":3})"},

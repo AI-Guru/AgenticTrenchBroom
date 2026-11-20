@@ -47,6 +47,7 @@
 #include "mdl/Selection.h"
 #include "mdl/UpdateBrushFaceAttributes.h"
 #include "mdl/WorldNode.h"
+#include "ui/McpFaceFilter.h"
 #include "ui/McpJson.h"
 #include "ui/McpMapTools.h"
 #include "ui/McpPreconditions.h"
@@ -976,12 +977,32 @@ McpResult<QJsonObject> setFaceAttributes(McpCallContext& context, const QJsonObj
   auto& doc = context.doc;
   auto& map = doc.map;
 
-  if (args.contains("faces") == args.contains("brushes"))
+  const auto hasFilter = args.contains("face_filter");
+  if (hasFilter && args.contains("faces"))
+  {
+    return toolError(
+      "invalid_argument",
+      "face_filter cannot be combined with faces",
+      "pass brushes (or nothing for all world brushes) with face_filter",
+      {{"pointer", "/face_filter"}});
+  }
+  if (!hasFilter && args.contains("faces") == args.contains("brushes"))
   {
     return toolError(
       "invalid_argument",
       "pass exactly one of faces or brushes",
-      "faces selects single faces, brushes all faces of the brushes");
+      "faces selects single faces, brushes all faces of the brushes; add face_filter "
+      "to pick faces by direction, e.g. {\"facing\":\"up\"} for floors");
+  }
+  auto matcher = std::optional<McpFaceMatcher>{};
+  if (hasFilter)
+  {
+    auto filter = parseFaceFilter(args.value("face_filter").toObject(), "/face_filter");
+    if (filter.is_error())
+    {
+      return errorOf(filter);
+    }
+    matcher.emplace(map, std::move(filter).value());
   }
 
   auto update = mdl::UpdateBrushFaceAttributes{};
@@ -1099,6 +1120,43 @@ McpResult<QJsonObject> setFaceAttributes(McpCallContext& context, const QJsonObj
       }
     }
   }
+  else if (!args.contains("brushes"))
+  {
+    // face_filter without brushes: all world brushes, including grouped ones
+    auto skipped = size_t(0);
+    const auto& editorContext = map.editorContext();
+    const auto collect = [&](const auto& self, mdl::Node& node) -> void {
+      if (auto* brushNode = dynamic_cast<mdl::BrushNode*>(&node))
+      {
+        if (dynamic_cast<const mdl::WorldNode*>(brushNode->entity()))
+        {
+          if (!isEditableBrush(doc, *brushNode))
+          {
+            ++skipped;
+            return;
+          }
+          for (size_t i = 0; i < brushNode->brush().faceCount(); ++i)
+          {
+            if (editorContext.selectable(*brushNode, brushNode->brush().face(i)))
+            {
+              faces.emplace_back(*brushNode, i);
+            }
+          }
+        }
+        return;
+      }
+      for (auto* child : node.children())
+      {
+        self(self, *child);
+      }
+    };
+    collect(collect, map.worldNode());
+    if (skipped > 0)
+    {
+      context.warnings.push_back(
+        QString{"%1 hidden, locked or linked world brushes were skipped"}.arg(skipped));
+    }
+  }
   else
   {
     // groups are expanded to their brushes, like in replace_material, so that rooms
@@ -1136,6 +1194,22 @@ McpResult<QJsonObject> setFaceAttributes(McpCallContext& context, const QJsonObj
           faces.emplace_back(*brushNode, i);
         }
       }
+    }
+  }
+
+  if (matcher)
+  {
+    const auto candidates = faces.size();
+    std::erase_if(faces, [&](const auto& handle) {
+      return !matcher->matches(handle.node(), handle.faceIndex());
+    });
+    if (faces.empty())
+    {
+      context.nothingChanged = true;
+      context.warnings.push_back(
+        QString{"face_filter matched none of the %1 faces; check it with find_faces"}.arg(
+          candidates));
+      return QJsonObject{{"faces_changed", 0}};
     }
   }
 
@@ -1207,7 +1281,11 @@ McpToolDef setFaceAttributesTool()
     .description =
       "Sets the material, UV offset, scale and rotation (degrees), surface attributes "
       "or UV alignment of the given faces or of all faces of the given brushes; fit "
-      "fits the texture to each face. Verify with get_brush_geometry.",
+      "fits the texture to each face. face_filter keeps only the faces of brushes (all "
+      "world brushes if brushes is omitted) that match it, e.g. "
+      "{brushes:[...], face_filter:{facing:'up', exposed_only:true}, material:'floor'} "
+      "retextures only the walkable floor surfaces; see find_faces for the filter. "
+      "Verify with find_faces (same filter plus material) or get_brush_geometry.",
     .inputSchema = schema::object({
       {"faces", schema::array(schema::faceRef(), 1, MaxFaceRefs, "faces to change")},
       {"brushes",
@@ -1215,6 +1293,10 @@ McpToolDef setFaceAttributesTool()
          schema::MaxNodeIds,
          "brushes whose faces to change; brush entities and groups are expanded to "
          "their brushes")},
+      {"face_filter",
+       schema::describe(
+         schema::object(faceFilterSchemaProperties()),
+         "only change the faces of brushes that match this filter (see find_faces)")},
       {"material", schema::material()},
       {"offset", schema::vec2("UV offset in texels")},
       {"scale", schema::vec2("UV scale; must not be 0")},

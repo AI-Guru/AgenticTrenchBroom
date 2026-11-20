@@ -46,6 +46,7 @@
 #include "mdl/Selection.h"
 #include "mdl/SoftMapBounds.h"
 #include "mdl/WorldNode.h"
+#include "ui/McpFaceFilter.h"
 #include "ui/McpJson.h"
 #include "ui/McpMapTools.h"
 #include "ui/McpPreconditions.h"
@@ -941,6 +942,143 @@ McpToolDef findNodesTool()
   };
 }
 
+// find_faces
+
+/** The brushes of world (including grouped brushes) or the brushes in the given nodes. */
+McpResult<std::unordered_set<const mdl::BrushNode*>> findFacesBrushes(
+  const McpDocumentState& doc, const QJsonObject& args)
+{
+  auto result = std::unordered_set<const mdl::BrushNode*>{};
+  const auto collect = [&](const auto& self, const mdl::Node& node) -> void {
+    if (const auto* brushNode = dynamic_cast<const mdl::BrushNode*>(&node))
+    {
+      result.insert(brushNode);
+      return;
+    }
+    for (const auto* child : node.children())
+    {
+      self(self, *child);
+    }
+  };
+
+  if (!args.contains("ids"))
+  {
+    visitPreOrder(doc.map.worldNode(), 0, [&](const mdl::Node& node, size_t) {
+      if (const auto* brushNode = dynamic_cast<const mdl::BrushNode*>(&node))
+      {
+        if (dynamic_cast<const mdl::WorldNode*>(brushNode->entity()))
+        {
+          result.insert(brushNode);
+        }
+        return false;
+      }
+      return true;
+    });
+    return result;
+  }
+
+  auto nodes = resolveNodes(doc, args.value("ids").toArray(), schema::MaxNodeIds);
+  if (nodes.is_error())
+  {
+    return errorOf(nodes);
+  }
+  for (const auto* node : nodes.value())
+  {
+    const auto* entityNode = dynamic_cast<const mdl::EntityNode*>(node);
+    if (
+      dynamic_cast<const mdl::PatchNode*>(node)
+      || (entityNode && !entityNode->hasChildren()))
+    {
+      const auto id = doc.nodes.idOf(*node);
+      return toolError(
+        "wrong_node_type",
+        QString{"%1 is a %2 and has no brush faces"}.arg(
+          id, entityNode ? QStringLiteral("point entity") : nodeTypeName(*node)),
+        "pass brushes, groups, brush entities, layers or world",
+        {{"id", id}, {"actual", nodeTypeName(*node)}, {"expected", "brush"}});
+    }
+    collect(collect, *node);
+  }
+  return result;
+}
+
+McpResult<QJsonObject> findFaces(McpCallContext& context, const QJsonObject& args)
+{
+  const auto& doc = context.doc;
+  const auto& map = doc.map;
+
+  auto filter = parseFaceFilter(args, "");
+  if (filter.is_error())
+  {
+    return errorOf(filter);
+  }
+  auto brushes = findFacesBrushes(doc, args);
+  if (brushes.is_error())
+  {
+    return errorOf(brushes);
+  }
+  const auto& brushNodes = brushes.value();
+  const auto matcher = McpFaceMatcher{map, std::move(filter).value()};
+
+  // DFS order, then face index, so that the output does not depend on the ids order
+  auto faces = QJsonArray{};
+  visitPreOrder(map.worldNode(), 0, [&](const mdl::Node& node, size_t) {
+    if (const auto* brushNode = dynamic_cast<const mdl::BrushNode*>(&node))
+    {
+      if (brushNodes.contains(brushNode))
+      {
+        for (size_t i = 0; i < brushNode->brush().faceCount(); ++i)
+        {
+          if (matcher.matches(*brushNode, i))
+          {
+            faces.append(faceRefJson(doc.nodes, map, *brushNode, i));
+          }
+        }
+      }
+      return false;
+    }
+    return true;
+  });
+
+  auto result = QJsonObject{};
+  result["faces"] = page(faces, args, result);
+  result["brushes_searched"] = qint64(brushNodes.size());
+  return result;
+}
+
+McpToolDef findFacesTool()
+{
+  auto properties = faceFilterSchemaProperties();
+  properties["ids"] = schema::nodeIds(
+    schema::MaxNodeIds,
+    "where to look: brushes, groups, brush entities, layers or world are expanded to "
+    "their brushes (default: all world brushes, including grouped ones, but not those "
+    "of brush entities)");
+  schema::addPaging(properties);
+
+  return {
+    .name = "find_faces",
+    .title = "Find Faces",
+    .description =
+      "Finds brush faces by orientation, material, position and exposure, e.g. "
+      "{facing:'up', exposed_only:true} for the walkable floor surfaces, 'down' for "
+      "the visible ceiling surfaces, 'horizontal' for walls. Returns {brush, index, "
+      "side, "
+      "normal, area, center, material} per face: the outward unit normal, the area in "
+      "square units, the vertex average and the material, sorted by brush (DFS order) "
+      "and face index. A face ref for set_face_attributes faces or select_nodes faces "
+      "takes exactly one of index, side or normal, so pass {brush, index}. To retexture "
+      "the matches in one "
+      "call, pass the same filter as set_face_attributes face_filter; verify by "
+      "calling find_faces again with material set to the new material.",
+    .inputSchema = schema::object(properties),
+    .kind = McpToolKind::Read,
+    .annotations = ReadOnly,
+    .allowedInBatch = true,
+    .run = findFaces,
+  };
+}
+
 // get_selection
 
 McpResult<QJsonObject> getSelection(McpCallContext& context, const QJsonObject&)
@@ -1368,6 +1506,7 @@ void registerMcpMapReadTools(McpToolDispatcher& dispatcher)
   dispatcher.add(getNodesTool());
   dispatcher.add(getBrushGeometryTool());
   dispatcher.add(findNodesTool());
+  dispatcher.add(findFacesTool());
   dispatcher.add(getSelectionTool());
   dispatcher.add(listEntityDefinitionsTool());
   dispatcher.add(getEntityDefinitionTool());

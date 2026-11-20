@@ -31,6 +31,7 @@ target_sources(TbUiLibTest
     ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_McpController.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_McpDeterminism.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_McpDocumentState.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_McpFaceFilter.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_McpJson.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_McpLogCapture.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_McpMapCreateTools.cpp

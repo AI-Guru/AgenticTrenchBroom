@@ -118,6 +118,7 @@ target_sources(TbUiLib
     ${CMAKE_CURRENT_SOURCE_DIR}/src/McpCheckpoints.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/McpController.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/McpDocumentState.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/McpFaceFilter.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/McpJson.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/McpLogCapture.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/McpMapCreateTools.cpp
@@ -325,6 +326,7 @@ target_sources(TbUiLib
     ${CMAKE_CURRENT_SOURCE_DIR}/include/ui/McpCheckpoints.h
     ${CMAKE_CURRENT_SOURCE_DIR}/include/ui/McpController.h
     ${CMAKE_CURRENT_SOURCE_DIR}/include/ui/McpDocumentState.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/ui/McpFaceFilter.h
     ${CMAKE_CURRENT_SOURCE_DIR}/include/ui/McpJson.h
     ${CMAKE_CURRENT_SOURCE_DIR}/include/ui/McpLogCapture.h
     ${CMAKE_CURRENT_SOURCE_DIR}/include/ui/McpMapTools.h

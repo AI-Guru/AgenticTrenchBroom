@@ -76,6 +76,12 @@ const auto Instructions = QStringLiteral(
   with drop_to_floor and align_nodes; describe_region summarizes an area. create_hollow_box, csg_subtract (touching
   brushes are never cut), clip_brush, create_primitive_brush, create_brush_from_points, duplicate_nodes and
   group_nodes (open_group/close_group to edit inside) cover the rest.
+- Texture by direction instead of painting all 6 faces: find_faces {facing:'up'|'down'|'horizontal'|'+x'..|[x,y,z],
+  exposed_only, inside, material} returns faces ('up' = walkable floor surfaces, 'down' = visible ceiling
+  surfaces, 'horizontal' = walls; exposed_only drops faces hidden against other world brushes; reuse a result as a
+  face ref as {brush, index}). Door jambs and lintels lie in the wall, outside a room's inner bounds. Retexture in ONE
+  call with the same filter: set_face_attributes {brushes:[...], face_filter:{facing:'up', exposed_only:true},
+  material:'floor_01'} (omit brushes for all world brushes; add inside:<room bounds> to skip outer faces).
 - checkpoint_create before big edits; checkpoint_revert undoes your steps back to it. Verify without screenshots:
   validate_map, query_point, check_brush_overlaps, checkpoint_diff, get_brush_geometry, find_nodes, get_map_stats.
   check_leaks flood fills from the point entities like a Quake compiler and returns the path of every leak; only

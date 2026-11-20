@@ -180,6 +180,15 @@ private:
   bool m_rolledBackOnFailure;
 };
 
+void addNothingChangedWarning(std::vector<QString>& warnings)
+{
+  static const auto warning = QStringLiteral("nothing changed; no undo step was added");
+  if (std::ranges::find(warnings, warning) == warnings.end())
+  {
+    warnings.push_back(warning);
+  }
+}
+
 QJsonArray logJson(const std::vector<McpLogLine>* log)
 {
   auto result = QJsonArray{};
@@ -684,6 +693,20 @@ mcp::ToolResult McpToolDispatcher::runMutate(
     return makeOutput(def, std::move(structured), context.warnings);
   }
 
+  if (context.nothingChanged)
+  {
+    // e.g. selecting and reselecting nodes would otherwise add an empty undo step
+    transaction.cancel();
+    guard.cancel();
+    addEnvelope(McpChangeSet{});
+    if (!structured.contains("undo_label"))
+    {
+      structured["undo_label"] = QJsonValue{};
+    }
+    addNothingChangedWarning(context.warnings);
+    return makeOutput(def, std::move(structured), context.warnings);
+  }
+
   if (def.keepsSelection)
   {
     guard.dismiss();
@@ -716,7 +739,7 @@ mcp::ToolResult McpToolDispatcher::runMutate(
   const auto addedUndoStep = undoNameAfter && undoNameAfter != undoNameBefore;
   if (!addedUndoStep)
   {
-    context.warnings.push_back("nothing changed; no undo step was added");
+    addNothingChangedWarning(context.warnings);
   }
   if (!structured.contains("undo_label"))
   {
@@ -888,6 +911,8 @@ McpResult<QJsonObject> McpToolDispatcher::runBatch(
 
   auto results = QJsonArray{};
   auto createdByOperation = std::vector<std::vector<QString>>{};
+  auto changedNothing = true;
+  auto selectedNodes = false;
 
   const auto failure = [&](const qsizetype index, const mcp::ToolError& error) {
     return toolError(
@@ -944,7 +969,8 @@ McpResult<QJsonObject> McpToolDispatcher::runBatch(
     }
 
     const auto before = doc.nodes.currentChanges();
-    auto result = runNested(*op.def, context, opArgs);
+    auto opChangedNothing = false;
+    auto result = runNested(*op.def, context, opArgs, opChangedNothing);
     if (result.is_error())
     {
       return failure(i, errorOf(result));
@@ -958,6 +984,19 @@ McpResult<QJsonObject> McpToolDispatcher::runBatch(
       structured["changes"] = changes.toJson();
     }
     results.append(QJsonObject{{"tool", op.def->name}, {"result", structured}});
+    changedNothing = changedNothing && opChangedNothing;
+    selectedNodes = selectedNodes || op.def->keepsSelection;
+  }
+
+  if (selectedNodes)
+  {
+    context.warnings.push_back(
+      "select_nodes in a batch only selects for the later operations; the user's "
+      "selection is restored after the batch");
+  }
+  if (changedNothing)
+  {
+    context.nothingChanged = true;
   }
 
   if (args.value("dry_run").toBool(false))
@@ -968,8 +1007,12 @@ McpResult<QJsonObject> McpToolDispatcher::runBatch(
 }
 
 McpResult<QJsonObject> McpToolDispatcher::runNested(
-  const McpToolDef& def, McpCallContext& outer, const QJsonObject& args)
+  const McpToolDef& def,
+  McpCallContext& outer,
+  const QJsonObject& args,
+  bool& changedNothing)
 {
+  changedNothing = false;
   auto& doc = outer.doc;
   auto& map = doc.map;
   auto context = McpCallContext{.doc = doc, .log = outer.log};
@@ -991,6 +1034,7 @@ McpResult<QJsonObject> McpToolDispatcher::runNested(
 
   if (def.kind == McpToolKind::Read)
   {
+    changedNothing = true;
     return addWarnings(def.run(context, args));
   }
 
@@ -1005,6 +1049,19 @@ McpResult<QJsonObject> McpToolDispatcher::runNested(
     guard.cancel();
     return result;
   }
+
+  if (context.nothingChanged)
+  {
+    transaction.cancel();
+    guard.cancel();
+    changedNothing = true;
+    auto structured = std::move(result).value();
+    structured["changes"] = McpChangeSet{}.toJson();
+    addNothingChangedWarning(context.warnings);
+    return addWarnings(std::move(structured));
+  }
+  // a selection change only applies to the later operations of the batch
+  changedNothing = def.keepsSelection;
 
   if (def.keepsSelection)
   {

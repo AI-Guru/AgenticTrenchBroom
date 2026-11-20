@@ -142,9 +142,16 @@ private:
   mcp::ToolResult runHistory(
     const McpToolDef& def, McpDocumentState& doc, const QJsonObject& args);
   McpResult<QJsonObject> runBatch(McpCallContext& context, const QJsonObject& args);
-  /** Runs an operation of a batch inside the batch's transaction. */
+  /**
+   * Runs an operation of a batch inside the batch's transaction. Sets changedNothing if
+   * the operation left the map unchanged: a read, a selection change (which the batch
+   * reverts) or a tool that set McpCallContext::nothingChanged.
+   */
   McpResult<QJsonObject> runNested(
-    const McpToolDef& def, McpCallContext& context, const QJsonObject& args);
+    const McpToolDef& def,
+    McpCallContext& context,
+    const QJsonObject& args,
+    bool& changedNothing);
 
   mcp::ToolRegistry& m_registry;
   McpDocumentProvider m_provider;

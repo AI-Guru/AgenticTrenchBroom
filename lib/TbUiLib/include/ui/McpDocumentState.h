@@ -109,6 +109,13 @@ struct McpCallContext
    * still returned (batch with dry_run).
    */
   bool discardChanges = false;
+  /**
+   * Set by a Mutate tool that succeeded but found that it changed nothing, e.g. a zero
+   * translation or snapping vertices that were already snapped. The call is rolled back
+   * so that it adds no undo step and does not mark the map as modified; its result is
+   * still returned, with a "nothing changed" warning.
+   */
+  bool nothingChanged = false;
 };
 
 enum class McpToolKind

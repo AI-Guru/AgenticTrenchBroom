@@ -213,6 +213,22 @@ vm::axis::type flipAxis(const QString& name)
   return name == u"x" ? vm::axis::x : name == u"y" ? vm::axis::y : vm::axis::z;
 }
 
+/** Whether the matrix is the identity up to rounding errors, e.g. of a full rotation. */
+bool isIdentity(const vm::mat4x4d& matrix)
+{
+  for (size_t c = 0; c < 4; ++c)
+  {
+    for (size_t r = 0; r < 4; ++r)
+    {
+      if (std::abs(matrix[c][r] - (c == r ? 1.0 : 0.0)) > 1e-9)
+      {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 McpResult<QJsonObject> transformNodes(McpCallContext& context, const QJsonObject& args)
 {
   auto& doc = context.doc;
@@ -359,6 +375,19 @@ McpResult<QJsonObject> transformNodes(McpCallContext& context, const QJsonObject
           * vm::translation_matrix(-c)
       : vm::translation_matrix(c) * vm::mirror_matrix<double>(mirrorAxis)
           * vm::translation_matrix(-c);
+
+  if (isIdentity(transformation))
+  {
+    // e.g. translate [0,0,0], scale [1,1,1] or a rotation by 360 degrees: transforming
+    // would still add an undo step and mark the map as modified
+    context.nothingChanged = true;
+    context.warnings.push_back(
+      "nothing changed: the transformation does not move anything");
+    return QJsonObject{
+      {"bounds", toJson(*selectionBounds)},
+      {"alignment_lock", map.editorContext().alignmentLock()},
+    };
+  }
 
   if (!map.worldBounds().contains(selectionBounds->transform(transformation)))
   {
@@ -775,6 +804,12 @@ McpResult<QJsonObject> setEntityProperties(
       "operation_failed", "the entities could not be selected for editing");
   }
 
+  auto entitiesBefore = std::vector<mdl::Entity>{};
+  for (const auto* entityNode : targets.entities)
+  {
+    entitiesBefore.push_back(entityNode->entity());
+  }
+
   for (const auto& [oldKey, newKey] : renames)
   {
     if (!mdl::renameEntityProperty(map, oldKey, newKey))
@@ -801,6 +836,16 @@ McpResult<QJsonObject> setEntityProperties(
         "operation_failed",
         QString{"property '%1' could not be removed"}.arg(toUnicode(map, key)));
     }
+  }
+
+  if (std::ranges::equal(
+        targets.entities, entitiesBefore, [](const auto* entityNode, const auto& entity) {
+          return entityNode->entity() == entity;
+        }))
+  {
+    context.nothingChanged = true;
+    context.warnings.push_back(
+      "nothing changed: the properties already have these values");
   }
 
   auto entities = QJsonArray{};
@@ -1020,6 +1065,20 @@ McpResult<QJsonObject> setFaceAttributes(McpCallContext& context, const QJsonObj
     return toolError("operation_failed", "no faces could be selected");
   }
 
+  auto faceBrushNodes = std::vector<const mdl::BrushNode*>{};
+  for (const auto& handle : map.selection().allBrushFaces())
+  {
+    if (std::ranges::find(faceBrushNodes, &handle.node()) == faceBrushNodes.end())
+    {
+      faceBrushNodes.push_back(&handle.node());
+    }
+  }
+  auto brushesBefore = std::vector<mdl::Brush>{};
+  for (const auto* brushNode : faceBrushNodes)
+  {
+    brushesBefore.push_back(brushNode->brush());
+  }
+
   if (hasUpdate && !mdl::setBrushFaceAttributes(map, update))
   {
     return toolError(
@@ -1039,6 +1098,16 @@ McpResult<QJsonObject> setFaceAttributes(McpCallContext& context, const QJsonObj
     context.warnings.push_back(
       QString{"material '%1' was not found; check list_materials"}.arg(
         toUnicode(map, *material)));
+  }
+
+  if (std::ranges::equal(
+        faceBrushNodes, brushesBefore, [](const auto* brushNode, const auto& brush) {
+          return brushNode->brush() == brush;
+        }))
+  {
+    context.nothingChanged = true;
+    context.warnings.push_back(
+      "nothing changed: the faces already have these attributes");
   }
 
   return QJsonObject{{"faces_changed", qint64(faceCount)}};
@@ -1285,6 +1354,13 @@ McpResult<QJsonObject> resizeNodes(McpCallContext& context, const QJsonObject& a
     }
   }
 
+  if (*oldBounds == newBounds)
+  {
+    context.nothingChanged = true;
+    context.warnings.push_back("nothing changed: the targets already have these bounds");
+    return QJsonObject{{"bounds", toJson(*oldBounds)}};
+  }
+
   if (!mdl::scaleSelection(map, *oldBounds, newBounds))
   {
     return toolError(
@@ -1366,6 +1442,8 @@ McpResult<QJsonObject> snapVertices(McpCallContext& context, const QJsonObject& 
   }
   if (changed.isEmpty())
   {
+    // TrenchBroom swaps the brushes anyway; roll that back
+    context.nothingChanged = true;
     context.warnings.push_back(
       "nothing changed: the vertices were already snapped or could not be snapped");
   }

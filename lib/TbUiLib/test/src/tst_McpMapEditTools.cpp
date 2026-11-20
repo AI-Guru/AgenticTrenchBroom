@@ -370,6 +370,63 @@ TEST_CASE("McpMapEditTools")
     }
   }
 
+  SECTION("calls that change nothing add no undo step and modify nothing")
+  {
+    mdl::selectNodes(f.map, {scene.patch});
+    const auto before = snapshot(f.map);
+    const auto noop = [&](const QString& tool, const char* args) {
+      CAPTURE(tool, args);
+      const auto result = f.ok(tool, args);
+      CHECK(result.value("undo_label") == QJsonValue{});
+      CHECK(result.value("warnings")
+              .toArray()
+              .contains(QJsonValue{"nothing changed; no undo step was added"}));
+      CHECK(
+        result.value("changes")
+        == QJsonValue{QJsonObject{
+          {"created", QJsonArray{}},
+          {"removed", QJsonArray{}},
+          {"modified", QJsonArray{}},
+        }});
+      CHECK(snapshot(f.map) == before);
+      return result;
+    };
+
+    noop("transform_nodes", R"({"ids":["B2"],"translate":[0,0,0]})");
+    noop("transform_nodes", R"({"ids":["B2","E3"],"scale":{"factors":[1,1,1]}})");
+    noop(
+      "transform_nodes", R"({"ids":["B2"],"rotate":{"axis":"z","angle_degrees":360}})");
+    noop("resize_nodes", R"({"ids":["B2"],"bounds":{"min":[0,0,0],"max":[64,64,64]}})");
+    CHECK(
+      noop("snap_vertices", R"({"ids":["B2"]})").value("unchanged")
+      == QJsonValue{QJsonArray{"B2"}});
+    noop("set_entity_properties", R"({"ids":["E3"],"set":{"light":300}})");
+    noop(
+      "set_face_attributes",
+      R"({"faces":[{"brush":"B2","side":"-z"}],"material":"wall"})");
+    noop("select_nodes", R"({"ids":["P9"]})");
+    noop("batch", R"({"operations":[
+      {"tool":"select_nodes","arguments":{"ids":["B2"]}},
+      {"tool":"transform_nodes","arguments":{"ids":["@selection"],"translate":[0,0,0]}},
+      {"tool":"get_nodes","arguments":{"ids":["B2"]}}
+    ]})");
+
+    // a batch that changes something is still one undo step
+    const auto batch = f.ok("batch", R"({"operations":[
+      {"tool":"transform_nodes","arguments":{"ids":["B2"],"translate":[0,0,0]}},
+      {"tool":"select_nodes","arguments":{"ids":["B2"]}},
+      {"tool":"transform_nodes","arguments":{"ids":["@selection"],"translate":[0,0,8]}}
+    ]})");
+    CHECK(batch.value("undo_label") == QJsonValue{"MCP: Batch"});
+    CHECK(batch.value("warnings")
+            .toArray()
+            .contains(QJsonValue{
+              "select_nodes in a batch only selects for the later operations; the "
+              "user's selection is restored after the batch"}));
+    CHECK(nodeBounds(f, "B2") == boundsJson({0, 0, 8}, {64, 64, 72}));
+    CHECK(f.map.selection().nodes == std::vector<mdl::Node*>{scene.patch});
+  }
+
   SECTION("set_entity_properties")
   {
     SECTION("point entities")

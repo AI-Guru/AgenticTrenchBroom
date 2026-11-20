@@ -54,6 +54,16 @@ McpResult<QJsonObject> selectNodes(McpCallContext& context, const QJsonObject& a
 
   const auto mode = args.value("mode").toString("replace");
   const auto hasIds = args.contains("ids");
+
+  // selecting what is already selected would otherwise add an empty undo step
+  const auto nodesBefore = map.selection().nodes;
+  const auto facesBefore = map.selection().brushFaces;
+  const auto setNothingChanged = [&]() {
+    if (map.selection().nodes == nodesBefore && map.selection().brushFaces == facesBefore)
+    {
+      context.nothingChanged = true;
+    }
+  };
   const auto hasFaces = args.contains("faces");
 
   if (mode == u"clear")
@@ -67,6 +77,7 @@ McpResult<QJsonObject> selectNodes(McpCallContext& context, const QJsonObject& a
         {{"pointer", hasIds ? "/ids" : "/faces"}});
     }
     mdl::deselectAll(map);
+    setNothingChanged();
     return selectionJson(doc.nodes, map);
   }
 
@@ -139,6 +150,7 @@ McpResult<QJsonObject> selectNodes(McpCallContext& context, const QJsonObject& a
     }
   }
 
+  setNothingChanged();
   return selectionJson(doc.nodes, map);
 }
 
@@ -149,7 +161,9 @@ McpToolDef selectNodesTool()
     .title = "Select Nodes",
     .description =
       "Changes the user's selection, e.g. to show them nodes or faces. Unlike other "
-      "tools, the selection is kept. Other tools take ids and do not need a selection.",
+      "tools, the selection is kept, except in a batch: there it only applies to the "
+      "later operations (e.g. \"@selection\") and the user's selection is restored "
+      "afterwards. Other tools take ids and do not need a selection.",
     .inputSchema = schema::object({
       {"ids", schema::nodeIds()},
       {"faces", schema::array(schema::faceRef(), 1, MaxFaceRefs)},

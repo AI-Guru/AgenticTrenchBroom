@@ -1578,7 +1578,7 @@ The [map view context menu](#map_view_context_menu) also has some layer related 
 
 # Preferences
 
-The preferences dialog allows you to set the game configurations, to change the view layout and control the rendering, and to customize the mouse and the keyboard shortcuts. You can open the preferences dialog by choosing #menu(Menu/File/Preferences...). The dialog is split into four panes, each of which we will review in the following sections. Note that on Windows and Linux, the changes are only applied if you click the "OK" or "Apply" button at the bottom of the dialog, whereas on Mac OS X, the changes are applied immediately.
+The preferences dialog allows you to set the game configurations, to change the view layout and control the rendering, and to customize the mouse and the keyboard shortcuts. You can open the preferences dialog by choosing #menu(Menu/File/Preferences...). The dialog is split into several panes, most of which we will review in the following sections. The update preferences are explained in [Automatic Updates](#automatic_updates) and the MCP preferences in [Controlling TrenchBroom with AI agents](#mcp). Note that on Windows and Linux, the changes are only applied if you click the "OK" or "Apply" button at the bottom of the dialog, whereas on Mac OS X, the changes are applied immediately.
 
 ## Game Configuration {#game_configuration}
 
@@ -1667,7 +1667,7 @@ Note that if you assign a keyboard shortcut to different actions in the same con
 
 # Advanced Topics
 
-## Automatic Updates
+## Automatic Updates {#automatic_updates}
 
 TrenchBroom can check for updates. If an update is available, it can be downloaded and installed from within TrenchBroom. If "Check for updates on startup" is enabled in the preferences, TrenchBroom will perform an update check when it starts.
 
@@ -1873,6 +1873,73 @@ Variable         Description
 The `MODS` variable is useful to pass a parameter to the engine to choose a mod. Usually, this will be the last mod in the mods for the current map. Since the `MODS` variable is an array that contains all mods for the map, its individual entries are accessed using the subscript operator (see below). To access the last entry in the array, you can use the expression `$MODS[-1]`.
 
 Note that the parameters are stored with the game engine profile.
+
+## Controlling TrenchBroom with AI agents (MCP) {#mcp}
+
+TrenchBroom contains a server for the [Model Context Protocol](https://modelcontextprotocol.io) (MCP). AI agents such as Claude Code can use it to inspect and edit your maps. An agent can create and open maps, build brushes and entities, change properties and materials, use undo and redo, check its work with evaluation tools and save the result. It does this through the same editor that you are looking at, so you can watch the agent work and continue editing yourself at any time.
+
+The server is off by default. It only accepts connections from the computer that TrenchBroom runs on. Any program on this computer can connect to it while it is running, so only enable it when you want to use it.
+
+### Starting the Server
+
+Open the preferences with #menu(Menu/File/Preferences...) and switch to the MCP pane. It has the following settings:
+
+Setting              Description
+-------              -----------
+Enable MCP server    Starts or stops the server. On macOS this takes effect immediately; on Windows and Linux, when you click "Apply" or "OK".
+Port                 The TCP port that the server listens on. The default is 6767. "Any free port" lets the system choose a port each time the server starts.
+
+The pane shows whether the server is running and, if it could not be started (for example because another program uses the port), why. It also shows the URL of the server, such as `http://127.0.0.1:6767/mcp`, and the command that adds TrenchBroom to Claude Code. Click "Copy" to copy either one to the clipboard.
+
+You can also start the server from the command line with the option `--mcp-port=<port>`, for example `TrenchBroom --mcp-port=6767`. Port 0 picks a free port. The server then runs regardless of the preferences, and TrenchBroom prints the URL to the standard error output. As soon as you change one of the MCP preferences, the server follows the preferences again.
+
+### Connecting an Agent
+
+The server uses the "Streamable HTTP" transport of MCP. To add TrenchBroom to Claude Code, run this command in a terminal while the server is running:
+
+    claude mcp add --transport http trenchbroom http://127.0.0.1:6767/mcp
+
+Other MCP clients need the URL of the server and the transport type "HTTP" or "Streamable HTTP". Use `127.0.0.1` rather than `localhost` in the URL, because the server only listens on the IPv4 loopback address.
+
+Then ask the agent to build something, for example "Create a new Quake map with two rooms connected by a corridor and a light in each room."
+
+### What Agents Can Do
+
+The server offers tools in the following groups. The agent receives a description of each tool and general conventions (units, axes, angles) when it connects.
+
+Group                Tools
+-----                -----
+Documents            `list_games`, `new_map`, `open_map`, `save_map`, `close_map`, `list_documents`, `set_active_document`
+Inspection           `get_map_info`, `get_scene_tree`, `get_nodes`, `get_brush_geometry`, `find_nodes`, `find_faces`, `get_selection`, `describe_region`, `get_conventions`, `list_entity_definitions`, `get_entity_definition`, `list_materials`, `get_log`
+Evaluation           `validate_map`, `get_map_stats`, `query_point`, `check_brush_overlaps`, `check_leaks`, `check_walkable`, `export_map_text`, `checkpoint_create`, `checkpoint_diff`, `checkpoint_list`, `checkpoint_delete`
+Creation             `create_box_brush`, `create_hollow_box`, `create_room`, `create_opening`, `create_corridor`, `create_stairs`, `create_primitive_brush`, `create_brush_from_points`, `create_entity`, `paste_map_text`
+Editing              `transform_nodes`, `resize_nodes`, `align_nodes`, `drop_to_floor`, `snap_vertices`, `duplicate_nodes`, `delete_nodes`, `set_entity_properties`, `set_face_attributes`, `replace_material`, `clip_brush`, `csg`, `csg_subtract`, `batch`
+Structure            `group_nodes`, `ungroup_nodes`, `open_group`, `close_group`, `create_layer`, `set_current_layer`, `move_to_layer`, `select_nodes`
+History              `undo`, `redo`, `checkpoint_revert`
+View                 `get_camera`, `set_camera`, `focus_nodes`, `screenshot`, `screenshot_set`
+
+Agents are told to call `get_conventions` first. It works before a map is open and returns the units, axes and angle conventions, typical sizes in units (the player, doors, corridors, stairs) and the available games. Given a `game`, it also describes that game: its map formats, the default material, and whether its entity definition files are present. Once a map is open, it adds the map's grid size, world bounds, soft map bounds, current material and format. The game Generic only defines `worldspawn` and `info_player_start`, so lights and most other entities in a Generic map have no entity definition; ask the agent to make a Quake map if you want entity definitions.
+
+`validate_map` reports the issues that the issue browser shows. Two issues appear in every new map of some games and are harmless, so `validate_map` marks them with `expected_for_new_map` and an `expected_reason`, and agents know they don't need to fix them: the empty `wad` property of a new Quake worldspawn, which TrenchBroom fills when you add material collections, and the missing entity definitions of entities such as `light` in a Generic map.
+
+`check_leaks` lets an agent check that a map is sealed without compiling it. Like the leak test of a Quake compiler, it fills the empty space from every point entity (or from given points) and reports a leak with the path to the outside when the fill escapes the map. It divides the map into cubic cells (8 units by default) and only counts a cell as solid if it lies entirely inside one world brush, so it never misses a gap, even one narrower than a cell. Only world brushes seal, including brushes in groups. Brush entities such as `func_door`, `func_wall` or triggers do not, just as in the compilers; `check_leaks` also ignores `func_group` brushes, which the compilers merge into the world. Brushes and entities in layers that are omitted from export are ignored, because the compiler never sees them. Materials are not considered, so a world brush with a liquid, clip or detail material seals here even if a compiler lets a leak through it. Walls thinner than two cells or off the grid can show up as false leaks; a smaller cell size resolves them.
+
+`check_walkable` lets an agent check that the player can actually walk from one place to another, for example up a staircase, through a door or onto an upper floor, instead of working out step heights and ceiling heights itself. It takes a start point and up to 64 target points, all given as the position of the player's feet, and moves each point down onto the floor below it (or, where the box does not fit there, up onto a slightly higher floor it rests on, such as the edge of the next step of a narrow staircase). The player is modelled as a box (32 by 32 by 56 units by default) that stands on the top of a brush and moves in steps of 8 units (the `resolution`) to the neighbouring positions: it can climb a step of up to 18 units (`step_height`) and drop down up to 256 units (`max_drop`), and the box must fit everywhere along the way. The model does not jump, crouch, swim or use ladders, and it treats slopes like small steps. World brushes, including grouped ones, and the brushes of `func_group`, `func_detail` and `func_wall` entities are solid; doors, triggers and other brush entities count as open, and brushes in layers that are omitted from export are ignored. For each target, the result says whether it is reachable and gives the path. Otherwise it gives the nearest reachable point and what blocks the way: too little headroom (with the free height), a step that is too high (with its height), a gap or drop that is too deep, or a target that is not a place where the player can stand, for example because it is inside a brush.
+
+`create_opening` and `create_corridor` let an agent connect rooms without computing brush coordinates itself. `create_opening` cuts a door, window or passage into an existing wall: either a single wall brush, or the wall on one side of a room group made by `create_room`, also after the room has been moved. It splits the wall brushes that the opening touches into non-overlapping boxes around the hole, keeps them in their group and keeps their materials. `create_corridor` takes two such openings (the `openings` that `create_room` returns or the `opening` that `create_opening` returns) and builds the floor, ceiling and walls of a corridor between them: a straight corridor if the openings face each other, or an L-shaped one with a single turn if they are on perpendicular walls. The corridor has the cross-section of the openings and touches the outside of the walls without overlapping them, so the rooms and the corridor together stay sealed, which `check_leaks` confirms.
+
+`find_faces` picks brush faces by the direction they face, so that an agent can texture floors, walls and ceilings separately instead of painting all six faces of every brush. `facing` is `up` (floors you can walk on), `down` (the visible undersides of ceilings), `horizontal` (walls), an axis such as `+x`, or any direction vector, within `tolerance_degrees` (10 by default). `exposed_only` drops faces that are completely covered by a touching face of another world brush, such as the bottom of a wall that stands on a floor or the end of a wall that butts against another wall; faces that face the void outside the map still count as exposed. `inside` keeps only faces that have some area in the given bounds, which skips the outside of a room, and `material` filters by a material name pattern. `set_face_attributes` accepts the same filter as `face_filter`, so one call (and one undo step) retextures all floors of a room, for example `set_face_attributes {brushes: ["G8"], face_filter: {facing: "up", exposed_only: true}, material: "floor_01"}`. Without `brushes`, the filter applies to all world brushes, including grouped ones.
+
+`screenshot` and `screenshot_set` let an agent look at its work. Seen from above, a closed room only shows its ceiling, so both tools take a `cutaway` that hides brushes while the images are rendered: `above_z` hides every world brush that starts at or above that height, `hide_ids` hides the given objects (and everything in them, even if they are selected), and `clip_bounds` hides every world brush outside the given box. `auto` hides every world brush that lies entirely above the middle height of the framed area, plus every ceiling, that is, a world brush that nothing else rests on and that has free space below most of its underside, even if a pillar or a partition wall stands under it; walls, floors and objects standing on a floor stay visible. World brushes include brushes in groups, but not the brushes of brush entities. A cutaway only affects these images: it does not hide anything in the map, add an undo step, change the selection or mark the map as modified, although your views may briefly show the cutaway while an image is rendered. The result tells the agent how many objects were hidden.
+
+### Working Together with an Agent
+
+- Every change that an agent makes is a single undo step whose name starts with "MCP:", for example "MCP: Create Box Brush". You can undo it with #menu(Menu/Edit/Undo) like any other change. The agent's own `undo` tool only undoes its own changes unless it explicitly asks to undo yours.
+- The agent leaves your selection as it was, unless it selects objects on purpose.
+- The agent works on the map window that it created or opened. Otherwise, it works on the map window that you used last.
+- While you interact with the editor, for example while a dialog is open, while you drag an object or while a tool such as the vertex tool is active, the agent's changes are refused, and the agent is told to try again later. Agents never open dialogs.
+- An agent can close a map without saving it only if it explicitly asks to discard the changes. It cannot quit TrenchBroom.
+- Agents refer to objects by short ids such as `B12` for a brush or `E3` for an entity. These ids are only valid while TrenchBroom is running.
 
 ## Expression Language {#expression_language}
 

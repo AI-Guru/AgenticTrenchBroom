@@ -181,10 +181,17 @@ typename Polyhedron<T, FP, VP>::Vertex* Polyhedron<T, FP, VP>::addColinearThirdP
     return v1;
   }
 
-  contract_assert((vm::segment<T, 3>(position, v1->position())
-                     .contains(v2->position(), vm::constants<T>::almost_zero())));
-  v2->setPosition(position);
-  return v2;
+  if (vm::segment<T, 3>(position, v1->position())
+        .contains(v2->position(), vm::constants<T>::almost_zero()))
+  {
+    v2->setPosition(position);
+    return v2;
+  }
+
+  // is_colinear uses an absolute epsilon, so for a short edge it also accepts points that
+  // are further away from the edge than the segment tests allow; such a point can neither
+  // be merged into the edge nor form a triangle with it, so it is ignored
+  return nullptr;
 }
 
 template <typename T, typename FP, typename VP>

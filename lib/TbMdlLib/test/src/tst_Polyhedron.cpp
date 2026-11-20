@@ -213,6 +213,23 @@ TEST_CASE("Polyhedron")
       CHECK(p.hasAllVertices({p1, p3}));
     }
 
+    SECTION("With three almost colinear points close to each other")
+    {
+      // is_colinear accepts p3, but it is too far from the edge p1-p2 to be merged
+      const auto p1 = vm::vec3d{0, 0, 0};
+      const auto p2 = vm::vec3d{0.5, 0.003, 0};
+      const auto p3 = vm::vec3d{1, 0, 0};
+
+      auto p = Polyhedron3d{p1, p2, p3};
+
+      CHECK(p.edge());
+      CHECK(p.hasAllVertices({p1, p2}));
+
+      auto q = Polyhedron3d{p1, p2, p3, vm::vec3d{2, 5, 0}, vm::vec3d{2, 2, 5}};
+      CHECK(q.polyhedron());
+      CHECK(q.closed());
+    }
+
     SECTION("With three points")
     {
       const auto p1 = vm::vec3d{0, 0, 0};

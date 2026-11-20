@@ -73,9 +73,13 @@ const auto Instructions = QStringLiteral(
   unless allow_user_commands is true.
 - After new_map or open_map, call get_conventions for units, grid and typical sizes (player, doors, stairs).
 - Block out with create_room (floor, ceiling and walls with door/window openings) and create_stairs; place things
-  with drop_to_floor and align_nodes; describe_region summarizes an area. create_hollow_box, csg_subtract (touching
-  brushes are never cut), clip_brush, create_primitive_brush, create_brush_from_points, duplicate_nodes and
-  group_nodes (open_group/close_group to edit inside) cover the rest.
+  with drop_to_floor and align_nodes; describe_region summarizes an area. Connect rooms without computing brushes:
+  create_opening {wall: room group id + side, or a wall brush; width, height, offset or center, bottom} cuts a door
+  into an existing wall (also after moving a room), and create_corridor {from, to} builds a sealed straight or
+  L-shaped corridor between two openings; pass the opening objects that create_room ('openings') and create_opening
+  ('opening') return unchanged, then confirm with check_leaks and check_brush_overlaps. create_hollow_box,
+  csg_subtract (touching brushes are never cut), clip_brush, create_primitive_brush, create_brush_from_points,
+  duplicate_nodes and group_nodes (open_group/close_group to edit inside) cover the rest.
 - Texture by direction instead of painting all 6 faces: find_faces {facing:'up'|'down'|'horizontal'|'+x'..|[x,y,z],
   exposed_only, inside, material} returns faces ('up' = walkable floor surfaces, 'down' = visible ceiling
   surfaces, 'horizontal' = walls; exposed_only drops faces hidden against other world brushes; reuse a result as a

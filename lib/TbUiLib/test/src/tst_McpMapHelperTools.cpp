@@ -22,10 +22,13 @@
 
 #include "McpTestUtils.h"
 #include "mdl/BrushNode.h"
+#include "mdl/EditorContext.h"
 #include "mdl/EntityNode.h"
 #include "mdl/Grid.h"
 #include "mdl/GroupNode.h"
 #include "mdl/Map.h"
+#include "mdl/Map_Groups.h"
+#include "mdl/Map_NodeLocking.h"
 #include "mdl/Map_Nodes.h"
 #include "mdl/Map_Selection.h"
 #include "mdl/WorldNode.h"
@@ -263,6 +266,676 @@ TEST_CASE("McpMapHelperTools")
         R"({"inner_bounds":{"min":[0,0,0],"max":[64,64,64]},"bogus":1})",
         "invalid_argument",
         "/bogus");
+    }
+  }
+
+  SECTION("create_opening")
+  {
+    const auto faceOn = [&](const QString& id, const QString& side) {
+      for (const auto& face :
+           f.ok("get_brush_geometry", QJsonObject{{"ids", QJsonArray{id}}})
+             .value("brushes")
+             .toArray()[0]
+             .toObject()
+             .value("faces")
+             .toArray())
+      {
+        if (face.toObject().value("side") == QJsonValue{side})
+        {
+          return face.toObject();
+        }
+      }
+      FAIL("no face with side " << side.toStdString());
+      return QJsonObject{};
+    };
+
+    SECTION("cuts into the wall of a moved room group like create_room")
+    {
+      f.ok("create_room", R"({
+        "inner_bounds":{"min":[0,0,0],"max":[256,128,96]},"group_name":"room"})");
+      f.ok("transform_nodes", R"({"ids":["G8"],"translate":[64,0,0]})");
+
+      const auto result =
+        f.ok("create_opening", R"({"wall":"G8","side":"+x","width":64,"height":72})");
+      CHECK(
+        result.value("opening")
+        == QJsonValue{
+          QJsonObject{{"side", "+x"}, {"bounds", box({320, 32, 0}, {336, 96, 72})}}});
+      CHECK(
+        result.value("pieces")
+        == QJsonValue{QJsonObject{{"B2", QJsonArray{"B2", "B9", "B10"}}}});
+      CHECK(result.value("removed") == QJsonValue{QJsonArray{}});
+      CHECK(result.value("undo_label") == QJsonValue{"MCP: Create Opening"});
+
+      // the same pieces as create_room makes for this opening
+      CHECK(boundsOf("B2") == box({320, -16, 0}, {336, 32, 96}));
+      CHECK(boundsOf("B9") == box({320, 32, 72}, {336, 96, 96}));
+      CHECK(boundsOf("B10") == box({320, 96, 0}, {336, 144, 96}));
+      // the pieces stay in the group
+      CHECK(
+        nodeOf("G8").value("child_ids")
+        == QJsonValue{QJsonArray{"B2", "B3", "B4", "B5", "B6", "B7", "B9", "B10"}});
+      CHECK(f.ok("check_brush_overlaps").value("pairs") == QJsonValue{QJsonArray{}});
+      CHECK_FALSE(solid({328, 64, 36}));
+      CHECK(solid({328, 64, 84}));
+      CHECK(solid({328, 16, 36}));
+
+      SECTION("a second opening splits the pieces it touches")
+      {
+        const auto second = f.ok("create_opening", R"({
+          "wall":"G8","side":"+x","center":16,"width":16,"height":16,"bottom":40})");
+        CHECK(
+          second.value("opening").toObject().value("bounds")
+          == box({320, 8, 40}, {336, 24, 56}));
+        CHECK(
+          second.value("pieces")
+          == QJsonValue{QJsonObject{{"B2", QJsonArray{"B2", "B11", "B12", "B13"}}}});
+        CHECK(boundsOf("B2") == box({320, -16, 0}, {336, 8, 96}));
+        CHECK(boundsOf("B11") == box({320, 8, 0}, {336, 24, 40}));
+        CHECK(boundsOf("B12") == box({320, 8, 56}, {336, 24, 96}));
+        CHECK(boundsOf("B13") == box({320, 24, 0}, {336, 32, 96}));
+        CHECK(f.ok("check_brush_overlaps").value("pairs") == QJsonValue{QJsonArray{}});
+        CHECK_FALSE(solid({328, 16, 48}));
+      }
+
+      SECTION("pieces of a cut wall are not taken for the neighbouring walls")
+      {
+        // B10 reaches the +y face of the room, but it belongs to the +x wall
+        const auto next = f.ok("create_opening", R"({
+          "wall":"G8","side":"+y","offset":96,"width":32,"height":32})");
+        CHECK(
+          next.value("opening")
+          == QJsonValue{
+            QJsonObject{{"side", "+y"}, {"bounds", box({272, 128, 0}, {304, 144, 32})}}});
+        CHECK(
+          next.value("pieces")
+          == QJsonValue{QJsonObject{{"B4", QJsonArray{"B4", "B11", "B12"}}}});
+        CHECK(f.ok("check_brush_overlaps").value("pairs") == QJsonValue{QJsonArray{}});
+        CHECK(
+          f.err("create_opening", R"({"wall":"G8","side":"+y","width":257,"height":32})")
+          == "invalid_argument");
+        CHECK(
+          f.err("create_opening", R"({"wall":"G8","side":"+x","width":129,"height":32})")
+          == "invalid_argument");
+      }
+
+      SECTION("an opening over several pieces")
+      {
+        // spans the door and the pieces on both sides of it
+        const auto second = f.ok("create_opening", R"({
+          "wall":"G8","side":"+x","width":96,"height":16,"bottom":76})");
+        CHECK(
+          second.value("pieces")
+          == QJsonValue{QJsonObject{
+            {"B2", QJsonArray{"B2", "B11", "B12"}},
+            {"B9", QJsonArray{"B9", "B13"}},
+            {"B10", QJsonArray{"B10", "B14", "B15"}},
+          }});
+        CHECK(f.ok("check_brush_overlaps").value("pairs") == QJsonValue{QJsonArray{}});
+        CHECK_FALSE(solid({328, 24, 84}));
+        CHECK_FALSE(solid({328, 64, 84}));
+        CHECK(solid({328, 64, 94}));
+        CHECK(
+          totalVolume(QJsonArray{"B2", "B9", "B10", "B11", "B12", "B13", "B14", "B15"})
+          == 16.0 * 160.0 * 96.0 - 16.0 * 64.0 * 72.0 - 16.0 * 96.0 * 16.0);
+      }
+
+      SECTION("undo restores the wall")
+      {
+        f.ok("undo");
+        CHECK(boundsOf("B2") == box({320, -16, 0}, {336, 144, 96}));
+        CHECK(solid({328, 64, 36}));
+      }
+    }
+
+    SECTION("cuts into every wall of a room rotated by 90 degrees")
+    {
+      // after the rotation, the y walls span the corners instead of the x walls
+      f.ok("create_room", R"({
+        "inner_bounds":{"min":[0,0,0],"max":[256,128,96]},"group_name":"room"})");
+      f.ok(
+        "transform_nodes",
+        R"({"ids":["G8"],"rotate":{"axis":"z","angle_degrees":90,"center":[0,0,0]}})");
+      // inner bounds are now x -128..0, y 0..256
+      const auto py =
+        f.ok("create_opening", R"({"wall":"G8","side":"+y","width":64,"height":72})");
+      CHECK(
+        py.value("opening")
+        == QJsonValue{
+          QJsonObject{{"side", "+y"}, {"bounds", box({-96, 256, 0}, {-32, 272, 72})}}});
+      const auto px =
+        f.ok("create_opening", R"({"wall":"G8","side":"+x","width":64,"height":72})");
+      CHECK(
+        px.value("opening")
+        == QJsonValue{
+          QJsonObject{{"side", "+x"}, {"bounds", box({0, 96, 0}, {16, 160, 72})}}});
+      // the opening may span the whole inner side of the wall, but not the corners
+      f.ok("create_opening", R"({"wall":"G8","side":"-x","width":256,"height":32})");
+      CHECK(
+        f.err("create_opening", R"({"wall":"G8","side":"-y","width":129,"height":32})")
+        == "invalid_argument");
+      f.ok("create_opening", R"({"wall":"G8","side":"-y","width":128,"height":32})");
+      CHECK(f.ok("check_brush_overlaps").value("pairs") == QJsonValue{QJsonArray{}});
+      CHECK_FALSE(solid({-64, 264, 36}));
+      CHECK_FALSE(solid({8, 128, 36}));
+      CHECK(solid({8, 264, 36}));
+    }
+
+    SECTION("a wall brush keeps its face attributes")
+    {
+      auto* wall = addBrush(f.map, vm::bbox3d{{0, 0, 0}, {16, 128, 96}}, "brick");
+      REQUIRE(f.id(*wall) == "B2");
+      f.ok(
+        "set_face_attributes",
+        R"({"faces":[{"brush":"B2","side":"+x"}],"offset":[5,7]})");
+
+      const auto result = f.ok(
+        "create_opening", R"({"wall":"B2","width":32,"height":64,"material":"trim"})");
+      // without side, the thinner horizontal axis is the thickness
+      CHECK(
+        result.value("opening")
+        == QJsonValue{QJsonObject{{"bounds", box({0, 48, 0}, {16, 80, 64})}}});
+      CHECK(
+        result.value("pieces")
+        == QJsonValue{QJsonObject{{"B2", QJsonArray{"B2", "B3", "B4"}}}});
+      CHECK(boundsOf("B2") == box({0, 0, 0}, {16, 48, 96}));
+      CHECK(boundsOf("B3") == box({0, 48, 64}, {16, 80, 96}));
+      CHECK(boundsOf("B4") == box({0, 80, 0}, {16, 128, 96}));
+
+      // outer faces keep material and offset; the faces in the opening get the material
+      for (const auto& id : {"B2", "B3", "B4"})
+      {
+        CAPTURE(id);
+        CHECK(faceOn(id, "+x").value("material") == QJsonValue{"brick"});
+        CHECK(
+          faceOn(id, "+x").value("uv").toObject().value("offset")
+          == QJsonValue{QJsonArray{5, 7}});
+        CHECK(faceOn(id, "-x").value("material") == QJsonValue{"brick"});
+      }
+      CHECK(faceOn("B2", "+y").value("material") == QJsonValue{"trim"});
+      CHECK(faceOn("B2", "-y").value("material") == QJsonValue{"brick"});
+      CHECK(faceOn("B3", "-z").value("material") == QJsonValue{"trim"});
+      CHECK(faceOn("B3", "+z").value("material") == QJsonValue{"brick"});
+      CHECK(faceOn("B4", "-y").value("material") == QJsonValue{"trim"});
+      CHECK(faceOn("B4", "+y").value("material") == QJsonValue{"brick"});
+    }
+
+    SECTION("without material, the new faces copy the wall's faces")
+    {
+      addBrush(f.map, vm::bbox3d{{0, 0, 0}, {128, 8, 64}}, "brick");
+      const auto result = f.ok(
+        "create_opening",
+        R"({"wall":"B2","side":"-y","offset":-32,"width":32,"height":32,"bottom":16})");
+      CHECK(
+        result.value("opening")
+        == QJsonValue{
+          QJsonObject{{"side", "-y"}, {"bounds", box({16, 0, 16}, {48, 8, 48})}}});
+      CHECK(result.value("pieces").toObject().value("B2").toArray().size() == 4);
+      for (const auto& id : {"B2", "B3", "B4", "B5"})
+      {
+        CHECK(nodeOf(id).value("materials") == QJsonValue{QJsonArray{"brick"}});
+      }
+    }
+
+    SECTION("an opening as large as a brush removes it")
+    {
+      addBrush(f.map, vm::bbox3d{{0, 0, 0}, {16, 64, 64}});
+      const auto result =
+        f.ok("create_opening", R"({"wall":"B2","width":64,"height":64})");
+      CHECK(result.value("pieces") == QJsonValue{QJsonObject{}});
+      CHECK(result.value("removed") == QJsonValue{QJsonArray{"B2"}});
+      CHECK(
+        result.value("changes").toObject().value("removed")
+        == QJsonValue{QJsonArray{"B2"}});
+    }
+
+    SECTION("removing the only brush of the open group")
+    {
+      auto* brush = addBrush(f.map, vm::bbox3d{{0, 0, 0}, {16, 64, 64}});
+      groupNodes(f.map, {brush}, "wall");
+      mdl::deselectAll(f.map);
+      f.ok("open_group", R"({"id":"G3"})");
+      const auto result =
+        f.ok("create_opening", R"({"wall":"B2","width":64,"height":64})");
+      CHECK(result.value("removed") == QJsonValue{QJsonArray{"B2"}});
+      CHECK(f.map.editorContext().currentGroup() == nullptr);
+      // undo brings the brush and its group back (under new ids)
+      f.ok("undo");
+      CHECK(solid({8, 32, 32}));
+    }
+
+    SECTION("errors")
+    {
+      f.ok("create_room", R"({
+        "inner_bounds":{"min":[0,0,0],"max":[256,128,96]},"group_name":"room"})");
+      addBrush(f.map, vm::bbox3d{{512, 0, 0}, {576, 64, 64}});
+      auto* light = addPointEntity(f.map, "light", {64, 64, 64});
+      f.ok("create_brush_from_points", R"({"points":[[600,0,0],[664,0,0],[600,64,0],
+        [664,64,0],[664,0,32],[664,64,32]]})");
+      auto* floorOnly = addBrush(f.map, vm::bbox3d{{0, 512, 0}, {64, 576, 16}});
+      groupNodes(f.map, {floorOnly}, "floor");
+      mdl::deselectAll(f.map);
+      REQUIRE(f.id(*light) == "E10");
+      const auto wedge = QString{"B11"};
+
+      const auto before = snapshot(f.map);
+      const auto check = [&](const QString& args, const char* code, const char* pointer) {
+        CAPTURE(args);
+        const auto error = f.error("create_opening", args.toUtf8().constData());
+        CHECK(error.value("code") == QJsonValue{code});
+        if (pointer)
+        {
+          CHECK(
+            error.value("details").toObject().value("pointer") == QJsonValue{pointer});
+        }
+        CHECK(snapshot(f.map) == before);
+      };
+
+      check(R"({"wall":"G8","width":32,"height":32})", "invalid_argument", "/side");
+      check(
+        R"({"wall":"G8","side":"+x","width":160,"height":32})",
+        "invalid_argument",
+        "/width");
+      check(
+        R"({"wall":"G8","side":"+x","width":32,"height":32,"offset":60})",
+        "invalid_argument",
+        "/width");
+      check(
+        R"({"wall":"G8","side":"-y","width":32,"height":32,"bottom":80})",
+        "invalid_argument",
+        "/height");
+      check(
+        R"({"wall":"G8","side":"-y","width":32,"height":32,"offset":0,"center":4})",
+        "invalid_argument",
+        "/center");
+      check(
+        R"({"wall":"G8","side":"+z","width":32,"height":32})",
+        "invalid_argument",
+        "/side");
+      check(R"({"wall":"B9","width":32,"height":32})", "invalid_argument", "/side");
+      check(R"({"wall":"E10","width":32,"height":32})", "wrong_node_type", "/wall");
+      check(
+        QString{R"({"wall":"%1","side":"+x","width":32,"height":16})"}.arg(wedge),
+        "not_supported",
+        nullptr);
+      check(
+        R"({"wall":"G13","side":"+x","width":32,"height":8})",
+        "invalid_argument",
+        "/side");
+      check(R"({"wall":"B99","width":32,"height":32})", "unknown_node", "/wall");
+      check(
+        R"({"wall":"G8","side":"+x","width":32,"height":32,"material":"a b"})",
+        "invalid_argument",
+        "/material");
+      check(
+        R"({"wall":"G8","side":"+x","width":32,"height":0.0001})",
+        "invalid_argument",
+        nullptr);
+
+      // an opening that overlaps an existing one
+      f.ok("create_opening", R"({"wall":"G8","side":"+x","width":32,"height":32})");
+      const auto again = snapshot(f.map);
+      const auto error =
+        f.error("create_opening", R"({"wall":"G8","side":"+x","width":64,"height":32})");
+      CHECK(error.value("code") == QJsonValue{"invalid_argument"});
+      CHECK(error.value("message").toString().contains("existing opening"));
+      CHECK(snapshot(f.map) == again);
+    }
+
+    SECTION("locked and linked walls are refused")
+    {
+      f.ok("create_room", R"({
+        "inner_bounds":{"min":[0,0,0],"max":[128,128,96]},"group_name":"room"})");
+      auto* group = dynamic_cast<mdl::GroupNode*>(f.doc->nodes.lookup(u"G8").node);
+      REQUIRE(group);
+      const auto* wall = group->children().front();
+      const auto args = R"({"wall":"G8","side":"+x","width":32,"height":32})";
+
+      mdl::lockNodes(f.map, {group});
+      CHECK(f.err("create_opening", args) == "node_not_selectable");
+      CHECK(
+        f.err("create_opening", R"({"wall":"B2","width":32,"height":32})")
+        == "node_not_selectable");
+      mdl::unlockNodes(f.map, {group});
+
+      mdl::selectNodes(f.map, {group});
+      REQUIRE(mdl::createLinkedDuplicate(f.map) != nullptr);
+      mdl::deselectAll(f.map);
+      const auto before = snapshot(f.map);
+      CHECK(f.err("create_opening", args) == "not_supported");
+      CHECK(
+        f.err("create_opening", R"({"wall":"B2","width":32,"height":32})")
+        == "not_supported");
+      CHECK(snapshot(f.map) == before);
+      CHECK(f.doc->nodes.isLive(wall));
+    }
+  }
+
+  SECTION("create_corridor")
+  {
+    const auto addLights = [&](const std::vector<vm::vec3d>& origins) {
+      for (const auto& origin : origins)
+      {
+        addPointEntity(f.map, "light", origin);
+      }
+    };
+    const auto sealed = [&]() { return f.ok("check_leaks").value("sealed").toBool(); };
+
+    SECTION("straight between two rooms")
+    {
+      const auto a = f.ok("create_room", R"({
+        "inner_bounds":{"min":[0,0,0],"max":[512,512,256]},
+        "openings":[{"side":"+x","width":128,"height":128}]})");
+      const auto b = f.ok("create_room", R"({
+        "inner_bounds":{"min":[640,0,0],"max":[1152,512,256]},
+        "openings":[{"side":"-x","width":128,"height":128}]})");
+      const auto from = a.value("openings").toArray()[0];
+      const auto to = b.value("openings").toArray()[0];
+      addLights({{256, 256, 128}, {896, 256, 128}});
+      CHECK_FALSE(sealed());
+
+      const auto result = f.ok(
+        "create_corridor", QJsonObject{{"from", from}, {"to", to}, {"material", "c"}});
+      CHECK(result.value("shape") == QJsonValue{"straight"});
+      CHECK(
+        result.value("interior_bounds")
+        == QJsonValue{QJsonArray{box({528, 192, 0}, {624, 320, 128})}});
+      const auto ids = result.value("ids").toArray();
+      REQUIRE(ids.size() == 4);
+      CHECK(result.value("floor") == QJsonValue{QJsonArray{ids[0]}});
+      CHECK(result.value("ceiling") == QJsonValue{QJsonArray{ids[1]}});
+      CHECK(result.value("walls") == QJsonValue{QJsonArray{ids[2], ids[3]}});
+      CHECK(boundsOf(ids[0].toString()) == box({528, 176, -16}, {624, 336, 0}));
+      CHECK(boundsOf(ids[1].toString()) == box({528, 176, 128}, {624, 336, 144}));
+      CHECK(boundsOf(ids[2].toString()) == box({528, 176, 0}, {624, 192, 128}));
+      CHECK(boundsOf(ids[3].toString()) == box({528, 320, 0}, {624, 336, 128}));
+      CHECK(nodeOf(ids[0].toString()).value("materials") == QJsonValue{QJsonArray{"c"}});
+      CHECK(result.value("undo_label") == QJsonValue{"MCP: Create Corridor"});
+      CHECK_FALSE(result.contains("group"));
+
+      CHECK(f.ok("check_brush_overlaps").value("pairs") == QJsonValue{QJsonArray{}});
+      CHECK(sealed());
+      CHECK_FALSE(solid({576, 256, 64}));
+      CHECK_FALSE(solid({520, 256, 64}));
+
+      SECTION("the corridor is needed to seal the rooms")
+      {
+        f.ok("delete_nodes", QJsonObject{{"ids", QJsonArray{ids[1]}}});
+        CHECK_FALSE(sealed());
+      }
+
+      SECTION("the other way round gives the same corridor")
+      {
+        auto expected = QJsonArray{};
+        for (const auto& id : ids)
+        {
+          expected.append(boundsOf(id.toString()));
+        }
+        f.ok("undo");
+        const auto back = f.ok(
+          "create_corridor",
+          QJsonObject{{"from", to}, {"to", from}, {"group_name", "c"}});
+        CHECK(back.value("interior_bounds") == result.value("interior_bounds"));
+        const auto backIds = back.value("ids").toArray();
+        REQUIRE(backIds.size() == 4);
+        for (qsizetype i = 0; i < 4; ++i)
+        {
+          CHECK(boundsOf(backIds[i].toString()) == expected[i]);
+        }
+        CHECK(back.contains("group"));
+        CHECK(sealed());
+      }
+    }
+
+    SECTION("L-shaped between openings cut with create_opening")
+    {
+      f.ok("create_room", R"({
+        "inner_bounds":{"min":[0,0,0],"max":[256,256,128]},"group_name":"a"})");
+      f.ok("create_room", R"({
+        "inner_bounds":{"min":[0,0,0],"max":[256,256,128]},"group_name":"b"})");
+      // the room is built in place and moved, as an agent would
+      f.ok("transform_nodes", R"({"ids":["G15"],"translate":[400,400,0]})");
+      const auto from =
+        f.ok("create_opening", R"({"wall":"G8","side":"+x","width":64,"height":96})")
+          .value("opening");
+      const auto to =
+        f.ok("create_opening", R"({"wall":"G15","side":"-y","width":64,"height":96})")
+          .value("opening");
+      CHECK(
+        to
+        == QJsonValue{
+          QJsonObject{{"side", "-y"}, {"bounds", box({496, 384, 0}, {560, 400, 96})}}});
+      addLights({{128, 128, 64}, {528, 528, 64}});
+
+      const auto result =
+        f.ok("create_corridor", QJsonObject{{"from", from}, {"to", to}});
+      CHECK(result.value("shape") == QJsonValue{"l_shaped"});
+      CHECK(
+        result.value("interior_bounds")
+        == QJsonValue{QJsonArray{
+          box({272, 96, 0}, {496, 160, 96}),
+          box({496, 96, 0}, {560, 160, 96}),
+          box({496, 160, 0}, {560, 384, 96}),
+        }});
+      const auto boundsList = [&](const QJsonValue& ids) {
+        auto list = QJsonArray{};
+        for (const auto& id : ids.toArray())
+        {
+          list.append(boundsOf(id.toString()));
+        }
+        return list;
+      };
+      CHECK(
+        boundsList(result.value("floor"))
+        == QJsonArray{
+          box({272, 80, -16}, {576, 176, 0}), box({480, 176, -16}, {576, 384, 0})});
+      CHECK(
+        boundsList(result.value("ceiling"))
+        == QJsonArray{
+          box({272, 80, 96}, {576, 176, 112}), box({480, 176, 96}, {576, 384, 112})});
+      CHECK(
+        boundsList(result.value("walls"))
+        == QJsonArray{
+          box({272, 80, 0}, {576, 96, 96}),
+          box({560, 96, 0}, {576, 384, 96}),
+          box({272, 160, 0}, {496, 176, 96}),
+          box({480, 176, 0}, {496, 384, 96}),
+        });
+      CHECK(f.ok("check_brush_overlaps").value("pairs") == QJsonValue{QJsonArray{}});
+      CHECK(sealed());
+      CHECK_FALSE(solid({528, 128, 48}));
+      CHECK_FALSE(solid({528, 300, 48}));
+      CHECK_FALSE(compactJson(result.value("warnings")).contains("overlap"));
+
+      SECTION("the other way round gives the same space")
+      {
+        f.ok("undo");
+        const auto back =
+          f.ok("create_corridor", QJsonObject{{"from", to}, {"to", from}});
+        CHECK(back.value("shape") == QJsonValue{"l_shaped"});
+        const auto interiors = back.value("interior_bounds").toArray();
+        REQUIRE(interiors.size() == 3);
+        CHECK(interiors[0] == box({496, 160, 0}, {560, 384, 96}));
+        CHECK(interiors[1] == box({496, 96, 0}, {560, 160, 96}));
+        CHECK(interiors[2] == box({272, 96, 0}, {496, 160, 96}));
+        CHECK(f.ok("check_brush_overlaps").value("pairs") == QJsonValue{QJsonArray{}});
+        CHECK(sealed());
+      }
+
+      SECTION("a corner right at the wall needs no first segment")
+      {
+        f.ok("undo");
+        // the second opening starts right where the first wall ends
+        const auto near =
+          QJsonObject{{"side", "+x"}, {"bounds", box({256, 96, 0}, {272, 160, 96})}};
+        const auto close =
+          QJsonObject{{"side", "-y"}, {"bounds", box({272, 384, 0}, {336, 400, 96})}};
+        const auto corner =
+          f.ok("create_corridor", QJsonObject{{"from", near}, {"to", close}});
+        CHECK(
+          corner.value("interior_bounds")
+          == QJsonValue{QJsonArray{
+            box({272, 96, 0}, {336, 160, 96}), box({272, 160, 0}, {336, 384, 96})}});
+        CHECK(f.ok("check_brush_overlaps").value("pairs") == QJsonValue{QJsonArray{}});
+      }
+    }
+
+    SECTION("openings that differ slightly use their overlap")
+    {
+      const auto from =
+        QJsonObject{{"side", "+x"}, {"bounds", box({0, 0, 0}, {16, 64, 96})}};
+      const auto to =
+        QJsonObject{{"side", "-x"}, {"bounds", box({128, 8, 0}, {144, 72, 80})}};
+      const auto result =
+        f.ok("create_corridor", QJsonObject{{"from", from}, {"to", to}});
+      CHECK(
+        result.value("interior_bounds")
+        == QJsonValue{QJsonArray{box({16, 8, 0}, {128, 64, 80})}});
+    }
+
+    SECTION("warns about brushes in the way")
+    {
+      addBrush(f.map, vm::bbox3d{{64, 16, 0}, {80, 48, 32}});
+      addBrush(f.map, vm::bbox3d{{64, -16, 0}, {80, 0, 32}});
+      const auto from =
+        QJsonObject{{"side", "+x"}, {"bounds", box({0, 0, 0}, {16, 64, 96})}};
+      const auto to =
+        QJsonObject{{"side", "-x"}, {"bounds", box({128, 0, 0}, {144, 64, 96})}};
+      const auto warnings =
+        compactJson(f.ok("create_corridor", QJsonObject{{"from", from}, {"to", to}})
+                      .value("warnings"));
+      CHECK(warnings.contains("the corridor brushes overlap B3"));
+      CHECK(warnings.contains("the corridor interior is blocked by B2"));
+    }
+
+    SECTION("errors")
+    {
+      const auto before = snapshot(f.map);
+      const auto open = [](const char* side, const QJsonValue& bounds) {
+        auto result = QJsonObject{{"bounds", bounds}};
+        if (side)
+        {
+          result["side"] = side;
+        }
+        return result;
+      };
+      const auto px = box({0, 0, 0}, {16, 64, 96});
+      const auto check = [&](
+                           const QJsonObject& from,
+                           const QJsonObject& to,
+                           const char* code,
+                           const char* pointer,
+                           const char* message = nullptr) {
+        CAPTURE(from, to);
+        const auto error =
+          f.error("create_corridor", QJsonObject{{"from", from}, {"to", to}});
+        CHECK(error.value("code") == QJsonValue{code});
+        if (pointer)
+        {
+          CHECK(
+            error.value("details").toObject().value("pointer") == QJsonValue{pointer});
+        }
+        if (message)
+        {
+          CHECK(error.value("message").toString().contains(message));
+        }
+        CHECK(snapshot(f.map) == before);
+      };
+
+      // parallel walls without overlap
+      check(
+        open("+x", px),
+        open("-x", box({128, 100, 0}, {144, 164, 96})),
+        "invalid_argument",
+        "/to/bounds",
+        "do not overlap along y");
+      // facing away
+      check(
+        open("-x", px),
+        open("-x", box({128, 0, 0}, {144, 64, 96})),
+        "invalid_argument",
+        "/from/side");
+      check(
+        open("+x", px),
+        open("+x", box({128, 0, 0}, {144, 64, 96})),
+        "invalid_argument",
+        "/to/side");
+      // the same opening
+      check(open("+x", px), open("-x", px), "invalid_argument", "/to/bounds");
+      // touching walls
+      check(
+        open("+x", px),
+        open("-x", box({16, 0, 0}, {32, 64, 96})),
+        "invalid_argument",
+        "/to/bounds",
+        "touch");
+      // no common height
+      check(
+        open("+x", px),
+        open("-x", box({128, 0, 100}, {144, 64, 196})),
+        "invalid_argument",
+        "/to/bounds",
+        "height");
+      // much wider than the other
+      check(
+        open("+x", px),
+        open("-x", box({128, 0, 0}, {144, 128, 96})),
+        "invalid_argument",
+        "/to/bounds",
+        "wall_thickness");
+      check(
+        open("+x", px),
+        open("-x", box({128, 0, 0}, {144, 64, 32})),
+        "invalid_argument",
+        "/from/bounds",
+        "height");
+      // the direction through the wall is unclear
+      check(
+        open(nullptr, box({0, 0, 0}, {16, 16, 96})),
+        open("-x", box({128, 0, 0}, {144, 64, 96})),
+        "invalid_argument",
+        "/from");
+      check(
+        open("+x", box({0, 0, 0}, {16, 64, 0})),
+        open("-x", box({128, 0, 0}, {144, 64, 96})),
+        "invalid_argument",
+        "/from/bounds");
+      // perpendicular walls without room for the turn
+      check(
+        open("+x", px),
+        open("-y", box({8, 128, 0}, {72, 144, 96})),
+        "invalid_argument",
+        "/to/bounds",
+        "turn");
+      check(
+        open("+x", px),
+        open("-y", box({64, 32, 0}, {128, 48, 96})),
+        "invalid_argument",
+        "/to/bounds",
+        "turn");
+      check(
+        open("+x", px),
+        open("+y", box({64, 128, 0}, {128, 144, 96})),
+        "invalid_argument",
+        "/to/side");
+      // outside the world
+      check(
+        open("+x", box({30000, 0, 0}, {32000, 64, 96})),
+        open("-x", box({40000, 0, 0}, {40016, 64, 96})),
+        "out_of_world_bounds",
+        nullptr);
+      CHECK(
+        f.err(
+          "create_corridor",
+          QJsonObject{{"from", open("+x", px)}, {"to", open("+x", px)}, {"bogus", 1}})
+        == "invalid_argument");
+      CHECK(
+        f.err(
+          "create_corridor",
+          QJsonObject{
+            {"from", QJsonObject{{"bounds", px}, {"side", "+z"}}},
+            {"to", open("-x", box({128, 0, 0}, {144, 64, 96}))}})
+        == "invalid_argument");
     }
   }
 

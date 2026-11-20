@@ -195,6 +195,16 @@ TEST_CASE("McpDeterminism")
       R"({"inner_bounds":{"min":[1024,0,0],"max":[1280,256,128]},
           "openings":[{"side":"-x","width":64,"height":96}],"group_name":"room2"})"},
     Call{
+      "batch",
+      R"({"operations":[
+          {"tool":"create_box_brush","arguments":{"bounds":{"min":[1400,0,0],"max":[1416,256,128]}}},
+          {"tool":"create_opening","arguments":{"wall":"$0","offset":-32,"width":48,"height":64,"bottom":8}}]})"},
+    Call{
+      "create_corridor",
+      R"({"from":{"side":"-x","bounds":{"min":[1008,96,0],"max":[1024,160,96]}},
+          "to":{"side":"-y","bounds":{"min":[880,640,0],"max":[944,656,96]}},
+          "group_name":"corridor"})"},
+    Call{
       "create_stairs",
       R"({"start":[1100,128,0],"direction":"+y","steps":4,"step_height":8.5})"},
     Call{"create_entity", R"({"classname":"light","origin":[1100,64,100]})"},

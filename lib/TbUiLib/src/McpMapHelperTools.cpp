@@ -63,10 +63,12 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <limits>
 #include <map>
 #include <optional>
 #include <set>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace tb::ui
@@ -684,6 +686,1326 @@ McpToolDef createRoomTool()
     .annotations = Mutating,
     .allowedInBatch = true,
     .run = createRoom,
+  };
+}
+
+// create_opening
+
+/** The horizontal axis along a wall whose thickness is along the given axis. */
+size_t otherHorizontalAxis(const size_t axis)
+{
+  return axis == 0 ? 1 : 0;
+}
+
+QString axisName(const size_t axis)
+{
+  return axis == 0 ? "x" : axis == 1 ? "y" : "z";
+}
+
+QString sideName(const size_t axis, const double sign)
+{
+  return (sign > 0 ? "+" : "-") + axisName(axis);
+}
+
+double volume(const vm::bbox3d& box)
+{
+  const auto size = box.size();
+  return size.x() * size.y() * size.z();
+}
+
+/** The intersection of the boxes, if it has a volume. */
+std::optional<vm::bbox3d> intersection(const vm::bbox3d& lhs, const vm::bbox3d& rhs)
+{
+  auto min = vm::vec3d{};
+  auto max = vm::vec3d{};
+  for (size_t i = 0; i < 3; ++i)
+  {
+    min[i] = std::max(lhs.min[i], rhs.min[i]);
+    max[i] = std::min(lhs.max[i], rhs.max[i]);
+    if (max[i] - min[i] <= Epsilon)
+    {
+      return std::nullopt;
+    }
+  }
+  return vm::bbox3d{min, max};
+}
+
+/** Whether the brush is an axis-aligned cuboid, i.e. equal to its bounds. */
+bool isCuboid(const mdl::Brush& brush)
+{
+  if (brush.faceCount() != 6)
+  {
+    return false;
+  }
+  return std::ranges::all_of(brush.faces(), [](const auto& face) {
+    const auto& normal = face.boundary().normal;
+    return std::ranges::any_of(std::array{0, 1, 2}, [&](const auto i) {
+      return std::abs(std::abs(normal[size_t(i)]) - 1.0) < 1e-9;
+    });
+  });
+}
+
+/**
+ * Creates a cuboid piece of the given brush. Each face of the piece copies the material,
+ * UV and surface attributes of the brush's face with the same normal, so the pieces look
+ * like the brush. Faces that do not lie on a face of the brush, i.e. the new faces around
+ * an opening, get cutMaterial if one is given.
+ */
+McpResult<mdl::Brush> brushPiece(
+  const mdl::Map& map,
+  const mdl::Brush& brush,
+  const vm::bbox3d& bounds,
+  const std::optional<std::string>& cutMaterial)
+{
+  if (auto check = boxInWorld(map, bounds.min, bounds.max); check.is_error())
+  {
+    auto error = errorOf(check);
+    error.message = "a piece of the wall: " + error.message;
+    error.hint =
+      "keep the opening at least 1/1024 away from the edges of the wall "
+      "brushes, or align it with them";
+    return error;
+  }
+  auto piece = brushBuilder(map).createCuboid(bounds, mdl::BrushFace::NoMaterialName);
+  if (piece.is_error())
+  {
+    return toolError(
+      "geometry_invalid",
+      QString::fromStdString(std::get<Error>(piece.error()).msg),
+      "check the sizes");
+  }
+  auto result = std::move(piece).value();
+  for (auto& face : result.faces())
+  {
+    const auto index = brush.findFace(face.boundary().normal);
+    if (!index)
+    {
+      continue;
+    }
+    const auto& original = brush.face(*index);
+    if (const auto snapshot = original.takeUvCoordSystemSnapshot())
+    {
+      face.restoreUvCoordSystemSnapshot(*snapshot);
+    }
+    face.copyAttributes(original);
+    if (
+      cutMaterial
+      && !vm::is_equal(face.boundary(), original.boundary(), vm::Cd::almost_zero()))
+    {
+      face.setMaterialName(*cutMaterial);
+    }
+  }
+  return result;
+}
+
+/** Whether the brush can be changed, even inside a closed group. */
+McpResult<void> requireEditableBrush(
+  const McpDocumentState& doc, const mdl::BrushNode& brushNode)
+{
+  const auto& editorContext = doc.map.editorContext();
+  if (!editorContext.visible(brushNode) || !editorContext.editable(brushNode))
+  {
+    const auto id = doc.nodes.idOf(brushNode);
+    return toolError(
+      "node_not_selectable",
+      QString{"%1 is hidden or locked"}.arg(id),
+      "show and unlock it first",
+      {{"id", id}, {"reason", editorContext.visible(brushNode) ? "locked" : "hidden"}});
+  }
+  return requireNotLinked(doc, brushNode);
+}
+
+/** The wall to cut an opening into: a brush or the walls on one side of a room. */
+struct Wall
+{
+  /** The axis of the wall's thickness. */
+  size_t axis;
+  /** The side of its room the wall is on, if known. */
+  std::optional<double> sign;
+  /** The candidates to cut, in DFS order. */
+  std::vector<mdl::BrushNode*> brushNodes;
+  /** The extent of the wall through its thickness. */
+  double slabMin;
+  double slabMax;
+  /** Where an opening may be along the wall and vertically. */
+  double alongMin;
+  double alongMax;
+  double zMin;
+  double zMax;
+};
+
+McpResult<Wall> brushWall(
+  const McpDocumentState& doc,
+  mdl::BrushNode& brushNode,
+  const std::optional<QString>& side)
+{
+  if (auto check = requireEditableBrush(doc, brushNode); check.is_error())
+  {
+    return errorOf(check);
+  }
+  const auto id = doc.nodes.idOf(brushNode);
+  if (!isCuboid(brushNode.brush()))
+  {
+    return toolError(
+      "not_supported",
+      QString{"%1 is not an axis-aligned cuboid"}.arg(id),
+      "cut it with csg_subtract and a box instead",
+      {{"id", id}});
+  }
+
+  const auto& b = brushNode.logicalBounds();
+  auto axis = size_t(0);
+  if (side)
+  {
+    axis = sideAxis(*side);
+  }
+  else if (std::abs(b.size().x() - b.size().y()) <= Epsilon)
+  {
+    return invalidArgument(
+      "/side",
+      QString{"%1 is as thick in x as in y, so the direction through the wall is unclear"}
+        .arg(id),
+      "pass side");
+  }
+  else
+  {
+    axis = b.size().x() < b.size().y() ? 0 : 1;
+  }
+  const auto along = otherHorizontalAxis(axis);
+  return Wall{
+    .axis = axis,
+    .sign = side ? std::optional{sideSign(*side)} : std::nullopt,
+    .brushNodes = {&brushNode},
+    .slabMin = b.min[axis],
+    .slabMax = b.max[axis],
+    .alongMin = b.min[along],
+    .alongMax = b.max[along],
+    .zMin = b.min.z(),
+    .zMax = b.max.z(),
+  };
+}
+
+/**
+ * The walls on one side of a room group laid out like create_room does it: the brushes
+ * in the group that reach the outer face of the group on that side but not across the
+ * group; the walls of one axis span the corners (the x walls, unless the room was
+ * rotated). Openings must lie between the walls of the two
+ * neighbouring sides and within the height of the walls, as in create_room.
+ */
+McpResult<Wall> roomWall(
+  const McpDocumentState& doc, mdl::GroupNode& groupNode, const QString& side)
+{
+  const auto& map = doc.map;
+  const auto id = doc.nodes.idOf(groupNode);
+  const auto& editorContext = map.editorContext();
+  if (!editorContext.visible(groupNode) || !editorContext.editable(groupNode))
+  {
+    return toolError(
+      "node_not_selectable",
+      QString{"%1 is hidden or locked"}.arg(id),
+      "show and unlock it first",
+      {{"id", id}, {"reason", editorContext.visible(groupNode) ? "locked" : "hidden"}});
+  }
+  if (auto check = requireNotLinked(doc, groupNode); check.is_error())
+  {
+    return errorOf(check);
+  }
+
+  auto brushNodes = std::vector<mdl::BrushNode*>{};
+  const auto collect = [&](const auto& self, mdl::Node& node) -> void {
+    for (auto* child : node.children())
+    {
+      if (auto* brushNode = dynamic_cast<mdl::BrushNode*>(child))
+      {
+        brushNodes.push_back(brushNode);
+      }
+      else if (dynamic_cast<mdl::GroupNode*>(child))
+      {
+        self(self, *child);
+      }
+    }
+  };
+  collect(collect, groupNode);
+  if (brushNodes.empty())
+  {
+    return toolError(
+      "invalid_argument",
+      QString{"%1 contains no brushes"}.arg(id),
+      "pass a room group made by create_room, or a wall brush",
+      {{"pointer", "/wall"}});
+  }
+
+  auto outer = brushNodes.front()->logicalBounds();
+  for (const auto* brushNode : brushNodes)
+  {
+    outer = vm::merge(outer, brushNode->logicalBounds());
+  }
+
+  const auto touches = [&](const vm::bbox3d& b, const size_t axis, const double sign) {
+    return sign > 0 ? std::abs(b.max[axis] - outer.max[axis]) <= Epsilon
+                    : std::abs(b.min[axis] - outer.min[axis]) <= Epsilon;
+  };
+  const auto touchesAny = [&](const vm::bbox3d& b, const size_t axis) {
+    return touches(b, axis, -1.0) || touches(b, axis, 1.0);
+  };
+
+  // the walls of one horizontal axis own the corners: in create_room the x walls, but
+  // after a rotation by 90 degrees the y walls; a corner brush is thinner across its wall
+  // than along it
+  auto votes = std::array<size_t, 2>{};
+  for (const auto* brushNode : brushNodes)
+  {
+    const auto& b = brushNode->logicalBounds();
+    const auto full = [&](const size_t axis) {
+      return b.size()[axis] >= outer.size()[axis] - Epsilon;
+    };
+    if (touchesAny(b, 0) && touchesAny(b, 1) && !(full(0) && full(1)))
+    {
+      if (b.size().x() < b.size().y() - Epsilon)
+      {
+        ++votes[0];
+      }
+      else if (b.size().y() < b.size().x() - Epsilon)
+      {
+        ++votes[1];
+      }
+    }
+  }
+  const auto cornerAxis = votes[1] > votes[0] ? size_t(1) : size_t(0);
+
+  // the brushes that form the wall on the given side of the group; the other walls must
+  // not reach the outer faces of the walls that own the corners
+  const auto wallsOn = [&](const size_t axis, const double sign) {
+    auto result = std::vector<mdl::BrushNode*>{};
+    for (auto* brushNode : brushNodes)
+    {
+      const auto& b = brushNode->logicalBounds();
+      if (
+        touches(b, axis, sign) && b.size()[axis] < outer.size()[axis] - Epsilon
+        && (axis == cornerAxis || !touchesAny(b, cornerAxis)))
+      {
+        result.push_back(brushNode);
+      }
+    }
+    return result;
+  };
+
+  const auto axis = sideAxis(side);
+  const auto sign = sideSign(side);
+  const auto along = otherHorizontalAxis(axis);
+  auto walls = wallsOn(axis, sign);
+  if (walls.empty())
+  {
+    return toolError(
+      "invalid_argument",
+      QString{"%1 has no wall on its %2 side"}.arg(id, side),
+      "pass a room group made by create_room, or a wall brush",
+      {{"pointer", "/side"}});
+  }
+
+  auto wall = Wall{
+    .axis = axis,
+    .sign = sign,
+    .brushNodes = walls,
+    .slabMin = outer.max[axis],
+    .slabMax = outer.min[axis],
+    .alongMin = outer.min[along],
+    .alongMax = outer.max[along],
+    .zMin = outer.max.z(),
+    .zMax = outer.min.z(),
+  };
+  for (const auto* brushNode : walls)
+  {
+    const auto& b = brushNode->logicalBounds();
+    wall.slabMin = std::min(wall.slabMin, b.min[axis]);
+    wall.slabMax = std::max(wall.slabMax, b.max[axis]);
+    wall.zMin = std::min(wall.zMin, b.min.z());
+    wall.zMax = std::max(wall.zMax, b.max.z());
+  }
+  // openings stay between the neighbouring walls
+  for (const auto* brushNode : wallsOn(along, -1.0))
+  {
+    wall.alongMin = std::max(wall.alongMin, brushNode->logicalBounds().max[along]);
+  }
+  for (const auto* brushNode : wallsOn(along, 1.0))
+  {
+    wall.alongMax = std::min(wall.alongMax, brushNode->logicalBounds().min[along]);
+  }
+  if (wall.alongMax - wall.alongMin <= Epsilon)
+  {
+    return toolError(
+      "invalid_argument",
+      QString{"the %1 wall of %2 has no room for an opening"}.arg(side, id),
+      "pass a wall brush instead",
+      {{"pointer", "/wall"}});
+  }
+  return wall;
+}
+
+McpResult<QJsonObject> createOpening(McpCallContext& context, const QJsonObject& args)
+{
+  auto& doc = context.doc;
+  auto& map = doc.map;
+
+  const auto wallId = args.value("wall").toString();
+  const auto side = optionalString(args, "side");
+  auto node = resolveNode(doc, wallId);
+  if (node.is_error())
+  {
+    auto error = errorOf(node);
+    error.details["pointer"] = "/wall";
+    return error;
+  }
+
+  const auto wallResult = [&]() -> McpResult<Wall> {
+    if (auto* brushNode = dynamic_cast<mdl::BrushNode*>(node.value()))
+    {
+      return brushWall(doc, *brushNode, side);
+    }
+    if (auto* groupNode = dynamic_cast<mdl::GroupNode*>(node.value()))
+    {
+      if (!side)
+      {
+        return invalidArgument(
+          "/side",
+          QString{"%1 is a group; pass the side of the room to cut into"}.arg(wallId),
+          "e.g. \"side\":\"+x\" for the wall at the room's maximum x");
+      }
+      return roomWall(doc, *groupNode, *side);
+    }
+    return toolError(
+      "wrong_node_type",
+      QString{"%1 is a %2, not a brush or group"}.arg(
+        wallId, nodeTypeName(*node.value())),
+      "pass a wall brush, or a room group with side",
+      {{"pointer", "/wall"}});
+  }();
+  if (wallResult.is_error())
+  {
+    return errorOf(wallResult);
+  }
+  const auto& wall = wallResult.value();
+  const auto along = otherHorizontalAxis(wall.axis);
+
+  if (args.contains("center") && args.contains("offset"))
+  {
+    return invalidArgument(
+      "/center",
+      "pass center or offset, not both",
+      "center is a coordinate, offset is relative to the middle of the wall");
+  }
+  const auto middle = (wall.alongMin + wall.alongMax) / 2.0;
+  const auto center = args.contains("center")
+                        ? args.value("center").toDouble()
+                        : middle + args.value("offset").toDouble(0.0);
+  const auto width = args.value("width").toDouble();
+  const auto bottom = wall.zMin + args.value("bottom").toDouble(0.0);
+  const auto height = args.value("height").toDouble();
+
+  auto min = vm::vec3d{};
+  auto max = vm::vec3d{};
+  min[wall.axis] = wall.slabMin;
+  max[wall.axis] = wall.slabMax;
+  min[along] = center - width / 2.0;
+  max[along] = center + width / 2.0;
+  min[2] = bottom;
+  max[2] = bottom + height;
+  const auto hole = vm::bbox3d{min, max};
+
+  if (
+    hole.min[along] < wall.alongMin - Epsilon
+    || hole.max[along] > wall.alongMax + Epsilon)
+  {
+    return invalidArgument(
+      "/width",
+      QString{"the opening does not fit into the wall: it spans %1 to %2 along %3, but "
+              "the wall spans %4 to %5"}
+        .arg(canon(hole.min[along]))
+        .arg(canon(hole.max[along]))
+        .arg(axisName(along))
+        .arg(canon(wall.alongMin))
+        .arg(canon(wall.alongMax)),
+      "offset is measured from the middle of the wall, center is a coordinate; reduce "
+      "width or move the opening");
+  }
+  if (hole.max.z() > wall.zMax + Epsilon)
+  {
+    return invalidArgument(
+      "/height",
+      QString{"the opening reaches z %1, above the top of the wall at %2"}
+        .arg(canon(hole.max.z()))
+        .arg(canon(wall.zMax)),
+      QString{"bottom is measured from the bottom of the wall at z %1; reduce height or "
+              "bottom"}
+        .arg(canon(wall.zMin)));
+  }
+
+  // the brushes to cut and the solid volume of the hole
+  auto cut = std::vector<mdl::BrushNode*>{};
+  auto solid = 0.0;
+  for (auto* brushNode : wall.brushNodes)
+  {
+    if (const auto common = intersection(brushNode->logicalBounds(), hole))
+    {
+      if (auto check = requireEditableBrush(doc, *brushNode); check.is_error())
+      {
+        return errorOf(check);
+      }
+      if (!isCuboid(brushNode->brush()))
+      {
+        const auto id = doc.nodes.idOf(*brushNode);
+        return toolError(
+          "not_supported",
+          QString{"%1 is not an axis-aligned cuboid"}.arg(id),
+          "cut it with csg_subtract and a box instead",
+          {{"id", id}});
+      }
+      cut.push_back(brushNode);
+      solid += volume(*common);
+    }
+  }
+  if (solid < volume(hole) - 1e-3)
+  {
+    return toolError(
+      "invalid_argument",
+      QString{"the opening is not entirely inside the wall: %1 of its %2 cubic units "
+              "are solid; it overlaps an existing opening or a gap"}
+        .arg(canon(solid))
+        .arg(canon(volume(hole))),
+      "move the opening, or describe_region to see the wall",
+      {{"pointer", "/wall"}, {"bounds", toJson(hole)}});
+  }
+
+  auto cutMaterial = std::optional<std::string>{};
+  if (args.contains("material"))
+  {
+    auto material = materialArgument(map, args, {"material"});
+    if (material.is_error())
+    {
+      return errorOf(material);
+    }
+    cutMaterial = material.value();
+  }
+
+  // split each brush around the part of the hole inside it
+  const auto splitSide = sideName(wall.axis, 1.0);
+  struct Split
+  {
+    mdl::BrushNode* brushNode;
+    std::vector<mdl::Brush> pieces;
+  };
+  auto splits = std::vector<Split>{};
+  for (auto* brushNode : cut)
+  {
+    const auto& b = brushNode->logicalBounds();
+    const auto opening = Opening{
+      .side = splitSide,
+      .alongMin = std::max(hole.min[along], b.min[along]),
+      .alongMax = std::min(hole.max[along], b.max[along]),
+      .zMin = std::max(hole.min.z(), b.min.z()),
+      .zMax = std::min(hole.max.z(), b.max.z()),
+    };
+    auto split = Split{brushNode, {}};
+    for (const auto& pieceBounds : splitWall(splitSide, b, {opening}))
+    {
+      auto piece = brushPiece(map, brushNode->brush(), pieceBounds, cutMaterial);
+      if (piece.is_error())
+      {
+        return errorOf(piece);
+      }
+      split.pieces.push_back(std::move(piece).value());
+    }
+    splits.push_back(std::move(split));
+  }
+
+  mdl::deselectAll(map);
+  auto toUpdate = std::vector<std::pair<mdl::Node*, mdl::NodeContents>>{};
+  auto toRemove = std::vector<mdl::Node*>{};
+  for (auto& split : splits)
+  {
+    if (split.pieces.empty())
+    {
+      toRemove.push_back(split.brushNode);
+    }
+    else
+    {
+      toUpdate.emplace_back(split.brushNode, mdl::NodeContents{split.pieces.front()});
+    }
+  }
+  const auto originalIds = idsOf(doc.nodes, cut);
+  if (!toUpdate.empty() && !mdl::updateNodeContents(map, "Create Opening", toUpdate))
+  {
+    return toolError("operation_failed", "the wall could not be cut");
+  }
+
+  auto piecesJson = QJsonObject{};
+  auto removed = QJsonArray{};
+  for (size_t i = 0; i < splits.size(); ++i)
+  {
+    auto& split = splits[i];
+    const auto originalId = originalIds[qsizetype(i)].toString();
+    if (split.pieces.empty())
+    {
+      removed.append(originalId);
+      continue;
+    }
+    auto nodes = std::vector<std::unique_ptr<mdl::Node>>{};
+    for (size_t j = 1; j < split.pieces.size(); ++j)
+    {
+      nodes.push_back(std::make_unique<mdl::BrushNode>(std::move(split.pieces[j])));
+    }
+    auto ids = QJsonArray{originalId};
+    if (!nodes.empty())
+    {
+      const auto added = mdl::addNodes(map, *split.brushNode->parent(), std::move(nodes));
+      if (added.size() + 1 != split.pieces.size())
+      {
+        return toolError("operation_failed", "the wall pieces could not be added");
+      }
+      for (const auto* addedNode : added)
+      {
+        ids.append(doc.nodes.idOf(*addedNode));
+      }
+    }
+    piecesJson[originalId] = ids;
+  }
+  if (!toRemove.empty())
+  {
+    mdl::removeNodes(map, toRemove);
+  }
+
+  auto openingJson = QJsonObject{{"bounds", toJson(hole)}};
+  if (wall.sign)
+  {
+    openingJson["side"] = sideName(wall.axis, *wall.sign);
+  }
+
+  if (cutMaterial)
+  {
+    warnAboutMaterials(context, {*cutMaterial});
+  }
+  warnAboutBounds(context, hole);
+
+  return QJsonObject{
+    {"opening", openingJson},
+    {"pieces", piecesJson},
+    {"removed", removed},
+  };
+}
+
+McpToolDef createOpeningTool()
+{
+  return {
+    .name = "create_opening",
+    .title = "Create Opening",
+    .description =
+      "Cuts a rectangular opening (door, window, passage) through an existing wall: "
+      "either one wall brush, or the wall on one side of a room group made by "
+      "create_room, also after moving or rotating it in 90 degree steps (wall = group "
+      "id, side = the side of the room). The wall brushes "
+      "that the opening touches are split into non-overlapping cuboids around it, in "
+      "the same parent, keeping their materials; the first piece keeps the brush's id. "
+      "Units: offset and width along the wall, bottom and height in z, all in world "
+      "units; bottom is measured from the bottom of the wall (the room's floor). "
+      "Returns opening {side (missing for a brush passed without side), bounds} "
+      "spanning the wall thickness (pass it to "
+      "create_corridor as from/to), pieces {original id: [piece ids]} and removed ids. "
+      "Verify with query_point (empty inside the opening) and check_brush_overlaps.",
+    .inputSchema = schema::object(
+      {
+        {"wall", schema::nodeId("a wall brush, or a room group together with side")},
+        {"side",
+         schema::stringEnum(
+           {"+x", "-x", "+y", "-y"},
+           "the side of the room the wall is on; required for a group, optional for a "
+           "brush (then the thinner horizontal axis is the thickness)")},
+        {"offset",
+         schema::number(
+           -MaxSize,
+           MaxSize,
+           "center of the opening along the wall, relative to the middle of the wall "
+           "(default 0); a room's wall middle is the middle of its inner side")},
+        {"center",
+         schema::number(
+           -MaxCoordinate,
+           MaxCoordinate,
+           "center of the opening along the wall as a coordinate (x for a +y/-y wall, y "
+           "for a +x/-x wall); instead of offset")},
+        {"width", schema::number(MinSize, MaxSize, "width along the wall")},
+        {"height", schema::number(MinSize, MaxSize, "height")},
+        {"bottom",
+         schema::number(
+           0, MaxSize, "height of the bottom above the bottom of the wall (default 0)")},
+        {"material",
+         schema::material(
+           "material of the new faces around the opening (default: the wall's)")},
+      },
+      {"wall", "width", "height"}),
+    .kind = McpToolKind::Mutate,
+    .annotations = Mutating,
+    .allowedInBatch = true,
+    .run = createOpening,
+  };
+}
+
+// create_corridor
+
+/** An opening that a corridor connects to. */
+struct CorridorEnd
+{
+  /** The axis through the wall. */
+  size_t axis;
+  /** The direction out of the room, if known. */
+  std::optional<double> sign;
+  vm::bbox3d bounds;
+};
+
+McpResult<CorridorEnd> corridorEndArgument(const QJsonObject& args, const QString& key)
+{
+  const auto pointer = "/" + key;
+  const auto object = args.value(key).toObject();
+  auto b = bounds(object.value("bounds"), pointer + "/bounds");
+  if (b.is_error())
+  {
+    return errorOf(b);
+  }
+  const auto& box = b.value();
+  for (size_t i = 0; i < 3; ++i)
+  {
+    if (box.size()[i] <= Epsilon)
+    {
+      return invalidArgument(
+        pointer + "/bounds",
+        QString{"the opening is flat in %1"}.arg(axisName(i)),
+        "pass the bounds of an opening as returned by create_room or create_opening");
+    }
+  }
+
+  const auto side = optionalString(object, "side");
+  if (side)
+  {
+    return CorridorEnd{sideAxis(*side), sideSign(*side), box};
+  }
+  if (std::abs(box.size().x() - box.size().y()) <= Epsilon)
+  {
+    return invalidArgument(
+      pointer,
+      "the opening is as deep in x as in y, so the direction through the wall is "
+      "unclear",
+      "pass side as returned by create_room or create_opening");
+  }
+  return CorridorEnd{box.size().x() < box.size().y() ? size_t(0) : size_t(1), {}, box};
+}
+
+/** A rectangle in the xy plane. */
+struct Rect
+{
+  vm::vec2d min;
+  vm::vec2d max;
+
+  bool contains(const vm::vec2d& point) const
+  {
+    return point.x() > min.x() && point.x() < max.x() && point.y() > min.y()
+           && point.y() < max.y();
+  }
+};
+
+Rect rectOf(const vm::bbox3d& box)
+{
+  return {vm::vec2d{box.min.x(), box.min.y()}, vm::vec2d{box.max.x(), box.max.y()}};
+}
+
+/**
+ * Splits the union of the included rectangles minus the excluded ones into
+ * non-overlapping rectangles: a grid of all rectangle edges is formed, cells are merged
+ * into runs along x and runs of equal extent are merged along y.
+ */
+std::vector<Rect> decompose(
+  const std::vector<Rect>& include, const std::vector<Rect>& exclude)
+{
+  auto xs = std::set<double>{};
+  auto ys = std::set<double>{};
+  for (const auto* rects : {&include, &exclude})
+  {
+    for (const auto& rect : *rects)
+    {
+      xs.insert({rect.min.x(), rect.max.x()});
+      ys.insert({rect.min.y(), rect.max.y()});
+    }
+  }
+  const auto xv = std::vector<double>{xs.begin(), xs.end()};
+  const auto yv = std::vector<double>{ys.begin(), ys.end()};
+
+  const auto filled = [&](const vm::vec2d& point) {
+    return std::ranges::any_of(include, [&](const auto& r) { return r.contains(point); })
+           && std::ranges::none_of(
+             exclude, [&](const auto& r) { return r.contains(point); });
+  };
+
+  auto result = std::vector<Rect>{};
+  // rectangles that end at the current row, by index into result
+  auto open = std::map<std::pair<double, double>, size_t>{};
+  for (size_t j = 0; j + 1 < yv.size(); ++j)
+  {
+    const auto y0 = yv[j];
+    const auto y1 = yv[j + 1];
+    if (y1 - y0 <= Epsilon)
+    {
+      continue;
+    }
+    auto runs = std::vector<std::pair<double, double>>{};
+    for (size_t i = 0; i + 1 < xv.size(); ++i)
+    {
+      const auto x0 = xv[i];
+      const auto x1 = xv[i + 1];
+      if (x1 - x0 <= Epsilon || !filled({(x0 + x1) / 2.0, (y0 + y1) / 2.0}))
+      {
+        continue;
+      }
+      if (!runs.empty() && runs.back().second == x0)
+      {
+        runs.back().second = x1;
+      }
+      else
+      {
+        runs.emplace_back(x0, x1);
+      }
+    }
+
+    auto nextOpen = std::map<std::pair<double, double>, size_t>{};
+    for (const auto& run : runs)
+    {
+      if (const auto it = open.find(run);
+          it != open.end() && result[it->second].max.y() == y0)
+      {
+        result[it->second].max[1] = y1;
+        nextOpen[run] = it->second;
+      }
+      else
+      {
+        nextOpen[run] = result.size();
+        result.push_back({vm::vec2d{run.first, y0}, vm::vec2d{run.second, y1}});
+      }
+    }
+    open = std::move(nextOpen);
+  }
+
+  std::ranges::sort(result, [](const auto& lhs, const auto& rhs) {
+    return std::pair{lhs.min.y(), lhs.min.x()} < std::pair{rhs.min.y(), rhs.min.x()};
+  });
+  return result;
+}
+
+/** A box with the given extents along the given axis and the extents of base otherwise.
+ */
+vm::bbox3d withExtent(
+  vm::bbox3d base, const size_t axis, const double min, const double max)
+{
+  base.min[axis] = min;
+  base.max[axis] = max;
+  return base;
+}
+
+/** Whether [min, max] lies within [lo, hi]. */
+bool within(const double min, const double max, const double lo, const double hi)
+{
+  return min >= lo - Epsilon && max <= hi + Epsilon;
+}
+
+/** The brushes in the map that overlap the box by a volume. */
+std::vector<const mdl::BrushNode*> overlappingBrushes(
+  const mdl::Map& map, const vm::bbox3d& box)
+{
+  auto result = std::vector<const mdl::BrushNode*>{};
+  auto cuboid = brushBuilder(map).createCuboid(box, mdl::BrushFace::NoMaterialName);
+  if (cuboid.is_error())
+  {
+    return result;
+  }
+  const auto visit = [&](const auto& self, const mdl::Node& node) -> void {
+    for (const auto* child : node.children())
+    {
+      if (const auto* brushNode = dynamic_cast<const mdl::BrushNode*>(child))
+      {
+        if (!intersection(brushNode->logicalBounds(), box))
+        {
+          continue;
+        }
+        auto common = cuboid.value();
+        if (common.intersect(map.worldBounds(), brushNode->brush()).is_success())
+        {
+          const auto size = common.bounds().size();
+          if (size.x() > 1e-3 && size.y() > 1e-3 && size.z() > 1e-3)
+          {
+            result.push_back(brushNode);
+          }
+        }
+      }
+      else
+      {
+        self(self, *child);
+      }
+    }
+  };
+  visit(visit, map.worldNode());
+  return result;
+}
+
+McpResult<QJsonObject> createCorridor(McpCallContext& context, const QJsonObject& args)
+{
+  auto& doc = context.doc;
+  auto& map = doc.map;
+
+  auto fromResult = corridorEndArgument(args, "from");
+  if (fromResult.is_error())
+  {
+    return errorOf(fromResult);
+  }
+  auto toResult = corridorEndArgument(args, "to");
+  if (toResult.is_error())
+  {
+    return errorOf(toResult);
+  }
+  const auto& from = fromResult.value();
+  const auto& to = toResult.value();
+  const auto t = args.value("wall_thickness").toDouble(16.0);
+
+  const auto checkSide =
+    [](const CorridorEnd& end, const QString& key, const double sign) -> McpResult<void> {
+    if (end.sign && *end.sign != sign)
+    {
+      return invalidArgument(
+        "/" + key + "/side",
+        QString{"the opening faces %1, but the corridor has to leave it towards %2"}.arg(
+          sideName(end.axis, *end.sign), sideName(end.axis, sign)),
+        "connect openings that face each other or lie on perpendicular walls; use "
+        "create_opening to cut one in another wall");
+    }
+    return kdl::void_success;
+  };
+
+  // the interior boxes from `from` to `to`; z is shared by all of them
+  auto interiors = std::vector<vm::bbox3d>{};
+  // grown by the wall thickness: which horizontal axes of each interior get walls
+  auto grow = std::vector<std::array<bool, 2>>{};
+  // the corridor stays out of the walls with the openings
+  auto clip = Rect{
+    vm::vec2d{-std::numeric_limits<double>::max(), -std::numeric_limits<double>::max()},
+    vm::vec2d{std::numeric_limits<double>::max(), std::numeric_limits<double>::max()}};
+  const auto clipTo = [&](const size_t axis, const double sign, const double face) {
+    if (sign > 0)
+    {
+      clip.min[axis] = std::max(clip.min[axis], face);
+    }
+    else
+    {
+      clip.max[axis] = std::min(clip.max[axis], face);
+    }
+  };
+
+  const auto z0 = std::max(from.bounds.min.z(), to.bounds.min.z());
+  const auto z1 = std::min(from.bounds.max.z(), to.bounds.max.z());
+  if (z1 - z0 <= Epsilon)
+  {
+    return invalidArgument(
+      "/to/bounds",
+      QString{"the openings do not overlap in height: z %1 to %2 and %3 to %4"}
+        .arg(canon(from.bounds.min.z()))
+        .arg(canon(from.bounds.max.z()))
+        .arg(canon(to.bounds.min.z()))
+        .arg(canon(to.bounds.max.z())),
+      "a corridor is level; make the openings overlap in z or add stairs");
+  }
+
+  auto shape = QString{};
+  if (from.axis == to.axis)
+  {
+    shape = "straight";
+    const auto a = from.axis;
+    const auto b = otherHorizontalAxis(a);
+    auto dir = 0.0;
+    auto g0 = 0.0;
+    auto g1 = 0.0;
+    if (from.bounds.max[a] <= to.bounds.min[a] + Epsilon)
+    {
+      dir = 1.0;
+      g0 = from.bounds.max[a];
+      g1 = to.bounds.min[a];
+    }
+    else if (to.bounds.max[a] <= from.bounds.min[a] + Epsilon)
+    {
+      dir = -1.0;
+      g0 = to.bounds.max[a];
+      g1 = from.bounds.min[a];
+    }
+    else
+    {
+      return invalidArgument(
+        "/to/bounds",
+        QString{"the openings overlap along %1; they must be in different walls"}.arg(
+          axisName(a)),
+        "pass openings in two walls that face each other");
+    }
+    if (auto check = checkSide(from, "from", dir); check.is_error())
+    {
+      return errorOf(check);
+    }
+    if (auto check = checkSide(to, "to", -dir); check.is_error())
+    {
+      return errorOf(check);
+    }
+    if (g1 - g0 <= Epsilon)
+    {
+      return invalidArgument(
+        "/to/bounds",
+        "the walls touch, so the openings already connect",
+        "no corridor is needed");
+    }
+
+    const auto b0 = std::max(from.bounds.min[b], to.bounds.min[b]);
+    const auto b1 = std::min(from.bounds.max[b], to.bounds.max[b]);
+    if (b1 - b0 <= Epsilon)
+    {
+      return invalidArgument(
+        "/to/bounds",
+        QString{"the openings face each other along %1 but do not overlap along %2: %3 "
+                "to %4 and %5 to %6"}
+          .arg(axisName(a), axisName(b))
+          .arg(canon(from.bounds.min[b]))
+          .arg(canon(from.bounds.max[b]))
+          .arg(canon(to.bounds.min[b]))
+          .arg(canon(to.bounds.max[b])),
+        "line the openings up (create_opening with center), or connect an opening on "
+        "a perpendicular wall for an L-shaped corridor");
+    }
+    for (const auto* end : {&from, &to})
+    {
+      if (!within(end->bounds.min[b], end->bounds.max[b], b0 - t, b1 + t))
+      {
+        return invalidArgument(
+          end == &from ? "/from/bounds" : "/to/bounds",
+          QString{"the openings differ along %1 by more than wall_thickness, so the "
+                  "corridor walls would not close the larger one"}
+            .arg(axisName(b)),
+          "give both openings the same width and position");
+      }
+    }
+
+    auto interior = vm::bbox3d{};
+    interior.min[a] = g0;
+    interior.max[a] = g1;
+    interior.min[b] = b0;
+    interior.max[b] = b1;
+    interior.min[2] = z0;
+    interior.max[2] = z1;
+    interiors.push_back(interior);
+    auto g = std::array<bool, 2>{};
+    g[b] = true;
+    grow.push_back(g);
+  }
+  else
+  {
+    shape = "l_shaped";
+    // a: through the from wall, b: through the to wall
+    const auto a = from.axis;
+    const auto b = to.axis;
+
+    // the first segment leaves `from` along a until it reaches the extent of `to`
+    auto sa = 0.0;
+    auto s1 = std::pair{0.0, 0.0};
+    if (to.bounds.min[a] >= from.bounds.max[a] - Epsilon)
+    {
+      sa = 1.0;
+      s1 = {from.bounds.max[a], to.bounds.min[a]};
+    }
+    else if (to.bounds.max[a] <= from.bounds.min[a] + Epsilon)
+    {
+      sa = -1.0;
+      s1 = {to.bounds.max[a], from.bounds.min[a]};
+    }
+    else
+    {
+      return invalidArgument(
+        "/to/bounds",
+        QString{"the to opening lies within the extent of the from wall along %1, so "
+                "there is no room for the turn"}
+          .arg(axisName(a)),
+        "move one of the openings along its wall");
+    }
+    // the second segment leaves the corner along b until it reaches `to`
+    auto sb = 0.0;
+    auto s2 = std::pair{0.0, 0.0};
+    if (to.bounds.min[b] >= from.bounds.max[b] - Epsilon)
+    {
+      sb = 1.0;
+      s2 = {from.bounds.max[b], to.bounds.min[b]};
+    }
+    else if (to.bounds.max[b] <= from.bounds.min[b] + Epsilon)
+    {
+      sb = -1.0;
+      s2 = {to.bounds.max[b], from.bounds.min[b]};
+    }
+    else
+    {
+      return invalidArgument(
+        "/to/bounds",
+        QString{"the to wall lies within the width of the from opening along %1, so "
+                "there is no room for the turn"}
+          .arg(axisName(b)),
+        "move one of the openings along its wall");
+    }
+    if (auto check = checkSide(from, "from", sa); check.is_error())
+    {
+      return errorOf(check);
+    }
+    if (auto check = checkSide(to, "to", -sb); check.is_error())
+    {
+      return errorOf(check);
+    }
+
+    auto corner = vm::bbox3d{};
+    corner.min[a] = to.bounds.min[a];
+    corner.max[a] = to.bounds.max[a];
+    corner.min[b] = from.bounds.min[b];
+    corner.max[b] = from.bounds.max[b];
+    corner.min[2] = z0;
+    corner.max[2] = z1;
+
+    if (s1.second - s1.first > Epsilon)
+    {
+      interiors.push_back(withExtent(corner, a, s1.first, s1.second));
+      auto g = std::array<bool, 2>{};
+      g[b] = true;
+      grow.push_back(g);
+    }
+    interiors.push_back(corner);
+    grow.push_back({true, true});
+    if (s2.second - s2.first > Epsilon)
+    {
+      interiors.push_back(withExtent(corner, b, s2.first, s2.second));
+      auto g = std::array<bool, 2>{};
+      g[a] = true;
+      grow.push_back(g);
+    }
+
+    clipTo(a, sa, sa > 0 ? from.bounds.max[a] : from.bounds.min[a]);
+    clipTo(b, -sb, sb > 0 ? to.bounds.min[b] : to.bounds.max[b]);
+  }
+
+  for (const auto* end : {&from, &to})
+  {
+    if (!within(end->bounds.min.z(), end->bounds.max.z(), z0 - t, z1 + t))
+    {
+      return invalidArgument(
+        end == &from ? "/from/bounds" : "/to/bounds",
+        "the openings differ in height by more than wall_thickness, so the corridor "
+        "floor or ceiling would not close the larger one",
+        "give both openings the same bottom and height");
+    }
+  }
+
+  // the floor and ceiling cover the interiors and their walls; the walls fill the rest
+  auto inner = std::vector<Rect>{};
+  auto outer = std::vector<Rect>{};
+  for (size_t i = 0; i < interiors.size(); ++i)
+  {
+    const auto rect = rectOf(interiors[i]);
+    inner.push_back(rect);
+    auto grown = rect;
+    for (size_t k = 0; k < 2; ++k)
+    {
+      if (grow[i][k])
+      {
+        grown.min[k] = std::max(grown.min[k] - t, clip.min[k]);
+        grown.max[k] = std::min(grown.max[k] + t, clip.max[k]);
+      }
+    }
+    outer.push_back(grown);
+  }
+
+  auto material = materialArgument(map, args, {"material"});
+  if (material.is_error())
+  {
+    return errorOf(material);
+  }
+
+  auto cuboids = std::vector<Cuboid>{};
+  auto floorCount = size_t(0);
+  const auto addSlabs =
+    [&](const std::vector<Rect>& rects, const double zMin, const double zMax) {
+      for (const auto& rect : rects)
+      {
+        cuboids.push_back(
+          {vm::bbox3d{
+             vm::vec3d{rect.min.x(), rect.min.y(), zMin},
+             vm::vec3d{rect.max.x(), rect.max.y(), zMax}},
+           material.value()});
+      }
+      return rects.size();
+    };
+  const auto slabs = decompose(outer, {});
+  floorCount = addSlabs(slabs, z0 - t, z0);
+  const auto ceilingCount = addSlabs(slabs, z1, z1 + t);
+  addSlabs(decompose(outer, inner), z0, z1);
+
+  auto all = cuboids.front().bounds;
+  for (const auto& cuboid : cuboids)
+  {
+    all = vm::merge(all, cuboid.bounds);
+    if (auto check = boxInWorld(map, cuboid.bounds.min, cuboid.bounds.max);
+        check.is_error())
+    {
+      auto error = errorOf(check);
+      error.message = "a corridor brush: " + error.message;
+      if (error.code == u"invalid_argument")
+      {
+        error.hint = "use openings whose edges are whole units";
+      }
+      return error;
+    }
+  }
+
+  auto groupName = groupNameArgument(args);
+  if (groupName.is_error())
+  {
+    return errorOf(groupName);
+  }
+  auto parent = brushParentArgument(doc, args, groupName.value().has_value());
+  if (parent.is_error())
+  {
+    return errorOf(parent);
+  }
+
+  // checked before the corridor exists, so that only other brushes are reported
+  auto overlapping = std::set<QString>{};
+  auto blocking = std::set<QString>{};
+  const auto byNumber = [](const QString& lhs, const QString& rhs) {
+    return lhs.mid(1).toULongLong() < rhs.mid(1).toULongLong();
+  };
+  for (const auto& cuboid : cuboids)
+  {
+    for (const auto* brushNode : overlappingBrushes(map, cuboid.bounds))
+    {
+      overlapping.insert(doc.nodes.idOf(*brushNode));
+    }
+  }
+  for (const auto& interior : interiors)
+  {
+    for (const auto* brushNode : overlappingBrushes(map, interior))
+    {
+      blocking.insert(doc.nodes.idOf(*brushNode));
+    }
+  }
+  const auto sortedIds = [&](const std::set<QString>& ids) {
+    auto result = QStringList{ids.begin(), ids.end()};
+    std::ranges::sort(result, byNumber);
+    return result.join(", ");
+  };
+  if (!overlapping.empty())
+  {
+    context.warnings.push_back(
+      QString{"the corridor brushes overlap %1; check check_brush_overlaps"}.arg(
+        sortedIds(overlapping)));
+  }
+  if (!blocking.empty())
+  {
+    context.warnings.push_back(
+      QString{"the corridor interior is blocked by %1"}.arg(sortedIds(blocking)));
+  }
+
+  auto added = addCuboids(map, *parent.value(), cuboids);
+  if (added.is_error())
+  {
+    return errorOf(added);
+  }
+  const auto& brushNodes = added.value();
+  const auto idsIn = [&](const size_t first, const size_t count) {
+    return idsOf(
+      doc.nodes,
+      std::vector<mdl::BrushNode*>{
+        brushNodes.begin() + qsizetype(first),
+        brushNodes.begin() + qsizetype(first + count)});
+  };
+
+  auto interiorsJson = QJsonArray{};
+  for (const auto& interior : interiors)
+  {
+    interiorsJson.append(toJson(interior));
+  }
+
+  auto result = QJsonObject{
+    {"shape", shape},
+    {"ids", idsOf(doc.nodes, brushNodes)},
+    {"floor", idsIn(0, floorCount)},
+    {"ceiling", idsIn(floorCount, ceilingCount)},
+    {"walls",
+     idsIn(floorCount + ceilingCount, brushNodes.size() - floorCount - ceilingCount)},
+    {"interior_bounds", interiorsJson},
+  };
+
+  if (groupName.value())
+  {
+    auto groupId = groupNewNodes(doc, brushNodes, *groupName.value());
+    if (groupId.is_error())
+    {
+      return errorOf(groupId);
+    }
+    result["group"] = groupId.value();
+  }
+
+  warnAboutMaterials(context, {material.value()});
+  warnAboutBounds(context, all);
+  return result;
+}
+
+QJsonObject openingRefSchema(const QString& description)
+{
+  return schema::describe(
+    schema::object(
+      {
+        {"bounds",
+         schema::bounds("the opening through the wall, spanning its thickness")},
+        {"side",
+         schema::stringEnum(
+           {"+x", "-x", "+y", "-y"},
+           "the side of its room the wall is on, i.e. the direction out of the room")},
+      },
+      {"bounds"}),
+    description);
+}
+
+McpToolDef createCorridorTool()
+{
+  return {
+    .name = "create_corridor",
+    .title = "Create Corridor",
+    .description =
+      "Builds a sealed corridor of non-overlapping cuboid brushes (floor, ceiling and "
+      "walls of wall_thickness world units) between two wall openings, e.g. the "
+      "openings returned by create_room or create_opening (pass them unchanged as from "
+      "and to). Openings that face each other through parallel walls give a straight "
+      "corridor; openings on perpendicular walls give an L-shaped one (two segments "
+      "joined by a corner). The interior has the cross-section of the openings (their "
+      "overlap if they differ by up to wall_thickness). The corridor touches the outer "
+      "faces of the walls without overlapping them, so the rooms stay sealed. Returns "
+      "ids, floor/ceiling/walls ids and interior_bounds (from 'from' to 'to'). Verify "
+      "with check_leaks and check_brush_overlaps.",
+    .inputSchema = schema::object(
+      {
+        {"from", openingRefSchema("the opening to start at")},
+        {"to", openingRefSchema("the opening to end at")},
+        {"wall_thickness",
+         schema::number(
+           MinSize, 4096, "thickness of floor, ceiling and walls (default 16)")},
+        {"material", schema::material("material (default: current)")},
+        {"group_name", schema::string(1, 128, "group the brushes under this name")},
+        {"parent", schema::nodeId("a layer or group (default: the current one)")},
+      },
+      {"from", "to"}),
+    .kind = McpToolKind::Mutate,
+    .annotations = Mutating,
+    .allowedInBatch = true,
+    .run = createCorridor,
   };
 }
 
@@ -1651,6 +2973,8 @@ void registerMcpMapHelperTools(McpToolDispatcher& dispatcher)
   dispatcher.add(getConventionsTool());
   dispatcher.add(describeRegionTool());
   dispatcher.add(createRoomTool());
+  dispatcher.add(createOpeningTool());
+  dispatcher.add(createCorridorTool());
   dispatcher.add(createStairsTool());
   dispatcher.add(dropToFloorTool());
   dispatcher.add(alignNodesTool());

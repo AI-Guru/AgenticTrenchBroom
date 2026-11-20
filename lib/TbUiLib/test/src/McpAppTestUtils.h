@@ -22,8 +22,8 @@
 #include <QJsonObject>
 #include <QString>
 #include <QTemporaryDir>
-#include <QTimer>
 
+#include "AppTestUtils.h"
 #include "ui/AppControllerFixture.h"
 #include "ui/CatchConfig.h" // IWYU pragma: keep
 #include "ui/McpController.h"
@@ -38,28 +38,6 @@ class WelcomeWindow;
 
 /** The name of the game that McpAppFixture configures. */
 inline const auto McpTestGameName = std::string{"Test"};
-
-/** Returns the welcome window, or nullptr if it was never created. */
-WelcomeWindow* findWelcomeWindow();
-
-bool isWelcomeWindowVisible();
-
-/**
- * Detects modal dialogs while it exists. A modal dialog spins its own event loop, so the
- * timer fires while it is shown; the dialog is then closed so that the test does not
- * hang, and the dialog is counted.
- */
-class McpModalWatchdog
-{
-public:
-  McpModalWatchdog();
-
-  int modalCount() const;
-
-private:
-  QTimer m_timer;
-  int m_modalCount = 0;
-};
 
 /**
  * An application with the game "Test" (formats Standard and Valve, no game files) and an

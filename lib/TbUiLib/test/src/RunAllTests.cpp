@@ -51,8 +51,10 @@ int main(int argc, char** argv)
 {
   kd::set_contract_violation_handler(contractViolated);
 
-  // Match the OpenGL setup in TrenchBroom's main function so that tests which show map
-  // windows render with the same context configuration as the application.
+  // Use the core OpenGL context settings of TrenchBroom's main function (version,
+  // profile, depth buffer, shared contexts) so that tests which show map windows render
+  // like the application. Multisampling and the alpha buffer hint are left out on
+  // purpose; the tests do not depend on them.
   auto format = QSurfaceFormat{};
   format.setRenderableType(QSurfaceFormat::OpenGL);
   format.setVersion(2, 1);

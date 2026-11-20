@@ -99,7 +99,7 @@ QImage decodeImage(const QJsonObject& content)
 TEST_CASE("McpViewTools")
 {
   auto f = McpAppFixture{};
-  auto watchdog = McpModalWatchdog{};
+  auto watchdog = ModalWatchdog{};
 
   SECTION("get_camera")
   {

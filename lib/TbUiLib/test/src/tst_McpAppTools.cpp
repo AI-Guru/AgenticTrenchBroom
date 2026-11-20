@@ -85,7 +85,7 @@ TEST_CASE("McpAppTools")
   f.appController.showWelcomeWindow();
   REQUIRE(isWelcomeWindowVisible());
 
-  auto watchdog = McpModalWatchdog{};
+  auto watchdog = ModalWatchdog{};
 
   SECTION("list_games")
   {
@@ -413,7 +413,7 @@ TEST_CASE("McpAppTools")
       REQUIRE(window.document().map().modified());
 
       // A local watchdog, so that a save prompt is attributed to this call
-      const auto closeWatchdog = McpModalWatchdog{};
+      const auto closeWatchdog = ModalWatchdog{};
       const auto result = f.ok("close_map", R"({"discard_changes":true})");
       CHECK(closeWatchdog.modalCount() == 0);
 
@@ -436,7 +436,7 @@ TEST_CASE("McpAppTools")
       f.newMap();
       f.ok("create_box_brush", Box);
 
-      const auto closeWatchdog = McpModalWatchdog{};
+      const auto closeWatchdog = ModalWatchdog{};
       CHECK(f.ok("close_map", R"({"discard_changes":true})").value("closed") == true);
       CHECK(closeWatchdog.modalCount() == 0);
       CHECK(mapWindowManager.allMapWindowsClosed());

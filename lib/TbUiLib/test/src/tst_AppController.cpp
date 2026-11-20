@@ -18,9 +18,9 @@
  */
 
 #include <QApplication>
-#include <QTimer>
 #include <QWidget>
 
+#include "AppTestUtils.h"
 #include "TestEnvironment.h"
 #include "base/Result.h"
 #include "fs/TestEnvironment.h"
@@ -92,53 +92,6 @@ void writeFile(const std::filesystem::path& path, const std::string& contents)
   auto stream = std::ofstream{path, std::ios::out | std::ios::trunc};
   stream << contents;
 }
-
-WelcomeWindow* findWelcomeWindow()
-{
-  for (auto* widget : QApplication::topLevelWidgets())
-  {
-    if (auto* welcomeWindow = dynamic_cast<WelcomeWindow*>(widget))
-    {
-      return welcomeWindow;
-    }
-  }
-  return nullptr;
-}
-
-bool isWelcomeWindowVisible()
-{
-  const auto* welcomeWindow = findWelcomeWindow();
-  return welcomeWindow != nullptr && welcomeWindow->isVisible();
-}
-
-/**
- * Detects modal dialogs while it exists. A modal dialog spins its own event loop, so
- * the timer fires while it is shown; the dialog is then closed so that the test does
- * not hang, and the dialog is recorded.
- */
-class ModalWatchdog
-{
-private:
-  QTimer m_timer;
-  int m_modalCount = 0;
-
-public:
-  ModalWatchdog()
-  {
-    using namespace std::chrono_literals;
-
-    QObject::connect(&m_timer, &QTimer::timeout, [&]() {
-      if (auto* modal = QApplication::activeModalWidget())
-      {
-        ++m_modalCount;
-        modal->close();
-      }
-    });
-    m_timer.start(10ms);
-  }
-
-  int modalCount() const { return m_modalCount; }
-};
 
 /**
  * Closes all map windows that were opened during a test before the app controller is

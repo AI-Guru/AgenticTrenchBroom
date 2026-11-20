@@ -23,7 +23,7 @@
 #include <QEvent>
 #include <QPointer>
 
-#include "McpAppTestUtils.h"
+#include "AppTestUtils.h"
 #include "TestEnvironment.h"
 #include "base/Result.h"
 #include "gl/GlManager.h"
@@ -169,7 +169,7 @@ TEST_CASE("MapWindow")
       QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
     };
 
-    const auto watchdog = McpModalWatchdog{};
+    const auto watchdog = ModalWatchdog{};
 
     SECTION("closes a modified window without asking")
     {

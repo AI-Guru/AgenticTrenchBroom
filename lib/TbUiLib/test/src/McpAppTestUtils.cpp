@@ -72,43 +72,6 @@ const auto GameConfig = R"({
 
 } // namespace
 
-WelcomeWindow* findWelcomeWindow()
-{
-  for (auto* widget : QApplication::topLevelWidgets())
-  {
-    if (auto* welcomeWindow = dynamic_cast<WelcomeWindow*>(widget))
-    {
-      return welcomeWindow;
-    }
-  }
-  return nullptr;
-}
-
-bool isWelcomeWindowVisible()
-{
-  const auto* welcomeWindow = findWelcomeWindow();
-  return welcomeWindow != nullptr && welcomeWindow->isVisible();
-}
-
-McpModalWatchdog::McpModalWatchdog()
-{
-  using namespace std::chrono_literals;
-
-  QObject::connect(&m_timer, &QTimer::timeout, [&]() {
-    if (auto* modal = QApplication::activeModalWidget())
-    {
-      ++m_modalCount;
-      modal->close();
-    }
-  });
-  m_timer.start(10ms);
-}
-
-int McpModalWatchdog::modalCount() const
-{
-  return m_modalCount;
-}
-
 McpAppFixture::McpAppFixture()
   : appControllerFixture{[](const auto& writeGameConfig) {
     writeGameConfig(McpTestGameName, GameConfig, std::nullopt, std::nullopt);

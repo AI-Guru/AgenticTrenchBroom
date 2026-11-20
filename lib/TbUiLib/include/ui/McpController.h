@@ -23,6 +23,8 @@
 #include <QString>
 #include <QtGlobal>
 
+#include "base/Notifier.h"
+
 #include <memory>
 #include <optional>
 
@@ -30,6 +32,12 @@ namespace tb::ui
 {
 class AppController;
 class McpToolDispatcher;
+
+/** The URL of the MCP endpoint on the given port: http://127.0.0.1:<port>/mcp. */
+QString mcpServerUrl(quint16 port);
+
+/** The shell command that registers the MCP server on the given port with Claude Code. */
+QString mcpClaudeAddCommand(quint16 port);
 
 /**
  * Runs the MCP server that lets AI agents control TrenchBroom. It listens on 127.0.0.1
@@ -46,11 +54,19 @@ class McpToolDispatcher;
  * modal dialog is open or the user is dragging.
  *
  * Create it on the stack in main() after the app controller and before any modal dialog
- * may be shown, and destroy it before the app controller.
+ * may be shown, and destroy it before the app controller. It registers itself with the
+ * app controller (AppController::mcpController()) so that the preference pane can show
+ * its state.
  */
 class McpController
 {
 public:
+  /**
+   * Notified after the server was started or stopped or failed to start, i.e. whenever
+   * isListening(), port(), lastError() or isCommandLineOverride() may have changed.
+   */
+  Notifier<> statusDidChangeNotifier;
+
   explicit McpController(AppController& appController);
   ~McpController();
 
@@ -74,6 +90,15 @@ public:
   /** The error of the last failed attempt to listen, or an empty string. */
   QString lastError() const;
 
+  /**
+   * Whether the server runs on the port given to start() instead of following the
+   * preferences. This ends when the user changes an MCP preference.
+   */
+  bool isCommandLineOverride() const;
+
+  /** The URL of the server endpoint, or an empty string if not listening. */
+  QString url() const;
+
   /** The tools offered by the server. */
   McpToolDispatcher& dispatcher();
 
@@ -81,6 +106,7 @@ public:
   QJsonObject callTool(const QString& name, const QJsonObject& arguments = {});
 
 private:
+  AppController& m_appController;
   class Impl;
   std::unique_ptr<Impl> m_impl;
 };

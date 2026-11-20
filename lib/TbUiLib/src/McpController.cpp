@@ -105,6 +105,7 @@ private:
   };
 
   AppController& m_appController;
+  Notifier<>& m_statusDidChangeNotifier;
   // destroyed last, which disconnects the window signals
   QObject m_context;
 
@@ -126,8 +127,9 @@ private:
   NotifierConnection m_notifierConnection;
 
 public:
-  explicit Impl(AppController& appController)
+  Impl(AppController& appController, Notifier<>& statusNotifier)
     : m_appController{appController}
+    , m_statusDidChangeNotifier{statusNotifier}
   {
     m_dispatcher = std::make_unique<McpToolDispatcher>(
       m_registry,
@@ -184,6 +186,8 @@ public:
   {
     m_commandLinePort.reset();
     m_transport->close();
+    m_lastError.clear();
+    m_statusDidChangeNotifier();
   }
 
   bool isListening() const { return m_transport->isListening(); }
@@ -191,6 +195,8 @@ public:
   quint16 port() const { return m_transport->port(); }
 
   const QString& lastError() const { return m_lastError; }
+
+  bool isCommandLineOverride() const { return m_commandLinePort.has_value(); }
 
   QJsonObject callTool(const QString& name, const QJsonObject& arguments)
   {
@@ -360,6 +366,12 @@ private:
 
   void apply()
   {
+    doApply();
+    m_statusDidChangeNotifier();
+  }
+
+  void doApply()
+  {
     auto port = std::optional<quint16>{};
     if (m_commandLinePort)
     {
@@ -381,6 +393,7 @@ private:
     if (!port)
     {
       m_transport->close();
+      m_lastError.clear();
       return;
     }
 
@@ -394,7 +407,7 @@ private:
     {
       m_lastError.clear();
       printToStderr(
-        QString{"MCP server listening on http://127.0.0.1:%1/mcp"}.arg(result.value()));
+        QString{"MCP server listening on %1"}.arg(mcpServerUrl(result.value())));
     }
     else
     {
@@ -417,12 +430,31 @@ private:
   }
 };
 
-McpController::McpController(AppController& appController)
-  : m_impl{std::make_unique<Impl>(appController)}
+QString mcpServerUrl(const quint16 port)
 {
+  return QString{"http://127.0.0.1:%1/mcp"}.arg(port);
 }
 
-McpController::~McpController() = default;
+QString mcpClaudeAddCommand(const quint16 port)
+{
+  return QString{"claude mcp add --transport http trenchbroom %1"}.arg(
+    mcpServerUrl(port));
+}
+
+McpController::McpController(AppController& appController)
+  : m_appController{appController}
+  , m_impl{std::make_unique<Impl>(appController, statusDidChangeNotifier)}
+{
+  m_appController.setMcpController(this);
+}
+
+McpController::~McpController()
+{
+  if (m_appController.mcpController() == this)
+  {
+    m_appController.setMcpController(nullptr);
+  }
+}
 
 void McpController::start(const std::optional<quint16> port)
 {
@@ -447,6 +479,16 @@ quint16 McpController::port() const
 QString McpController::lastError() const
 {
   return m_impl->lastError();
+}
+
+bool McpController::isCommandLineOverride() const
+{
+  return m_impl->isCommandLineOverride();
+}
+
+QString McpController::url() const
+{
+  return isListening() ? mcpServerUrl(port()) : QString{};
 }
 
 McpToolDispatcher& McpController::dispatcher()

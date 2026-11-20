@@ -65,6 +65,7 @@ namespace ui
 class AboutDialog;
 class ActionManager;
 class MapWindowManager;
+class McpController;
 class RecentDocuments;
 class WelcomeWindow;
 
@@ -96,6 +97,8 @@ private:
 
   QTemporaryFile* m_manualRedirectFile = nullptr;
 
+  McpController* m_mcpController = nullptr;
+
 public:
   AppController(
     std::unique_ptr<kdl::task_manager> taskManager,
@@ -122,6 +125,14 @@ public:
   RecentDocuments& recentDocuments();
 
   ActionManager& actionManager();
+
+  /**
+   * The MCP controller of this application, or nullptr if there is none. The MCP
+   * controller registers itself here when it is created and unregisters when it is
+   * destroyed.
+   */
+  McpController* mcpController();
+  void setMcpController(McpController* mcpController);
 
   void askForAutoUpdates();
   void triggerAutoUpdateCheck();

@@ -308,6 +308,16 @@ ActionManager& AppController::actionManager()
   return *m_actionManager;
 }
 
+McpController* AppController::mcpController()
+{
+  return m_mcpController;
+}
+
+void AppController::setMcpController(McpController* mcpController)
+{
+  m_mcpController = mcpController;
+}
+
 void AppController::askForAutoUpdates()
 {
   if (pref(Preferences::AskForAutoUpdates))

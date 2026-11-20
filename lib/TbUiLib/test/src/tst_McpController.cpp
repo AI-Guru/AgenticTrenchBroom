@@ -43,6 +43,7 @@
 
 #include <chrono>
 #include <future>
+#include <memory>
 #include <thread>
 
 #include <catch2/catch_test_macros.hpp>
@@ -133,6 +134,15 @@ bool waitForConsoleText(MapWindow& window, const QString& text)
 }
 
 } // namespace
+
+TEST_CASE("mcpServerUrl")
+{
+  CHECK(mcpServerUrl(6767) == "http://127.0.0.1:6767/mcp");
+  CHECK(mcpServerUrl(1) == "http://127.0.0.1:1/mcp");
+  CHECK(
+    mcpClaudeAddCommand(6767)
+    == "claude mcp add --transport http trenchbroom http://127.0.0.1:6767/mcp");
+}
 
 TEST_CASE("McpController")
 {
@@ -251,6 +261,102 @@ TEST_CASE("McpController")
       // the server is disabled in the preferences, so it stops
       setPref(Preferences::McpServerPort, 0);
       CHECK_FALSE(controller.isListening());
+    }
+  }
+
+  SECTION("constructor registers the controller with the app controller")
+  {
+    CHECK(f.appController.mcpController() == &controller);
+
+    {
+      auto other = McpController{f.appController};
+      CHECK(f.appController.mcpController() == &other);
+    }
+    CHECK(f.appController.mcpController() == nullptr);
+
+    f.appController.setMcpController(&controller);
+  }
+
+  SECTION("destructor keeps a registration of another controller")
+  {
+    auto other = std::make_unique<McpController>(f.appController);
+    f.appController.setMcpController(&controller);
+    other.reset();
+    CHECK(f.appController.mcpController() == &controller);
+  }
+
+  SECTION("statusDidChangeNotifier")
+  {
+    auto count = 0;
+    auto connection = controller.statusDidChangeNotifier.connect([&]() { ++count; });
+
+    controller.start(0);
+    CHECK(count == 1);
+    controller.stop();
+    CHECK(count == 2);
+
+    setPref(Preferences::McpServerPort, 0);
+    CHECK(count == 3);
+    setPref(Preferences::McpServerEnabled, true);
+    CHECK(count == 4);
+
+    // other preferences don't affect the server
+    setPref(Preferences::CameraFov, 70.0f);
+    CHECK(count == 4);
+    PreferenceManager::instance().resetToDefault(Preferences::CameraFov);
+  }
+
+  SECTION("isCommandLineOverride")
+  {
+    CHECK_FALSE(controller.isCommandLineOverride());
+    controller.start();
+    CHECK_FALSE(controller.isCommandLineOverride());
+    controller.start(0);
+    CHECK(controller.isCommandLineOverride());
+
+    SECTION("ends when a preference changes")
+    {
+      setPref(Preferences::McpServerPort, 0);
+      CHECK_FALSE(controller.isCommandLineOverride());
+    }
+
+    SECTION("ends with stop")
+    {
+      controller.stop();
+      CHECK_FALSE(controller.isCommandLineOverride());
+    }
+  }
+
+  SECTION("url")
+  {
+    CHECK(controller.url().isEmpty());
+    controller.start(0);
+    REQUIRE(controller.isListening());
+    CHECK(controller.url() == QString{"http://127.0.0.1:%1/mcp"}.arg(controller.port()));
+    controller.stop();
+    CHECK(controller.url().isEmpty());
+  }
+
+  SECTION("lastError")
+  {
+    auto blocker = QTcpServer{};
+    REQUIRE(blocker.listen(QHostAddress::LocalHost, 0));
+    controller.start(blocker.serverPort());
+    REQUIRE_FALSE(controller.lastError().isEmpty());
+
+    SECTION("is cleared by stop")
+    {
+      controller.stop();
+      CHECK(controller.lastError().isEmpty());
+    }
+
+    SECTION("is cleared when the server is disabled")
+    {
+      setPref(Preferences::McpServerPort, int(blocker.serverPort()));
+      setPref(Preferences::McpServerEnabled, true);
+      REQUIRE_FALSE(controller.lastError().isEmpty());
+      setPref(Preferences::McpServerEnabled, false);
+      CHECK(controller.lastError().isEmpty());
     }
   }
 

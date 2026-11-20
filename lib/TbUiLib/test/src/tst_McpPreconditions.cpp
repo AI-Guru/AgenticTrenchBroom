@@ -118,8 +118,16 @@ TEST_CASE("McpPreconditions")
     CHECK(detailsOf(wrongType).value("actual_id") == QJsonValue{id(*light)});
     CHECK(
       errorOf(wrongType).message
-      == QString{"B%1 is not a brush; %1 is entity %2"}.arg(
-        id(*light).mid(1), id(*light)));
+      == QString{"B%1 is not a brush; %1 is an entity %2 (node numbers are shared by all "
+                 "types)"}
+           .arg(id(*light).mid(1), id(*light)));
+    CHECK(
+      errorOf(wrongType).hint
+      == QString{"if you meant the entity, use %1; otherwise call find_nodes to look up "
+                 "ids"}
+           .arg(id(*light)));
+    CHECK(errorOf(resolveNode(doc, "E" + id(*brush).mid(1)))
+            .message.startsWith(QString{"E%1 is not an entity;"}.arg(id(*brush).mid(1))));
 
     const auto brushId = id(*brush);
     doc.nodes.setRemovalLabel("MCP: Delete Nodes");
@@ -444,6 +452,13 @@ TEST_CASE("McpPreconditions")
     const auto empty = boxInWorld(map, {0, 0, 0}, {64, 0, 64});
     CHECK(codeOf(empty) == "invalid_argument");
     CHECK(detailsOf(empty).value("axis") == QJsonValue{"y"});
+    // max does exceed min here, so the message must name the real limit
+    const auto thin = boxInWorld(map, {400, 0, 0}, {400.0001, 64, 64});
+    CHECK(codeOf(thin) == "invalid_argument");
+    CHECK(errorOf(thin).message.contains("1/1024"));
+    CHECK_FALSE(errorOf(thin).message.contains("must exceed"));
+    CHECK(detailsOf(thin).value("minimum") == QJsonValue{1.0 / 1024.0});
+    CHECK(detailsOf(thin).value("size").toDouble() > 0.0);
     CHECK(codeOf(boxInWorld(map, {0, 0, 0}, {64, 64, 0.0001})) == "invalid_argument");
 
     const auto outside = boxInWorld(map, {0, 0, 0}, {64, 64, 100000});

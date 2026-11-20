@@ -82,8 +82,37 @@ mcp::ToolError notSelectable(
   const McpDocumentState& doc, const mdl::Node& node, const QString& reason)
 {
   const auto id = doc.nodes.idOf(node);
-  const auto hint = reason == u"in_closed_group"
-                      ? QStringLiteral("pass the group id G<n> or call open_group")
+
+  // the outermost closed group below the open group (if any) contains the node
+  auto details = QJsonObject{{"id", id}, {"reason", reason}};
+  auto groupHint = QStringLiteral("pass the group id G<n> or call open_group");
+  if (reason == u"in_closed_group")
+  {
+    const mdl::GroupNode* closedGroup = nullptr;
+    for (const auto* parent = node.parent(); parent; parent = parent->parent())
+    {
+      if (const auto* groupNode = dynamic_cast<const mdl::GroupNode*>(parent))
+      {
+        if (groupNode->opened())
+        {
+          break;
+        }
+        closedGroup = groupNode;
+      }
+    }
+    if (closedGroup)
+    {
+      const auto groupId = doc.nodes.idOf(*closedGroup);
+      details["group"] = groupId;
+      groupHint =
+        QString{
+          "pass the group id %1 (tools that take groups apply to its contents), "
+          "or call open_group %1 first"}
+          .arg(groupId);
+    }
+  }
+
+  const auto hint = reason == u"in_closed_group" ? groupHint
                     : reason == u"group_open"
                       ? QStringLiteral("pass the nodes inside the open group instead")
                       : QStringLiteral("ask the user to show or unlock the node");
@@ -97,7 +126,7 @@ mcp::ToolError notSelectable(
       : reason == u"group_open"      ? QStringLiteral("an open group")
                                      : QStringLiteral("not selectable")),
     hint,
-    {{"id", id}, {"reason", reason}});
+    std::move(details));
 }
 
 /** Returns the reason why the node is not selectable, or nullopt if it is. */
@@ -304,11 +333,17 @@ McpResult<mdl::Node*> resolveNode(const McpDocumentState& doc, const QString& id
     const auto actualId = doc.nodes.idOf(*lookup.node);
     const auto actual = nodeTypeName(*lookup.node);
     const auto expected = typeNameForLetter(id[0]);
+    const auto article = [](const QString& noun) {
+      return noun.startsWith(u'e') ? QStringLiteral("an") : QStringLiteral("a");
+    };
+    // all node types share one counter, so e.g. a new map has L1 and B2 but no B1
     return toolError(
       "wrong_node_type",
-      QString{"%1 is not a %2; %3 is %4 %5"}.arg(
-        id, expected, id.mid(1), actual, actualId),
-      QString{"use %1"}.arg(actualId),
+      QString{"%1 is not %2 %3; %4 is %5 %6 %7 (node numbers are shared by all types)"}
+        .arg(
+          id, article(expected), expected, id.mid(1), article(actual), actual, actualId),
+      QString{"if you meant the %1, use %2; otherwise call find_nodes to look up ids"}
+        .arg(actual, actualId),
       {{"id", id}, {"actual", actual}, {"expected", expected}, {"actual_id", actualId}});
   }
   }
@@ -691,13 +726,19 @@ McpResult<vm::bbox3d> boxInWorld(
   static const auto axes = std::array<const char*, 3>{"x", "y", "z"};
   for (size_t i = 0; i < 3; ++i)
   {
-    if (!(max[i] - min[i] >= 1.0 / 1024.0))
+    constexpr auto minimum = 1.0 / 1024.0;
+    const auto size = max[i] - min[i];
+    if (!(size >= minimum))
     {
       return toolError(
         "invalid_argument",
-        QString{"the box is empty along %1: max.%1 must exceed min.%1"}.arg(axes[i]),
-        "pass min < max on every axis",
-        {{"axis", axes[i]}});
+        std::isfinite(size) && size > 0.0
+          ? QString{"the box is only %1 units thick along %2; the minimum is 1/1024"}
+              .arg(size)
+              .arg(axes[i])
+          : QString{"the box is empty along %1: max.%1 must exceed min.%1"}.arg(axes[i]),
+        "pass min < max on every axis, at least 1/1024 apart (usually whole units)",
+        {{"axis", axes[i]}, {"size", size}, {"minimum", minimum}});
     }
   }
 

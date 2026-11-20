@@ -591,6 +591,26 @@ TEST_CASE("McpMapEditTools")
 
   SECTION("set_face_attributes")
   {
+    SECTION("brushes in closed groups")
+    {
+      // the error names the group and the hint works for this tool
+      const auto error =
+        f.error("set_face_attributes", R"({"brushes":["B7"],"material":"stone"})");
+      CHECK(error.value("code") == QJsonValue{"node_not_selectable"});
+      CHECK(details(error).value("reason") == QJsonValue{"in_closed_group"});
+      CHECK(details(error).value("group") == QJsonValue{"G8"});
+      CHECK(error.value("hint").toString().contains("G8"));
+
+      const auto result =
+        f.ok("set_face_attributes", R"({"brushes":["G8"],"material":"stone"})");
+      CHECK(result.value("faces_changed") == QJsonValue{6});
+      for (const auto& face : faces(f, "B7"))
+      {
+        CHECK(face.toObject().value("material") == QJsonValue{"stone"});
+      }
+      CHECK(scene.group->closed());
+    }
+
     SECTION("faces")
     {
       const auto result = f.ok(

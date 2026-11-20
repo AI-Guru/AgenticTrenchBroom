@@ -72,7 +72,7 @@ namespace
 constexpr auto MaxIdList = size_t(50);
 constexpr auto DefaultMaxChanges = 200;
 constexpr auto MaxChanges = 5000;
-constexpr auto DefaultMaxBytes = 1048576;
+constexpr auto DefaultMaxBytes = 262144;
 constexpr auto MinMaxBytes = 1024;
 constexpr auto MaxMaxBytes = 8388608;
 constexpr auto CheckpointNamePattern = "^[A-Za-z0-9_.-]{1,64}$";
@@ -335,7 +335,10 @@ McpResult<QJsonObject> validateMap(McpCallContext& context, const QJsonObject& a
         {"node", doc.nodes.idOf(node)},
         {"type", typeIt != descriptions.end() ? typeIt->second : QString{}},
         {"description", description},
-        {"line", qint64(issue->lineNumber())},
+        // nodes that were never saved or loaded have no line
+        {"line",
+         issue->lineNumber() > 0 ? QJsonValue{qint64(issue->lineNumber())}
+                                 : QJsonValue{}},
         {"hidden", issue->hidden()},
       };
       if (const auto* faceIssue = dynamic_cast<const mdl::BrushFaceIssue*>(issue))
@@ -404,7 +407,8 @@ McpToolDef validateMapTool()
     .description =
       "Runs TrenchBroom's map validators (the issue browser) and lists the issues in "
       "node order, e.g. missing classnames, non-integer vertices or empty groups. Use "
-      "this after edits to verify the map is clean.",
+      "this after edits to verify the map is clean. Each item has the node id and the "
+      "line in the map file (null for nodes that were not saved or loaded yet).",
     .inputSchema = schema::object(properties),
     .kind = McpToolKind::Read,
     .annotations = ReadOnly,
@@ -685,7 +689,8 @@ McpToolDef checkpointDiffTool()
         {"from", checkpointNameSchema("the checkpoint to compare from, or 'current'")},
         {"to", checkpointNameSchema("the checkpoint to compare to (default 'current')")},
         {"max_changes",
-         schema::integer(1, MaxChanges, "maximum number of entries per list (200)")},
+         schema::integer(
+           1, MaxChanges, "maximum number of entries per list (default 200)")},
       },
       {"from"}),
     .kind = McpToolKind::Read,
@@ -957,7 +962,10 @@ McpToolDef exportMapTextTool()
       {"strip_tb_properties",
        schema::boolean("omit TrenchBroom specific properties such as layers and groups")},
       {"max_bytes",
-       schema::integer(MinMaxBytes, MaxMaxBytes, "maximum UTF-8 size of text (1 MiB)")},
+       schema::integer(
+         MinMaxBytes,
+         MaxMaxBytes,
+         "maximum UTF-8 size of text (default 256 KiB, at most 8 MiB)")},
     }),
     .kind = McpToolKind::Read,
     .annotations = ReadOnly,

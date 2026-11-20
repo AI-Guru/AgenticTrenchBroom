@@ -578,7 +578,8 @@ McpToolDef saveMapTool(McpAppHost& host)
        schema::boolean("Replace an existing file at path. Defaults to false.")},
     }),
     .kind = McpToolKind::App,
-    .annotations = Mutating,
+    // overwrite:true replaces an existing file
+    .annotations = {.readOnly = false, .destructive = true, .idempotent = false},
     .runApp = [&host](const QJsonObject& args) -> McpResult<QJsonObject> {
       return host.target(McpToolKind::Mutate)
              | kdl::and_then([&](const McpTarget& target) -> McpResult<QJsonObject> {

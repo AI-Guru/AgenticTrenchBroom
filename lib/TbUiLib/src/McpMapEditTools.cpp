@@ -898,6 +898,101 @@ McpToolDef setEntityPropertiesTool()
 
 // set_face_attributes
 
+mcp::ToolError notABrush(const McpDocumentState& doc, const mdl::Node& node)
+{
+  const auto id = doc.nodes.idOf(node);
+  return toolError(
+    "wrong_node_type",
+    QString{"%1 is a %2, not a brush"}.arg(id, nodeTypeName(node)),
+    "pass brush ids; brush entities are expanded to their brushes",
+    {{"id", id}, {"actual", nodeTypeName(node)}, {"expected", "brush"}});
+}
+
+/** Resolves the given ids to brushes; brush entities are expanded to their brushes. */
+McpResult<std::vector<mdl::BrushNode*>> resolveBrushes(
+  const McpDocumentState& doc, const QJsonArray& ids)
+{
+  auto targets = resolveTargets(doc, ids);
+  if (targets.is_error())
+  {
+    return errorOf(targets);
+  }
+  auto result = std::vector<mdl::BrushNode*>{};
+  for (auto* node : targets.value())
+  {
+    auto* brushNode = dynamic_cast<mdl::BrushNode*>(node);
+    if (!brushNode)
+    {
+      return notABrush(doc, *node);
+    }
+    result.push_back(brushNode);
+  }
+  return result;
+}
+
+/** Whether the brush can be edited although it may be inside a closed group. */
+bool isEditableBrush(const McpDocumentState& doc, const mdl::BrushNode& brushNode)
+{
+  const auto& editorContext = doc.map.editorContext();
+  return editorContext.visible(brushNode) && editorContext.editable(brushNode)
+         && requireNotLinked(doc, brushNode).is_success();
+}
+
+/**
+ * Resolves the given ids to brushes. Brush entities and groups are expanded to the
+ * brushes inside them that are visible, editable and not linked; the number of skipped
+ * brushes and patches is returned too.
+ */
+McpResult<std::pair<std::vector<mdl::BrushNode*>, size_t>> resolveBrushesInside(
+  const McpDocumentState& doc, const QJsonArray& ids)
+{
+  auto targets = resolveTargets(doc, ids);
+  if (targets.is_error())
+  {
+    return errorOf(targets);
+  }
+
+  auto result = std::vector<mdl::BrushNode*>{};
+  auto seen = std::unordered_set<const mdl::BrushNode*>{};
+  auto skipped = size_t(0);
+  const auto collect = [&](const auto& self, mdl::Node& node) -> void {
+    if (auto* brushNode = dynamic_cast<mdl::BrushNode*>(&node))
+    {
+      if (!isEditableBrush(doc, *brushNode))
+      {
+        ++skipped;
+      }
+      else if (seen.insert(brushNode).second)
+      {
+        result.push_back(brushNode);
+      }
+      return;
+    }
+    for (auto* child : node.children())
+    {
+      self(self, *child);
+    }
+  };
+
+  for (auto* node : targets.value())
+  {
+    if (dynamic_cast<mdl::BrushNode*>(node) || dynamic_cast<mdl::GroupNode*>(node))
+    {
+      collect(collect, *node);
+    }
+    else if (dynamic_cast<mdl::PatchNode*>(node))
+    {
+      // e.g. a patch of a brush entity
+      ++skipped;
+    }
+    else
+    {
+      return notABrush(doc, *node);
+    }
+  }
+  return std::pair{std::move(result), skipped};
+}
+
 McpResult<QJsonObject> setFaceAttributes(McpCallContext& context, const QJsonObject& args)
 {
   auto& doc = context.doc;
@@ -1006,7 +1101,6 @@ McpResult<QJsonObject> setFaceAttributes(McpCallContext& context, const QJsonObj
   }
 
   auto faces = std::vector<mdl::BrushFaceHandle>{};
-  auto brushes = std::vector<mdl::Node*>{};
   if (args.contains("faces"))
   {
     auto facesResult = resolveFaces(doc, args.value("faces").toArray());
@@ -1029,34 +1123,48 @@ McpResult<QJsonObject> setFaceAttributes(McpCallContext& context, const QJsonObj
   }
   else
   {
-    auto targets = resolveTargets(doc, args.value("brushes").toArray());
-    if (targets.is_error())
+    // groups are expanded to their brushes, like in replace_material, so that rooms
+    // made by create_room with a group_name can be retextured without open_group
+    const auto ids = args.value("brushes").toArray();
+    if (auto nodes = resolveNodes(doc, ids, schema::MaxNodeIds); nodes.is_success())
     {
-      return errorOf(targets);
-    }
-    for (auto* node : targets.value())
-    {
-      if (!dynamic_cast<mdl::BrushNode*>(node))
+      for (const auto* node : nodes.value())
       {
-        const auto id = doc.nodes.idOf(*node);
-        return toolError(
-          "wrong_node_type",
-          QString{"%1 is a %2, not a brush"}.arg(id, nodeTypeName(*node)),
-          "pass brush ids; brush entities are expanded to their brushes",
-          {{"id", id}, {"actual", nodeTypeName(*node)}, {"expected", "brush"}});
+        if (dynamic_cast<const mdl::PatchNode*>(node))
+        {
+          return notABrush(doc, *node);
+        }
       }
     }
-    brushes = std::move(targets).value();
+    auto resolved = resolveBrushesInside(doc, ids);
+    if (resolved.is_error())
+    {
+      return errorOf(resolved);
+    }
+    const auto [brushNodes, skipped] = std::move(resolved).value();
+    if (skipped > 0)
+    {
+      context.warnings.push_back(
+        QString{"%1 hidden, locked or linked brushes or patches were skipped"}.arg(
+          skipped));
+    }
+    const auto& editorContext = map.editorContext();
+    for (auto* brushNode : brushNodes)
+    {
+      for (size_t i = 0; i < brushNode->brush().faceCount(); ++i)
+      {
+        if (editorContext.selectable(*brushNode, brushNode->brush().face(i)))
+        {
+          faces.emplace_back(*brushNode, i);
+        }
+      }
+    }
   }
 
   mdl::deselectAll(map);
   if (!faces.empty())
   {
     mdl::selectBrushFaces(map, faces);
-  }
-  else
-  {
-    mdl::selectNodes(map, brushes);
   }
 
   const auto faceCount = map.selection().allBrushFaces().size();
@@ -1124,7 +1232,11 @@ McpToolDef setFaceAttributesTool()
       "fits the texture to each face. Verify with get_brush_geometry.",
     .inputSchema = schema::object({
       {"faces", schema::array(schema::faceRef(), 1, MaxFaceRefs, "faces to change")},
-      {"brushes", schema::nodeIds(schema::MaxNodeIds, "brushes whose faces to change")},
+      {"brushes",
+       schema::nodeIds(
+         schema::MaxNodeIds,
+         "brushes whose faces to change; brush entities and groups are expanded to "
+         "their brushes")},
       {"material", schema::material()},
       {"offset", schema::vec2("UV offset in texels")},
       {"scale", schema::vec2("UV scale; must not be 0")},
@@ -1163,100 +1275,6 @@ QJsonArray idsOf(const McpNodeRegistry& registry, const auto& nodes)
   return result;
 }
 
-mcp::ToolError notABrush(const McpDocumentState& doc, const mdl::Node& node)
-{
-  const auto id = doc.nodes.idOf(node);
-  return toolError(
-    "wrong_node_type",
-    QString{"%1 is a %2, not a brush"}.arg(id, nodeTypeName(node)),
-    "pass brush ids; brush entities are expanded to their brushes",
-    {{"id", id}, {"actual", nodeTypeName(node)}, {"expected", "brush"}});
-}
-
-/** Resolves the given ids to brushes; brush entities are expanded to their brushes. */
-McpResult<std::vector<mdl::BrushNode*>> resolveBrushes(
-  const McpDocumentState& doc, const QJsonArray& ids)
-{
-  auto targets = resolveTargets(doc, ids);
-  if (targets.is_error())
-  {
-    return errorOf(targets);
-  }
-  auto result = std::vector<mdl::BrushNode*>{};
-  for (auto* node : targets.value())
-  {
-    auto* brushNode = dynamic_cast<mdl::BrushNode*>(node);
-    if (!brushNode)
-    {
-      return notABrush(doc, *node);
-    }
-    result.push_back(brushNode);
-  }
-  return result;
-}
-
-/** Whether the brush can be edited although it may be inside a closed group. */
-bool isEditableBrush(const McpDocumentState& doc, const mdl::BrushNode& brushNode)
-{
-  const auto& editorContext = doc.map.editorContext();
-  return editorContext.visible(brushNode) && editorContext.editable(brushNode)
-         && requireNotLinked(doc, brushNode).is_success();
-}
-
-/**
- * Resolves the given ids to brushes. Brush entities and groups are expanded to the
- * brushes inside them that are visible, editable and not linked; the number of skipped
- * brushes and patches is returned too.
- */
-McpResult<std::pair<std::vector<mdl::BrushNode*>, size_t>> resolveBrushesInside(
-  const McpDocumentState& doc, const QJsonArray& ids)
-{
-  auto targets = resolveTargets(doc, ids);
-  if (targets.is_error())
-  {
-    return errorOf(targets);
-  }
-
-  auto result = std::vector<mdl::BrushNode*>{};
-  auto seen = std::unordered_set<const mdl::BrushNode*>{};
-  auto skipped = size_t(0);
-  const auto collect = [&](const auto& self, mdl::Node& node) -> void {
-    if (auto* brushNode = dynamic_cast<mdl::BrushNode*>(&node))
-    {
-      if (!isEditableBrush(doc, *brushNode))
-      {
-        ++skipped;
-      }
-      else if (seen.insert(brushNode).second)
-      {
-        result.push_back(brushNode);
-      }
-      return;
-    }
-    for (auto* child : node.children())
-    {
-      self(self, *child);
-    }
-  };
-
-  for (auto* node : targets.value())
-  {
-    if (dynamic_cast<mdl::BrushNode*>(node) || dynamic_cast<mdl::GroupNode*>(node))
-    {
-      collect(collect, *node);
-    }
-    else if (dynamic_cast<mdl::PatchNode*>(node))
-    {
-      // e.g. a patch of a brush entity
-      ++skipped;
-    }
-    else
-    {
-      return notABrush(doc, *node);
-    }
-  }
-  return std::pair{std::move(result), skipped};
-}
 
 /**
  * Returns the ids in after that are not in before. Uses a hash set, since

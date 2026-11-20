@@ -65,12 +65,13 @@ const auto Instructions = QStringLiteral(
   set_active_document choose the map that the map tools act on. save_map writes .map files; close_map closes a saved map
   (close_map with discard_changes:true throws unsaved changes away without asking).
 - Ids: world, default_layer, L<n> layer, G<n> group, E<n> entity, B<n> brush, P<n> patch; "@selection" = what the user
-  selected. Ids are stable across transforms, property/face edits, grouping and layer moves. They CHANGE after
+  selected. All types share one number sequence (a new map has L1 and B2, the next entity may be E4), so take ids
+  from tool results or find_nodes instead of guessing them. Ids are stable across transforms, property/face edits, grouping and layer moves. They CHANGE after
   delete+undo, CSG, clip and paste; old ids return stale_node. New maps may contain a starter brush.
 - Each mutating call is ONE undo step named "MCP: <tool>", leaves the user's selection as it was, and returns
   changes {created, removed, modified}, issues on touched nodes, warnings and log lines. undo only undoes MCP steps
   unless allow_user_commands is true.
-- Call get_conventions first for units, grid and typical sizes (player, doors, stairs).
+- After new_map or open_map, call get_conventions for units, grid and typical sizes (player, doors, stairs).
 - Block out with create_room (floor, ceiling and walls with door/window openings) and create_stairs; place things
   with drop_to_floor and align_nodes; describe_region summarizes an area. create_hollow_box, csg_subtract (touching
   brushes are never cut), clip_brush, create_primitive_brush, create_brush_from_points, duplicate_nodes and

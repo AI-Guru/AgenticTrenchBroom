@@ -164,7 +164,7 @@ TEST_CASE("McpMapEvalTools")
       CHECK(
         compactJson(result.value("items"))
         == QStringLiteral(
-          R"([{"description":"worldspawn not found in entity definitions","hidden":false,"line":0,"node":"world","type":"Missing entity definition"}])"));
+          R"([{"description":"worldspawn not found in entity definitions","hidden":false,"line":null,"node":"world","type":"Missing entity definition"}])"));
       CHECK(
         compactJson(result.value("by_type"))
         == QStringLiteral(R"({"Missing entity definition":1})"));

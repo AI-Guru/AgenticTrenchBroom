@@ -18,6 +18,7 @@
  */
 
 #include <QJsonArray>
+#include <QJsonDocument>
 #include <QJsonObject>
 
 #include "McpTestUtils.h"
@@ -530,6 +531,45 @@ TEST_CASE("McpMapReadTools")
       }
       sides.sort();
       CHECK(sides == QStringList{"+x", "+y", "+z", "-x", "-y", "-z"});
+    }
+
+    SECTION("the output is capped")
+    {
+      // a 64-sided cylinder is about 34 KB with faces and vertices
+      auto ids = QJsonArray{};
+      for (auto i = 0; i < 12; ++i)
+      {
+        const auto x = 1000 + 100 * i;
+        ids.append(f.ok(
+                      "create_primitive_brush",
+                      QJsonObject{
+                        {"shape", "cylinder"},
+                        {"sides", 64},
+                        {"bounds",
+                         QJsonObject{
+                           {"min", QJsonArray{x, 0, 0}},
+                           {"max", QJsonArray{x + 64, 64, 64}},
+                         }},
+                      })
+                     .value("ids")
+                     .toArray()[0]);
+      }
+
+      const auto result = f.ok("get_brush_geometry", QJsonObject{{"ids", ids}});
+      CHECK(result.value("truncated") == QJsonValue{true});
+      const auto brushes = result.value("brushes").toArray();
+      const auto omitted = result.value("omitted").toArray();
+      CHECK_FALSE(brushes.isEmpty());
+      CHECK_FALSE(omitted.isEmpty());
+      CHECK(brushes.size() + omitted.size() == ids.size());
+      CHECK(omitted.last() == ids.last());
+      CHECK(QJsonDocument{result}.toJson(QJsonDocument::Compact).size() < 300 * 1024);
+      CHECK_FALSE(result.value("warnings").toArray().isEmpty());
+
+      const auto small =
+        f.ok("get_brush_geometry", QJsonObject{{"ids", ids}, {"include_faces", false}});
+      CHECK(small.value("truncated") == QJsonValue{false});
+      CHECK(small.value("brushes").toArray().size() == ids.size());
     }
 
     SECTION("include_vertices and include_faces")

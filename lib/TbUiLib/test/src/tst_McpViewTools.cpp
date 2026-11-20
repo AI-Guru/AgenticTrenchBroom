@@ -18,6 +18,7 @@
  */
 
 #include <QByteArray>
+#include <QFile>
 #include <QFileInfo>
 #include <QGuiApplication>
 #include <QImage>
@@ -232,6 +233,19 @@ TEST_CASE("McpViewTools")
       CHECK(
         f.err("screenshot", QJsonObject{{"save_path", dir.filePath("missing/x.png")}})
         == "io_error");
+      // an existing file is only replaced with overwrite:true
+      const auto existing = dir.filePath("exists.png");
+      {
+        auto file = QFile{existing};
+        REQUIRE(file.open(QIODevice::WriteOnly));
+        file.write("notpng");
+      }
+      CHECK(f.err("screenshot", QJsonObject{{"save_path", existing}}) == "file_exists");
+      {
+        auto file = QFile{existing};
+        REQUIRE(file.open(QIODevice::ReadOnly));
+        CHECK(file.readAll() == "notpng");
+      }
       CHECK(f.err("screenshot", R"({"frame_ids":["B999"]})") == "unknown_node");
       CHECK(
         f.err(

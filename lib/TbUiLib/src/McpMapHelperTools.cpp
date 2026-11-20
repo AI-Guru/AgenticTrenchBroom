@@ -670,7 +670,8 @@ McpToolDef createRoomTool()
       {
         {"inner_bounds", schema::bounds("the empty space inside the room")},
         {"wall_thickness",
-         schema::number(MinSize, 4096, "thickness of walls, floor and ceiling (16)")},
+         schema::number(
+           MinSize, 4096, "thickness of walls, floor and ceiling (default 16)")},
         {"material", schema::material("default material (default: current)")},
         {"floor_material", schema::material("material of the floor")},
         {"ceiling_material", schema::material("material of the ceiling")},
@@ -687,7 +688,7 @@ McpToolDef createRoomTool()
                   -MaxSize,
                   MaxSize,
                   "center of the opening along the wall, relative to the center of the "
-                  "wall (0)")},
+                  "wall (default 0)")},
                {"width", schema::number(MinSize, MaxSize, "width along the wall")},
                {"height", schema::number(MinSize, MaxSize, "height")},
                {"bottom",
@@ -843,9 +844,10 @@ McpToolDef createStairsTool()
         {"direction",
          schema::stringEnum({"+x", "-x", "+y", "-y"}, "the direction to climb")},
         {"steps", schema::integer(1, MaxSteps, "number of steps")},
-        {"step_height", schema::number(MinSize, MaxStepSize, "rise per step (8)")},
-        {"step_depth", schema::number(MinSize, MaxStepSize, "run per step (16)")},
-        {"width", schema::number(MinSize, MaxSize, "width of the stairs (64)")},
+        {"step_height",
+         schema::number(MinSize, MaxStepSize, "rise per step (default 8)")},
+        {"step_depth", schema::number(MinSize, MaxStepSize, "run per step (default 16)")},
+        {"width", schema::number(MinSize, MaxSize, "width of the stairs (default 64)")},
         {"material", schema::material("material (default: current)")},
         {"solid",
          schema::boolean(
@@ -1218,8 +1220,10 @@ McpToolDef dropToFloorTool()
         {"ids", schema::nodeIds()},
         {"direction", schema::side("the direction to move in (-z)")},
         {"max_distance",
-         schema::number(MinSize, MaxDistance, "how far to look for a surface (8192)")},
-        {"gap", schema::number(0, MaxGap, "space to leave above the surface (0)")},
+         schema::number(
+           MinSize, MaxDistance, "how far to look for a surface (default 8192)")},
+        {"gap",
+         schema::number(0, MaxGap, "space to leave above the surface (default 0)")},
       },
       {"ids"}),
     .kind = McpToolKind::Mutate,
@@ -1414,7 +1418,8 @@ McpToolDef getConventionsTool()
     .title = "Get Conventions",
     .description =
       "Returns the coordinate conventions, the grid and world bounds, and typical sizes "
-      "(player, doors, corridors, stairs) to build playable spaces. Call it first.",
+      "(player, doors, corridors, stairs) to build playable spaces. Needs an open map: "
+      "call it after new_map or open_map.",
     .inputSchema = schema::object({}),
     .kind = McpToolKind::Read,
     .annotations = ReadOnly,
@@ -1665,7 +1670,8 @@ McpToolDef describeRegionTool()
       {
         {"bounds", schema::bounds("the region to describe")},
         {"max_items",
-         schema::integer(1, MaxItems, "maximum number of entries per list (100)")},
+         schema::integer(
+           1, MaxItems, "maximum number of entries per list (default 100)")},
       },
       {"bounds"}),
     .kind = McpToolKind::Read,

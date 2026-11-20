@@ -69,6 +69,8 @@ namespace
 
 constexpr auto MaxGetNodes = 200;
 constexpr auto MaxGetBrushGeometry = 100;
+/** get_brush_geometry omits further brushes once its output reaches this size. */
+constexpr auto MaxBrushGeometryBytes = qsizetype(256 * 1024);
 
 const auto NodeTypes = QStringList{"world", "layer", "group", "entity", "brush", "patch"};
 
@@ -308,7 +310,7 @@ McpToolDef getMapInfoTool()
     .description =
       "Returns an overview of the current map: game, format, file, world and soft map "
       "bounds, grid size, current layer/group/material, undo and redo state, the "
-      "selection and node counts. Call it first to orient yourself.",
+      "selection and node counts. Call it after open_map to orient yourself.",
     .inputSchema = schema::object({}),
     .kind = McpToolKind::Read,
     .annotations = ReadOnly,
@@ -444,7 +446,8 @@ QJsonObject nodeDetail(
   result["logical_bounds"] = result.value("bounds");
   result["physical_bounds"] =
     physicalBounds ? QJsonValue{toJson(*physicalBounds)} : QJsonValue{};
-  result["line_number"] = qint64(node.lineNumber());
+  result["line_number"] =
+    node.lineNumber() > 0 ? QJsonValue{qint64(node.lineNumber())} : QJsonValue{};
   result["child_ids"] = idArray(registry, node.children());
 
   node.accept(kdl::overload(
@@ -594,6 +597,8 @@ McpResult<QJsonObject> getBrushGeometry(McpCallContext& context, const QJsonObje
   }
 
   auto brushes = QJsonArray{};
+  auto omitted = QJsonArray{};
+  auto bytes = qsizetype(0);
   for (const auto* node : resolved.value())
   {
     const auto* brushNode = dynamic_cast<const mdl::BrushNode*>(node);
@@ -638,10 +643,31 @@ McpResult<QJsonObject> getBrushGeometry(McpCallContext& context, const QJsonObje
       }
       entry["faces"] = faces;
     }
+
+    // e.g. one 64-sided cylinder is about 34 KB; keep the output within a tool result
+    const auto entryBytes = QJsonDocument{entry}.toJson(QJsonDocument::Compact).size();
+    if (
+      !brushes.isEmpty()
+      && (!omitted.isEmpty() || bytes + entryBytes > MaxBrushGeometryBytes))
+    {
+      omitted.append(entry.value("id"));
+      continue;
+    }
+    bytes += entryBytes;
     brushes.append(entry);
   }
 
-  return QJsonObject{{"brushes", brushes}};
+  auto result = QJsonObject{{"brushes", brushes}, {"truncated", !omitted.isEmpty()}};
+  if (!omitted.isEmpty())
+  {
+    result["omitted"] = omitted;
+    context.warnings.push_back(
+      QString{"the output was cut off at about %1 KiB; %2 brushes were omitted: call "
+              "again for the omitted ids, or with include_faces false"}
+        .arg(MaxBrushGeometryBytes / 1024)
+        .arg(omitted.size()));
+  }
+  return result;
 }
 
 McpToolDef getBrushGeometryTool()
@@ -653,7 +679,8 @@ McpToolDef getBrushGeometryTool()
       "Returns exact brush geometry: bounds, size, center, volume, sorted vertices and "
       "per face the plane, side (+x..-z), boundary vertices, area, material and UV "
       "attributes, plus validity flags. Use it to verify that brushes were built as "
-      "intended.",
+      "intended. Output is capped at about 256 KiB (truncated, omitted); pass "
+      "include_faces false for many or complex brushes.",
     .inputSchema = schema::object(
       {
         {"ids",

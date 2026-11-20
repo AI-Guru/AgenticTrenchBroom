@@ -556,7 +556,7 @@ QJsonArray imageContent(QJsonObject& structured)
   return result;
 }
 
-McpResult<std::filesystem::path> savePath(const QString& text)
+McpResult<std::filesystem::path> savePath(const QString& text, const bool overwrite)
 {
   const auto path = pathFromQString(text).lexically_normal();
   if (!path.is_absolute() || !text.endsWith(".png", Qt::CaseInsensitive))
@@ -577,6 +577,14 @@ McpResult<std::filesystem::path> savePath(const QString& text)
   if (std::filesystem::is_directory(path, error))
   {
     return toolError("io_error", QString{"%1 is a directory"}.arg(pathAsQString(path)));
+  }
+  if (!overwrite && std::filesystem::exists(path, error))
+  {
+    return toolError(
+      "file_exists",
+      QString{"%1 already exists"}.arg(pathAsQString(path)),
+      "pass overwrite:true to replace it, or choose another path",
+      {{"path", pathAsGenericQString(path)}, {"pointer", "/save_path"}});
   }
   return path;
 }
@@ -873,7 +881,8 @@ McpResult<QJsonObject> screenshot(McpAppHost& host, const QJsonObject& args)
   auto path = std::optional<std::filesystem::path>{};
   if (args.contains("save_path"))
   {
-    auto result = savePath(args.value("save_path").toString());
+    auto result =
+      savePath(args.value("save_path").toString(), args.value("overwrite").toBool(false));
     if (result.is_error())
     {
       return errorOf(result);
@@ -944,8 +953,12 @@ McpToolDef screenshotTool(McpAppHost& host)
        {"minLength", 1},
        {"maxLength", 4096},
        {"pattern", "^.*\\.[pP][nN][gG]$"},
-       {"description", "Also write the PNG to this absolute path."},
+       {"description",
+        "Also write the PNG to this absolute path; an existing file is only replaced "
+        "with overwrite:true."},
      }},
+    {"overwrite",
+     schema::boolean("Replace an existing file at save_path; default false.")},
     {"restore_camera",
      schema::boolean(
        "Restore the cameras after the shot; default true. Set false to leave the "
@@ -963,7 +976,8 @@ McpToolDef screenshotTool(McpAppHost& host)
       "query tools and validate_map instead.",
     .inputSchema = schema::object(properties),
     .kind = McpToolKind::App,
-    .annotations = ReadOnly,
+    // not read-only: it can write a file and, with restore_camera false, move the view
+    .annotations = Mutating,
     .runApp = [&host](const QJsonObject& args) { return screenshot(host, args); },
     .extraContent = imageContent,
   };

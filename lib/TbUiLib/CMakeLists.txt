@@ -131,6 +131,7 @@ target_sources(TbUiLib
     ${CMAKE_CURRENT_SOURCE_DIR}/src/McpMapTools.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/McpNodeRegistry.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/McpPreconditions.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/McpPreferencePane.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/McpSchemas.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/McpSelectionGuard.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/McpToolDispatcher.cpp
@@ -332,6 +333,7 @@ target_sources(TbUiLib
     ${CMAKE_CURRENT_SOURCE_DIR}/include/ui/McpMapTools.h
     ${CMAKE_CURRENT_SOURCE_DIR}/include/ui/McpNodeRegistry.h
     ${CMAKE_CURRENT_SOURCE_DIR}/include/ui/McpPreconditions.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/ui/McpPreferencePane.h
     ${CMAKE_CURRENT_SOURCE_DIR}/include/ui/McpSchemas.h
     ${CMAKE_CURRENT_SOURCE_DIR}/include/ui/McpSelectionGuard.h
     ${CMAKE_CURRENT_SOURCE_DIR}/include/ui/McpToolDispatcher.h

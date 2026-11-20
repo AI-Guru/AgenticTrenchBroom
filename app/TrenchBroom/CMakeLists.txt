@@ -151,6 +151,17 @@ add_dependencies(TrenchBroom GenerateManual)
 
 set_target_properties(TrenchBroom PROPERTIES AUTORCC TRUE)
 
+# The MCP end-to-end tests start the real application, so they need a display (or the
+# offscreen platform on Linux) and are not registered by default.
+option(TB_ENABLE_MCP_E2E_TEST "Register the MCP end-to-end tests (needs a display/offscreen platform)" OFF)
+if(TB_ENABLE_MCP_E2E_TEST)
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    add_test(NAME TrenchBroomMcpE2E
+        COMMAND Python3::Interpreter ${CMAKE_CURRENT_SOURCE_DIR}/test/mcp_e2e.py --app $<TARGET_FILE:TrenchBroom>)
+    # the test uses the portable config directory next to the binary
+    set_tests_properties(TrenchBroomMcpE2E PROPERTIES LABELS e2e TIMEOUT 300 RUN_SERIAL TRUE)
+endif()
+
 if(APPLE)
     # Configure variables that are substituted into the plist
     # Set CFBundleName, which controls the application menu label

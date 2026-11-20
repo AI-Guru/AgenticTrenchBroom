@@ -29,6 +29,7 @@
 #include "mdl/Entity.h"
 #include "mdl/EntityNode.h"
 #include "mdl/EntityNodeBase.h"
+#include "mdl/EntityProperties.h"
 #include "mdl/GameConfig.h"
 #include "mdl/GameInfo.h"
 #include "mdl/Grid.h"
@@ -597,7 +598,7 @@ McpResult<QJsonObject> setEntityProperties(
       error.details["pointer"] = pointer;
       return error;
     }
-    return kdl::void_success;
+    return checkEntityPropertyKeyNotReserved(key, pointer);
   };
   const auto hasKeyEverywhere = [&](const std::string& key) {
     return std::ranges::all_of(targets.entities, [&](const auto* entityNode) {
@@ -713,6 +714,29 @@ McpResult<QJsonObject> setEntityProperties(
       {
         return keyError(pointer, "classname must not be empty or worldspawn");
       }
+      // An entity node with classname func_group and a _tb_type of _tb_group or
+      // _tb_layer violates the entity inspector's contracts, and the map reader would
+      // turn it into a group or layer. New _tb_type values are refused above, but an
+      // entity loaded from a file may already have one.
+      if (
+        value.value()
+        == QString::fromStdString(mdl::EntityPropertyValues::GroupClassname))
+      {
+        for (const auto* entityNode : targets.entities)
+        {
+          if (entityNode->entity().hasProperty(mdl::EntityPropertyKeys::TbGroupType))
+          {
+            const auto id = doc.nodes.idOf(*entityNode);
+            return toolError(
+              "invalid_argument",
+              QString{"%1 has a _tb_type property and cannot become a func_group"}.arg(
+                id),
+              "remove _tb_type in the TrenchBroom UI first, or use group_nodes to group "
+              "nodes",
+              {{"pointer", pointer}, {"id", id}});
+          }
+        }
+      }
     }
     sets.emplace_back(fromUnicode(map, it.key()), fromUnicode(map, value.value()));
   }
@@ -806,7 +830,8 @@ McpToolDef setEntityPropertiesTool()
     .description =
       "Renames, sets and removes properties (in this order) of the given entities, or of "
       "worldspawn with ids [\"world\"]. Values may be strings, numbers, booleans or "
-      "[x,y,z]. Verify with get_nodes.",
+      "[x,y,z]. Keys starting with _tb_ are reserved for TrenchBroom and refused. "
+      "Verify with get_nodes.",
     .inputSchema = schema::object(
       {
         {"ids", schema::nodeIds(schema::MaxNodeIds, "entity ids, or [\"world\"]")},

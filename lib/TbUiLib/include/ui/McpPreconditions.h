@@ -228,6 +228,17 @@ McpResult<void> checkEntityPropertyValue(
   const QString& key, const QString& value, const QString& pointer);
 
 /**
+ * Refuses entity property keys that start with "_tb_". TrenchBroom manages these keys
+ * itself: _tb_type turns a func_group into a group or layer (the entity inspector aborts
+ * on an entity node that looks like one, and the map changes structure when it is
+ * reloaded), and the worldspawn keys (_tb_soft_map_bounds, _tb_def, _tb_mod, ...) are
+ * read-only in the entity inspector and parsed without validation. Returns
+ * invalid_argument with the pointer.
+ */
+McpResult<void> checkEntityPropertyKeyNotReserved(
+  const QString& key, const QString& pointer);
+
+/**
  * Checks that the given nodes and their descendants can be added to the map and
  * transformed without reaching a TrenchBroom assertion or contract: their bounds are
  * finite and within McpMaxEntityPropertyNumber, entity rotations and group

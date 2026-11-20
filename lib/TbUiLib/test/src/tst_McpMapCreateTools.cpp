@@ -323,6 +323,34 @@ TEST_CASE("McpMapCreateTools")
       CHECK_FALSE(withOrigin.value("warnings").toArray().isEmpty());
     }
 
+    SECTION("reserved _tb_ keys are refused")
+    {
+      // a func_group with _tb_type _tb_group or _tb_layer looks like a group or layer
+      // to the entity inspector, which aborts on a contract when it is selected
+      const auto scene = populateTestScene(f);
+      const auto before = snapshot(f.map);
+
+      const auto error = f.error(
+        "create_entity",
+        R"({"classname":"func_group","brush_ids":["B2"],"properties":{"_tb_type":"_tb_group"}})");
+      CHECK(error.value("code") == QJsonValue{"invalid_argument"});
+      CHECK(
+        error.value("details").toObject().value("pointer")
+        == QJsonValue{"/properties/_tb_type"});
+      CHECK(
+        f.err(
+          "create_entity",
+          R"({"classname":"func_group","origin":[0,0,0],"properties":{"_tb_type":"_tb_layer"}})")
+        == "invalid_argument");
+      CHECK(
+        f.err(
+          "create_entity",
+          R"({"classname":"light","origin":[0,0,0],"properties":{"_tb_layer":"1"}})")
+        == "invalid_argument");
+      CHECK(snapshot(f.map) == before);
+      CHECK(scene.wall != nullptr);
+    }
+
     SECTION("brush_ids errors")
     {
       const auto scene = populateTestScene(f);

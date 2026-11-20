@@ -30,6 +30,7 @@
 #include "mdl/EditorContext.h"
 #include "mdl/Entity.h"
 #include "mdl/EntityNode.h"
+#include "mdl/EntityProperties.h"
 #include "mdl/Group.h"
 #include "mdl/GroupNode.h"
 #include "mdl/LayerNode.h"
@@ -841,6 +842,22 @@ McpResult<QString> propValueText(const QJsonValue& value, const QString& pointer
     return error;
   }
   return *text;
+}
+
+McpResult<void> checkEntityPropertyKeyNotReserved(
+  const QString& key, const QString& pointer)
+{
+  if (key.startsWith(QString::fromStdString(mdl::EntityPropertyKeys::TbPrefix)))
+  {
+    return toolError(
+      "invalid_argument",
+      QString{"%1: '%2' is reserved; keys starting with _tb_ are managed by TrenchBroom"}
+        .arg(pointer, key),
+      "use group_nodes, create_layer or move_to_layer for groups and layers; soft map "
+      "bounds, mods and entity definitions can only be changed in the TrenchBroom UI",
+      {{"pointer", pointer}, {"key", key}});
+  }
+  return kdl::void_success;
 }
 
 McpResult<void> checkEntityPropertyValue(

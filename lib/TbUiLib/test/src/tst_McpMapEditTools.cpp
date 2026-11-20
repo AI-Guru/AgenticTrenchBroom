@@ -489,7 +489,37 @@ TEST_CASE("McpMapEditTools")
       CHECK(err(R"({"ids":["E3"],"set":{"angle":1e300}})") == "invalid_argument");
       CHECK(err(R"({"ids":["E3"],"set":{"origin":[1e300,0,0]}})") == "invalid_argument");
 
+      // keys starting with _tb_ are managed by TrenchBroom: _tb_type turns a func_group
+      // into a group or layer (the entity inspector aborts on a contract), and an
+      // inverted _tb_soft_map_bounds aborts in the vm::bbox constructor
+      CHECK(
+        err(R"({"ids":["world"],"set":{"_tb_soft_map_bounds":"64 64 64 0 0 0"}})")
+        == "invalid_argument");
+      CHECK(
+        err(R"({"ids":["world"],"set":{"_tb_def":"builtin:x.fgd"}})")
+        == "invalid_argument");
+      CHECK(
+        err(R"({"ids":["E3"],"set":{"_tb_type":"_tb_layer"}})") == "invalid_argument");
+      CHECK(err(R"({"ids":["E3"],"rename":{"light":"_tb_type"}})") == "invalid_argument");
+      CHECK(err(R"({"ids":["world"],"remove":["_tb_mod"]})") == "invalid_argument");
+      CHECK(
+        f.error(
+           "set_entity_properties", R"({"ids":["E3"],"set":{"_tb_type":"_tb_group"}})")
+          .value("details")
+          .toObject()
+          .value("pointer")
+        == QJsonValue{"/set/_tb_type"});
+
       CHECK(snapshot(f.map) == before);
+
+      // an entity loaded from a file may already have a _tb_type; it must not become a
+      // func_group
+      mdl::selectNodes(f.map, {scene.light});
+      REQUIRE(mdl::setEntityProperty(f.map, "_tb_type", "_tb_group"));
+      mdl::deselectAll(f.map);
+      CHECK(
+        err(R"({"ids":["E3"],"set":{"classname":"func_group"}})") == "invalid_argument");
+      CHECK(scene.light->entity().classname() == "light");
 
       // a rename must not move a bad value into a rotation key
       f.ok("set_entity_properties", R"({"ids":["E3"],"set":{"note":"inf nan"}})");

@@ -29,6 +29,7 @@
 #include "mdl/EntityDefinition.h"
 #include "mdl/EntityDefinitionManager.h"
 #include "mdl/EntityNode.h"
+#include "mdl/EntityProperties.h"
 #include "mdl/GameConfig.h"
 #include "mdl/GameInfo.h"
 #include "mdl/GroupNode.h"
@@ -371,6 +372,11 @@ McpResult<QJsonObject> createEntity(McpCallContext& context, const QJsonObject& 
       error.details["pointer"] = pointer;
       return error;
     }
+    if (auto check = checkEntityPropertyKeyNotReserved(it.key(), pointer);
+        check.is_error())
+    {
+      return errorOf(check);
+    }
     if (it.key() == u"classname")
     {
       return toolError(
@@ -588,8 +594,8 @@ McpToolDef createEntityTool()
     .title = "Create Entity",
     .description =
       "Creates a point entity at origin, or a brush entity from existing brushes "
-      "(brush_ids). Property values may be strings, numbers, booleans or [x,y,z]. "
-      "Verify with get_nodes.",
+      "(brush_ids). Property values may be strings, numbers, booleans or [x,y,z]; keys "
+      "starting with _tb_ are reserved for TrenchBroom. Verify with get_nodes.",
     .inputSchema = schema::object(
       {
         {"classname", schema::string(1, 256, "e.g. light or info_player_start")},

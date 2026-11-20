@@ -106,6 +106,15 @@ void McpSelectionGuard::dismiss()
   m_done = true;
 }
 
+void McpSelectionGuard::cancel()
+{
+  if (m_map.currentMaterialName() != m_currentMaterialName)
+  {
+    m_map.setCurrentMaterialName(m_currentMaterialName);
+  }
+  m_done = true;
+}
+
 bool McpSelectionGuard::done() const
 {
   return m_done;

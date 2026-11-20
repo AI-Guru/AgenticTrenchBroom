@@ -640,8 +640,8 @@ mcp::ToolResult McpToolDispatcher::runMutate(
   auto result = def.run(context, args);
   if (result.is_error())
   {
-    guard.dismiss();
     transaction.cancel();
+    guard.cancel();
     return errorOf(result);
   }
 
@@ -679,8 +679,8 @@ mcp::ToolResult McpToolDispatcher::runMutate(
     addEnvelope(doc.nodes.currentChanges());
     structured["undo_label"] = QJsonValue{};
     structured["dry_run"] = true;
-    guard.dismiss();
     transaction.cancel();
+    guard.cancel();
     return makeOutput(def, std::move(structured), context.warnings);
   }
 
@@ -702,6 +702,12 @@ mcp::ToolResult McpToolDispatcher::runMutate(
       "check the log for details",
       {{"log", logJson(m_log)}});
   }
+
+  // Map::startTransaction also records the repeatable actions of the tool (transforms
+  // and duplicates) on the user's repeat stack. Edit > Repeat would replay them on the
+  // user's selection, e.g. a rotation around the centre of the agent's nodes, so they
+  // are dropped like Map::undoCommand does.
+  map.clearRepeatableCommands();
 
   addEnvelope(recording.end());
 
@@ -995,8 +1001,8 @@ McpResult<QJsonObject> McpToolDispatcher::runNested(
   auto result = def.run(context, args);
   if (result.is_error())
   {
-    guard.dismiss();
     transaction.cancel();
+    guard.cancel();
     return result;
   }
 

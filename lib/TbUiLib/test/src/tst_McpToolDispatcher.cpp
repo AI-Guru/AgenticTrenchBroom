@@ -515,6 +515,29 @@ TEST_CASE("McpToolDispatcher")
       CHECK(*f.map.undoCommandName() == undoLabel);
     }
 
+    SECTION("tools do not leave repeatable actions on the user's repeat stack")
+    {
+      // the user moves a node; Edit > Repeat would move the selection again
+      const auto scene = populateTestScene(f);
+      mdl::selectNodes(f.map, {scene.light});
+      REQUIRE(mdl::translateSelection(f.map, {16, 0, 0}));
+      REQUIRE(f.map.canRepeatCommands());
+
+      // a repeat after the agent's rotation must not rotate the user's selection
+      f.ok(
+        "transform_nodes", R"({"ids":["B2"],"rotate":{"axis":"z","angle_degrees":90}})");
+      CHECK_FALSE(f.map.canRepeatCommands());
+
+      f.ok("duplicate_nodes", R"({"ids":["B2"],"offset":[128,0,0]})");
+      CHECK_FALSE(f.map.canRepeatCommands());
+
+      f.ok(
+        "batch",
+        R"({"operations":[{"tool":"transform_nodes","arguments":{"ids":["B2"],"translate":[0,0,8]}}]})");
+      CHECK_FALSE(f.map.canRepeatCommands());
+      CHECK(f.map.selection().nodes == std::vector<mdl::Node*>{scene.light});
+    }
+
     SECTION("collation is disabled during calls")
     {
       f.map.setIsCommandCollationEnabled(true);
@@ -997,6 +1020,35 @@ TEST_CASE("McpToolDispatcher")
       CHECK(
         f.err("batch", R"({"dry_run":1,"operations":[{"tool":"get_map_stats"}]})")
         == "invalid_argument");
+    }
+
+    SECTION("failed batches and dry runs restore the current material")
+    {
+      // selecting faces sets the current material, which is not undoable
+      f.map.setCurrentMaterialName("current");
+      const auto selectFace =
+        R"({"tool":"select_nodes","arguments":{"faces":[{"brush":"B2","side":"+x"}]}})";
+
+      CHECK(
+        f.err(
+          "batch",
+          QString{
+            R"({"operations":[%1,{"tool":"delete_nodes","arguments":{"ids":["B99"]}}]})"}
+            .arg(selectFace)
+            .toUtf8()
+            .constData())
+        == "unknown_node");
+      CHECK(f.map.currentMaterialName() == "current");
+
+      f.ok(
+        "batch",
+        QString{
+          R"({"dry_run":true,"operations":[{"tool":"set_face_attributes","arguments":{"brushes":["B2"],"material":"rolled_back"}},%1]})"}
+          .arg(selectFace)
+          .toUtf8()
+          .constData());
+      CHECK(f.map.currentMaterialName() == "current");
+      CHECK(f.map.selection().nodes == selection);
     }
 
     SECTION("warnings of operations are returned with their results")

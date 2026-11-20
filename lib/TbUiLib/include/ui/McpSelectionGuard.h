@@ -40,7 +40,7 @@ class McpNodeRegistry;
  * so nodes that were deleted in the meantime are skipped instead of being dereferenced.
  *
  * The guard does nothing on destruction. Call restore() before committing a transaction,
- * or dismiss() if the transaction is cancelled, which restores the selection anyway.
+ * or cancel() if the transaction is cancelled, which restores the selection anyway.
  */
 class McpSelectionGuard
 {
@@ -60,6 +60,13 @@ public:
 
   /** Marks the guard as done without changing the selection. */
   void dismiss();
+
+  /**
+   * Marks the guard as done after its transaction was cancelled. The rollback restores
+   * the selection, but not the current material, which is not undoable and which
+   * selecting faces changes, so this restores the current material only.
+   */
+  void cancel();
 
   bool done() const;
 

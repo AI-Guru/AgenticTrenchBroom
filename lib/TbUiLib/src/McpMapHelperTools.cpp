@@ -1229,26 +1229,6 @@ McpToolDef dropToFloorTool()
   };
 }
 
-/** Returns the bounds of the contents of the given node; layers bounds may be stale. */
-std::optional<vm::bbox3d> contentBounds(const mdl::Node& node)
-{
-  if (
-    dynamic_cast<const mdl::WorldNode*>(&node)
-    || dynamic_cast<const mdl::LayerNode*>(&node))
-  {
-    auto result = std::optional<vm::bbox3d>{};
-    for (const auto* child : node.children())
-    {
-      if (const auto childBounds = contentBounds(*child))
-      {
-        result = result ? vm::merge(*result, *childBounds) : *childBounds;
-      }
-    }
-    return result;
-  }
-  return node.logicalBounds();
-}
-
 McpResult<QJsonObject> alignNodes(McpCallContext& context, const QJsonObject& args)
 {
   auto& doc = context.doc;
@@ -1270,7 +1250,7 @@ McpResult<QJsonObject> alignNodes(McpCallContext& context, const QJsonObject& ar
       error.details["pointer"] = "/to";
       return error;
     }
-    reference = contentBounds(*node.value());
+    reference = nodeBounds(*node.value());
     if (!reference)
     {
       return invalidArgument("/to", QString{"%1 is empty"}.arg(to.toString()));

@@ -92,7 +92,8 @@ QString nodeTypeName(const mdl::Node& node);
 /**
  * Returns a short summary of the given node:
  *
- * - for every node: id, type, parent, layer, bounds, selected, visible, locked
+ * - for every node: id, type, parent, layer, bounds (see nodeBounds; null for an empty
+ *   world or layer), selected, visible, locked
  * - name for layers and groups, classname for entities and the world
  * - child_count for worlds, layers, groups and entities
  * - materials (distinct and sorted) for brushes, material for patches
@@ -102,6 +103,17 @@ QString nodeTypeName(const mdl::Node& node);
  */
 QJsonObject nodeSummary(
   const McpNodeRegistry& registry, const mdl::Map& map, const mdl::Node& node);
+
+/**
+ * Returns the logical bounds of the given node, or nullopt if it has none. The world and
+ * layers are replaced by the merged bounds of their contents: the world has no bounds of
+ * its own, and a layer's cached bounds are not updated when children are added or
+ * removed.
+ */
+std::optional<vm::bbox3d> nodeBounds(const mdl::Node& node);
+
+/** Like nodeBounds, but for the physical bounds (which include entity models). */
+std::optional<vm::bbox3d> nodePhysicalBounds(const mdl::Node& node);
 
 /**
  * Returns the selection of the given map: {nodes:[ids], faces:[{brush, index, side?}],

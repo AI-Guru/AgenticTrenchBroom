@@ -440,8 +440,10 @@ QJsonObject nodeDetail(
   const McpNodeRegistry& registry, mdl::Map& map, const mdl::Node& node)
 {
   auto result = nodeSummary(registry, map, node);
-  result["logical_bounds"] = toJson(node.logicalBounds());
-  result["physical_bounds"] = toJson(node.physicalBounds());
+  const auto physicalBounds = nodePhysicalBounds(node);
+  result["logical_bounds"] = result.value("bounds");
+  result["physical_bounds"] =
+    physicalBounds ? QJsonValue{toJson(*physicalBounds)} : QJsonValue{};
   result["line_number"] = qint64(node.lineNumber());
   result["child_ids"] = idArray(registry, node.children());
 
@@ -818,14 +820,15 @@ bool matches(const mdl::Map& map, const NodeFilter& filter, const mdl::Node& nod
     }
   }
 
-  if (filter.inside && !filter.inside->contains(node.logicalBounds()))
+  if (filter.inside || filter.intersects)
   {
-    return false;
-  }
-
-  if (filter.intersects && !filter.intersects->intersects(node.logicalBounds()))
-  {
-    return false;
+    const auto bounds = nodeBounds(node);
+    if (
+      !bounds || (filter.inside && !filter.inside->contains(*bounds))
+      || (filter.intersects && !filter.intersects->intersects(*bounds)))
+    {
+      return false;
+    }
   }
 
   return true;

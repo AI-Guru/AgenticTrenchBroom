@@ -49,6 +49,7 @@
 #include "ui/MapViewBase.h"
 #include "ui/MapWindow.h"
 #include "ui/McpAppTools.h"
+#include "ui/McpJson.h"
 #include "ui/McpPreconditions.h"
 #include "ui/McpSchemas.h"
 #include "ui/McpToolDispatcher.h"
@@ -196,43 +197,19 @@ private:
 /** A small box around the origin, framed when there is nothing else to frame. */
 const auto EmptyFrame = vm::bbox3d{64.0};
 
-/**
- * The bounds of the contents of the given nodes, or nullopt if they have none. The world
- * and layers are replaced by their contents, since the world has no bounds of its own and
- * a layer's bounds are not updated when nodes are added to or removed from it.
+/** The merged bounds of the given nodes (see nodeBounds), or nullopt if they have none.
  */
 std::optional<vm::bbox3d> contentBounds(const std::vector<const mdl::Node*>& nodes)
 {
-  auto contents = std::vector<const mdl::Node*>{};
-  const auto addLayerContents = [&](const mdl::LayerNode& layer) {
-    for (const auto* child : layer.children())
-    {
-      contents.push_back(child);
-    }
-  };
+  auto result = std::optional<vm::bbox3d>{};
   for (const auto* node : nodes)
   {
-    node->accept(kdl::overload(
-      [&](const mdl::WorldNode& world) {
-        for (const auto* layer : world.allLayers())
-        {
-          addLayerContents(*layer);
-        }
-      },
-      [&](const mdl::LayerNode& layer) { addLayerContents(layer); },
-      [&](const mdl::GroupNode&) { contents.push_back(node); },
-      [&](const mdl::EntityNode&) { contents.push_back(node); },
-      [&](const mdl::BrushNode&) { contents.push_back(node); },
-      [&](const mdl::PatchNode&) { contents.push_back(node); }));
+    if (const auto bounds = nodeBounds(*node))
+    {
+      result = result ? vm::merge(*result, *bounds) : *bounds;
+    }
   }
-
-  auto bounds = std::vector<vm::bbox3d>{};
-  bounds.reserve(contents.size());
-  for (const auto* node : contents)
-  {
-    bounds.push_back(node->logicalBounds());
-  }
-  return vm::bbox3d::build(bounds);
+  return result;
 }
 
 /** The bounds of everything in the map, or a small box around the origin if empty. */

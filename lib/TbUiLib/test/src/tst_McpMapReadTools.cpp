@@ -341,6 +341,53 @@ TEST_CASE("McpMapReadTools")
       CHECK(hidden.value("visible") == QJsonValue{false});
     }
 
+    SECTION("world and layer bounds follow their contents")
+    {
+      // the world has no bounds of its own and layer bounds are not updated when
+      // children are added or removed
+      const auto box =
+        f.ok("create_box_brush", R"({"bounds":{"min":[1000,0,0],"max":[1064,64,64]}})");
+      f.ok("delete_nodes", R"({"ids":["B2","E3","E4","G8","P9"]})");
+
+      const auto nodes =
+        f.ok("get_nodes", R"({"ids":["L1","world"]})").value("nodes").toArray();
+      const auto layerBounds = QJsonObject{
+        {"min", QJsonArray{1000, 0, 0}},
+        {"max", QJsonArray{1064, 64, 64}},
+      };
+      CHECK(nodes[0].toObject().value("bounds") == QJsonValue{layerBounds});
+      CHECK(nodes[0].toObject().value("logical_bounds") == QJsonValue{layerBounds});
+      const auto worldMax = nodes[1].toObject().value("bounds").toObject().value("max");
+      CHECK(worldMax.toArray()[0] == QJsonValue{1064});
+
+      CHECK(
+        findById(f.ok("get_scene_tree").value("nodes").toArray(), "L1").value("bounds")
+        == QJsonValue{layerBounds});
+
+      const auto findLayers = [&](const char* region) {
+        return strings(f.ok(
+                          "find_nodes",
+                          QString{R"({"types":["layer"],"intersects":%1})"}
+                            .arg(region)
+                            .toUtf8()
+                            .constData())
+                         .value("ids"));
+      };
+      CHECK(findLayers(R"({"min":[1000,0,0],"max":[1010,10,10]})") == QStringList{"L1"});
+      CHECK_FALSE(findLayers(R"({"min":[-10,-10,-10],"max":[10,10,10]})").contains("L1"));
+
+      // an empty layer has no bounds
+      f.ok("delete_nodes", QJsonObject{{"ids", QJsonArray{box.value("id")}}});
+      CHECK(
+        f.ok("get_nodes", R"({"ids":["L1"]})")
+          .value("nodes")
+          .toArray()[0]
+          .toObject()
+          .value("bounds")
+        == QJsonValue{});
+      CHECK(findLayers(R"({"min":[1000,0,0],"max":[1010,10,10]})").isEmpty());
+    }
+
     SECTION("group")
     {
       const auto group =

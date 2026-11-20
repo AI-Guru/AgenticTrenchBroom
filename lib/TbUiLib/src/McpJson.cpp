@@ -218,9 +218,46 @@ QJsonArray brushMaterials(const mdl::Map& map, const mdl::Brush& brush)
 
 } // namespace
 
+namespace
+{
+
+template <typename GetBounds>
+std::optional<vm::bbox3d> contentBounds(const mdl::Node& node, const GetBounds& getBounds)
+{
+  if (
+    !dynamic_cast<const mdl::WorldNode*>(&node)
+    && !dynamic_cast<const mdl::LayerNode*>(&node))
+  {
+    return getBounds(node);
+  }
+
+  auto result = std::optional<vm::bbox3d>{};
+  for (const auto* child : node.children())
+  {
+    if (const auto childBounds = contentBounds(*child, getBounds))
+    {
+      result = result ? vm::merge(*result, *childBounds) : *childBounds;
+    }
+  }
+  return result;
+}
+
+} // namespace
+
+std::optional<vm::bbox3d> nodeBounds(const mdl::Node& node)
+{
+  return contentBounds(node, [](const mdl::Node& n) { return n.logicalBounds(); });
+}
+
+std::optional<vm::bbox3d> nodePhysicalBounds(const mdl::Node& node)
+{
+  return contentBounds(node, [](const mdl::Node& n) { return n.physicalBounds(); });
+}
+
 QJsonObject nodeSummary(
   const McpNodeRegistry& registry, const mdl::Map& map, const mdl::Node& node)
 {
+  const auto bounds = nodeBounds(node);
   const auto& editorContext = map.editorContext();
 
   auto result = QJsonObject{
@@ -228,7 +265,7 @@ QJsonObject nodeSummary(
     {"type", nodeTypeName(node)},
     {"parent", idOrNull(registry, node.parent())},
     {"layer", idOrNull(registry, containingLayer(node))},
-    {"bounds", toJson(node.logicalBounds())},
+    {"bounds", bounds ? QJsonValue{toJson(*bounds)} : QJsonValue{}},
     {"selected", node.selected()},
     {"visible", editorContext.visible(node)},
     {"locked", node.locked()},

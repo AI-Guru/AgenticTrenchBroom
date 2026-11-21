@@ -25,14 +25,23 @@
 #include "mdl/BrushFaceHandle.h"
 #include "mdl/BrushNode.h"
 #include "mdl/EditorContext.h"
+#include "mdl/EmptyPropertyValueValidator.h"
 #include "mdl/Entity.h"
+#include "mdl/EntityDefinitionFileSpec.h"
+#include "mdl/EntityDefinitionManager.h"
 #include "mdl/EntityNode.h"
+#include "mdl/GameConfig.h"
+#include "mdl/GameInfo.h"
 #include "mdl/GroupNode.h"
+#include "mdl/Issue.h"
 #include "mdl/LayerNode.h"
 #include "mdl/Map.h"
+#include "mdl/Map_Assets.h"
+#include "mdl/MissingDefinitionValidator.h"
 #include "mdl/PatchNode.h"
 #include "mdl/Selection.h"
 #include "mdl/SurfaceAttributes.h"
+#include "mdl/Validator.h"
 #include "mdl/WorldNode.h"
 #include "ui/McpNodeRegistry.h"
 #include "ui/QStringUtils.h"
@@ -363,6 +372,78 @@ QJsonObject selectionJson(const McpNodeRegistry& registry, const mdl::Map& map)
     {"faces", faces},
     {"bounds", selectionBounds ? QJsonValue{toJson(*selectionBounds)} : QJsonValue{}},
   };
+}
+
+QString mcpGenericEntityDefinitionsNote()
+{
+  return "game Generic only defines worldspawn and info_player_start (Generic.fgd), so "
+         "validate_map reports entities with other classnames, e.g. light, as 'not found "
+         "in entity definitions'; they are kept and saved unchanged. Use game Quake if "
+         "you want entity definitions (light, monsters, items, doors); it needs no game "
+         "files either, but materials only load when its game path is configured";
+}
+
+std::optional<QString> expectedIssueReason(
+  const mdl::Map& map,
+  const std::vector<const mdl::Validator*>& validators,
+  const mdl::Issue& issue)
+{
+  const auto it = std::ranges::find_if(
+    validators, [&](const auto* validator) { return validator->type() == issue.type(); });
+  if (it == validators.end())
+  {
+    return std::nullopt;
+  }
+  const auto* validator = *it;
+  const auto& gameConfig = map.gameInfo().gameConfig;
+
+  if (dynamic_cast<const mdl::EmptyPropertyValueValidator*>(validator))
+  {
+    const auto* propertyIssue = dynamic_cast<const mdl::EntityPropertyIssue*>(&issue);
+    if (
+      propertyIssue && dynamic_cast<const mdl::WorldNode*>(&issue.node())
+      && gameConfig.materialConfig.property
+      && propertyIssue->propertyKey() == *gameConfig.materialConfig.property)
+    {
+      return QString{
+        "worldspawn's '%1' property lists the game's material collections (e.g. WAD "
+        "files); TrenchBroom adds it empty to every new map and fills it when "
+        "collections are added. Harmless, leave it as it is"}
+        .arg(toUnicode(map, propertyIssue->propertyKey()));
+    }
+    return std::nullopt;
+  }
+
+  if (dynamic_cast<const mdl::MissingDefinitionValidator*>(validator))
+  {
+    // only with the game's own definition file, and only if it was loaded: otherwise
+    // even worldspawn has no definition, and the reason would be wrong
+    const auto& defFilePaths = gameConfig.entityConfig.defFilePaths;
+    const auto spec = mdl::entityDefinitionFile(map);
+    if (
+      gameConfig.name == "Generic" && spec && !defFilePaths.empty()
+      && *spec == mdl::EntityDefinitionFileSpec::makeBuiltin(defFilePaths.front())
+      && map.entityDefinitionManager().definition("worldspawn") != nullptr)
+    {
+      return mcpGenericEntityDefinitionsNote();
+    }
+  }
+  return std::nullopt;
+}
+
+bool addExpectedIssueFields(
+  QJsonObject& item,
+  const mdl::Map& map,
+  const std::vector<const mdl::Validator*>& validators,
+  const mdl::Issue& issue)
+{
+  if (const auto reason = expectedIssueReason(map, validators, issue))
+  {
+    item["expected_for_new_map"] = true;
+    item["expected_reason"] = *reason;
+    return true;
+  }
+  return false;
 }
 
 } // namespace tb::ui

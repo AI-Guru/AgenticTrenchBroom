@@ -37,8 +37,10 @@
 namespace tb::mdl
 {
 class Brush;
+class Issue;
 class Map;
 class Node;
+class Validator;
 struct SurfaceAttributes;
 } // namespace tb::mdl
 
@@ -141,5 +143,35 @@ std::optional<vm::bbox3d> nodePhysicalBounds(const mdl::Node& node);
  * bounds}. The selected nodes must be registered with the given registry.
  */
 QJsonObject selectionJson(const McpNodeRegistry& registry, const mdl::Map& map);
+
+/**
+ * Explains that game Generic has no entity definitions except worldspawn and
+ * info_player_start. Used by get_conventions and by expectedIssueReason.
+ */
+QString mcpGenericEntityDefinitionsNote();
+
+/**
+ * Returns why the given issue is expected in a new map and harmless, or nullopt. These
+ * are the two benign issues that agents see in fresh maps:
+ * - "Empty property value" for worldspawn's material collection property (e.g. wad),
+ *   which TrenchBroom adds empty to every new map of games that have one, such as Quake.
+ * - "Missing entity definition" in game Generic with its own definition file, which only
+ *   defines worldspawn and info_player_start, so e.g. light is reported.
+ * The validators are the map's registered validators.
+ */
+std::optional<QString> expectedIssueReason(
+  const mdl::Map& map,
+  const std::vector<const mdl::Validator*>& validators,
+  const mdl::Issue& issue);
+
+/**
+ * Adds expected_for_new_map: true and expected_reason to the JSON of the given issue if
+ * expectedIssueReason returns a reason. Returns whether it did.
+ */
+bool addExpectedIssueFields(
+  QJsonObject& item,
+  const mdl::Map& map,
+  const std::vector<const mdl::Validator*>& validators,
+  const mdl::Issue& issue);
 
 } // namespace tb::ui

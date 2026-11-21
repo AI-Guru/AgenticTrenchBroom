@@ -26,18 +26,23 @@
 
 #include "base/PreferenceManager.h"
 #include "base/Result.h"
+#include "mdl/BrushFace.h"
 #include "mdl/GameConfig.h"
 #include "mdl/GameInfo.h"
 #include "mdl/GameManager.h"
+#include "mdl/Grid.h"
 #include "mdl/Map.h"
 #include "mdl/MapFormat.h"
 #include "mdl/MapHeader.h"
+#include "mdl/Map_World.h"
+#include "mdl/SoftMapBounds.h"
 #include "mdl/WorldNode.h"
 #include "ui/AppController.h"
 #include "ui/CompilationDialog.h"
 #include "ui/MapDocument.h"
 #include "ui/MapWindow.h"
 #include "ui/MapWindowManager.h"
+#include "ui/McpJson.h"
 #include "ui/McpPreconditions.h"
 #include "ui/McpSchemas.h"
 #include "ui/McpToolDispatcher.h"
@@ -109,6 +114,26 @@ QStringList formatNames(const mdl::GameInfo& gameInfo)
     result.push_back(QString::fromStdString(formatConfig.format));
   }
   return result;
+}
+
+QJsonObject gameJson(const mdl::GameInfo& gameInfo)
+{
+  return QJsonObject{
+    {"name", gameName(gameInfo)},
+    {"formats", QJsonArray::fromStringList(formatNames(gameInfo))},
+    {"experimental", gameInfo.gameConfig.experimental},
+    {"game_path_configured", !pref(gameInfo.gamePathPreference).empty()},
+  };
+}
+
+QJsonArray gamesJson(const mdl::GameManager& gameManager)
+{
+  auto games = QJsonArray{};
+  for (const auto& gameInfo : gameManager.gameInfos())
+  {
+    games.append(gameJson(gameInfo));
+  }
+  return games;
 }
 
 McpResult<const mdl::GameInfo*> findGame(
@@ -257,17 +282,164 @@ McpToolDef listGamesTool(McpAppHost& host)
     .kind = McpToolKind::App,
     .annotations = ReadOnly,
     .runApp = [&host](const QJsonObject&) -> McpResult<QJsonObject> {
-      auto games = QJsonArray{};
-      for (const auto& gameInfo : host.appController().gameManager().gameInfos())
+      return QJsonObject{{"games", gamesJson(host.appController().gameManager())}};
+    },
+  };
+}
+
+// get_conventions
+
+/** The conventions that do not depend on the game or the document. */
+QJsonObject generalConventions()
+{
+  return QJsonObject{
+    {"units", "1 unit is about 1 inch (Quake scale)"},
+    {"up_axis", "+z"},
+    {"handedness", "right"},
+    {"angles", "entity 'angle' is the yaw in degrees around +z; 0 = +x, 90 = +y"},
+    {"player",
+     QJsonObject{
+       {"width", 32},
+       {"height", 56},
+       {"eye_height", 22},
+       {"step_height", 18},
+       {"jump_height", 45},
+       {"source", "default"},
+     }},
+    {"common_dimensions",
+     QJsonObject{
+       {"door", QJsonObject{{"width", 64}, {"height", 96}}},
+       {"corridor_min_width", 64},
+       {"room_height_typical", QJsonArray{128, 256}},
+       {"wall_thickness_typical", QJsonArray{8, 16}},
+       {"stair_step", QJsonObject{{"height", 8}, {"depth", 16}}},
+     }},
+    {"note",
+     "guidance for building playable spaces; player sizes are Quake defaults, not read "
+     "from the game configuration"},
+    {"entity_definitions_note", mcpGenericEntityDefinitionsNote()},
+  };
+}
+
+QJsonValue softMapBoundsJson(const mdl::SoftMapBounds& softBounds)
+{
+  return QJsonObject{
+    {"source", softBounds.source == mdl::SoftMapBoundsType::Game ? "game" : "map"},
+    {"bounds", softBounds.bounds ? QJsonValue{toJson(*softBounds.bounds)} : QJsonValue{}},
+  };
+}
+
+/** What an agent needs to know about a game before it creates a map for it. */
+QJsonObject gameConventions(const mdl::GameInfo& gameInfo)
+{
+  const auto& gameConfig = gameInfo.gameConfig;
+  auto result = gameJson(gameInfo);
+
+  const auto formats = formatNames(gameInfo);
+  result["default_format"] = formats.empty() ? QJsonValue{} : QJsonValue{formats.front()};
+  result["material_default"] = QString::fromStdString(mdl::BrushFace::NoMaterialName);
+  result["material_property"] =
+    gameConfig.materialConfig.property
+      ? QJsonValue{QString::fromStdString(*gameConfig.materialConfig.property)}
+      : QJsonValue{};
+  result["soft_map_bounds"] = gameConfig.softMapBounds
+                                ? QJsonValue{toJson(*gameConfig.softMapBounds)}
+                                : QJsonValue{};
+
+  auto files = QJsonArray{};
+  for (const auto& path : gameConfig.entityConfig.defFilePaths)
+  {
+    auto error = std::error_code{};
+    const auto available =
+      std::filesystem::is_regular_file(gameConfig.findConfigFile(path), error);
+    files.append(QJsonObject{
+      {"file", pathAsGenericQString(path)},
+      {"available", available},
+    });
+  }
+  result["entity_definitions"] = QJsonObject{
+    {"files", files},
+    // new maps use the first file
+    {"default", files.empty() ? QJsonValue{} : files.first().toObject().value("file")},
+    {"default_available",
+     !files.empty() && files.first().toObject().value("available").toBool()},
+  };
+  if (gameConfig.name == "Generic")
+  {
+    result["note"] = mcpGenericEntityDefinitionsNote();
+  }
+  return result;
+}
+
+McpToolDef getConventionsTool(McpAppHost& host)
+{
+  return {
+    .name = "get_conventions",
+    .title = "Get Conventions",
+    .description =
+      "Call it first, also before a map is open. Returns the coordinate conventions "
+      "(units are about 1 inch, +z up, angles in degrees) and typical sizes in units "
+      "(player hull, doors, corridors, stairs) to build playable spaces, and the games "
+      "(as list_games). Pass game to learn about a game before new_map: its formats, "
+      "default material, soft map bounds and whether its entity definition files are "
+      "available. With an open map it also returns the map's grid_size, world_bounds, "
+      "soft_map_bounds, material_default and map_format, and game describes the map's "
+      "game unless another one is given. Game Generic has no definition for light and "
+      "most other classnames (see entity_definitions_note); use Quake for definitions.",
+    .inputSchema = schema::object({
+      {"game", schema::string(1, 256, "A game name from list_games.")},
+    }),
+    .kind = McpToolKind::App,
+    .annotations = ReadOnly,
+    .runApp = [&host](const QJsonObject& args) -> McpResult<QJsonObject> {
+      auto& appController = host.appController();
+
+      const auto* requestedGame = static_cast<const mdl::GameInfo*>(nullptr);
+      if (const auto name = optionalString(args, "game"))
       {
-        games.append(QJsonObject{
-          {"name", gameName(gameInfo)},
-          {"formats", QJsonArray::fromStringList(formatNames(gameInfo))},
-          {"experimental", gameInfo.gameConfig.experimental},
-          {"game_path_configured", !pref(gameInfo.gamePathPreference).empty()},
-        });
+        auto found = findGame(appController, *name);
+        if (found.is_error())
+        {
+          return errorOf(found);
+        }
+        requestedGame = found.value();
       }
-      return QJsonObject{{"games", games}};
+
+      auto result = generalConventions();
+      result["games"] = gamesJson(appController.gameManager());
+
+      const auto target = host.target(McpToolKind::Read);
+      if (target.is_error())
+      {
+        const auto error = errorOf(target);
+        if (error.code != "no_document")
+        {
+          return error;
+        }
+
+        result["document"] = QJsonValue{};
+        result["next_step"] =
+          "no map is open: call new_map (or open_map), then call get_conventions again "
+          "for grid_size, world_bounds, soft_map_bounds, material_default and "
+          "map_format";
+        if (requestedGame)
+        {
+          result["game"] = gameConventions(*requestedGame);
+        }
+        return result;
+      }
+
+      const auto& doc = *target.value().doc;
+      const auto& map = doc.map;
+      result["document"] = doc.documentId;
+      result["grid_size"] = canon(map.grid().actualSize());
+      result["world_bounds"] = toJson(map.worldBounds());
+      result["soft_map_bounds"] = softMapBoundsJson(mdl::softMapBounds(map));
+      result["material_default"] = toUnicode(map, map.currentMaterialName());
+      result["map_format"] =
+        QString::fromStdString(mdl::formatName(map.worldNode().mapFormat()));
+      result["game"] = gameConventions(requestedGame ? *requestedGame : map.gameInfo());
+      return result;
     },
   };
 }
@@ -766,6 +938,7 @@ McpToolDef closeMapTool(McpAppHost& host)
 void registerMcpAppTools(McpToolDispatcher& dispatcher, McpAppHost& host)
 {
   dispatcher.add(listGamesTool(host));
+  dispatcher.add(getConventionsTool(host));
   dispatcher.add(listDocumentsTool(host));
   dispatcher.add(setActiveDocumentTool(host));
   dispatcher.add(newMapTool(host));

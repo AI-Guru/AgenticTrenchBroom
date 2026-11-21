@@ -61,6 +61,9 @@ const auto Instructions = QStringLiteral(
   walls typically 8-16 thick. Vectors are [x,y,z]; bounds are {"min":[..],"max":[..]}; angles are DEGREES.
 - Entity "angle" is yaw around +Z (0 = +X, 90 = +Y). Nothing is snapped to the grid unless you ask; keep brush vertices
   on integers (validate_map reports non-integer vertices).
+- Call get_conventions first (it works before a map is open; pass game to learn about a game) for units, grid and
+  typical sizes (player, doors, stairs). Game "Generic" only defines worldspawn and info_player_start, so lights and
+  other entities have no definitions there; use "Quake" if you want entity definitions.
 - Start with list_games and new_map (game "Generic" needs no game files) or open_map; list_documents and
   set_active_document choose the map that the map tools act on. save_map writes .map files; close_map closes a saved map
   (close_map with discard_changes:true throws unsaved changes away without asking).
@@ -71,7 +74,6 @@ const auto Instructions = QStringLiteral(
 - Each mutating call is ONE undo step named "MCP: <tool>", leaves the user's selection as it was, and returns
   changes {created, removed, modified}, issues on touched nodes, warnings and log lines. undo only undoes MCP steps
   unless allow_user_commands is true.
-- After new_map or open_map, call get_conventions for units, grid and typical sizes (player, doors, stairs).
 - Block out with create_room (floor, ceiling and walls with door/window openings) and create_stairs; place things
   with drop_to_floor and align_nodes; describe_region summarizes an area. Connect rooms without computing brushes:
   create_opening {wall: room group id + side, or a wall brush; width, height, offset or center, bottom} cuts a door
@@ -88,6 +90,8 @@ const auto Instructions = QStringLiteral(
   material:'floor_01'} (omit brushes for all world brushes; add inside:<room bounds> to skip outer faces).
 - checkpoint_create before big edits; checkpoint_revert undoes your steps back to it. Verify without screenshots:
   validate_map, query_point, check_brush_overlaps, checkpoint_diff, get_brush_geometry, find_nodes, get_map_stats.
+  validate_map marks issues that every new map of the game has (the empty 'wad' of a Quake worldspawn, light in
+  Generic) with expected_for_new_map:true; they are harmless, fix the others.
   check_leaks flood fills from the point entities like a Quake compiler and returns the path of every leak; only
   world brushes seal, so run it after closing a room instead of reasoning about where brushes meet.
   check_walkable {from, to:[...]} (feet positions) answers whether the player (32x56 hull, step 18, drop 256) can

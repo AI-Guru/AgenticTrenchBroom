@@ -96,8 +96,9 @@ public:
 };
 
 /**
- * Registers the document and session tools: list_games, list_documents,
- * set_active_document, new_map, open_map, save_map and close_map.
+ * Registers the document and session tools: list_games, get_conventions (which works
+ * with and without an open map), list_documents, set_active_document, new_map, open_map,
+ * save_map and close_map.
  */
 void registerMcpAppTools(McpToolDispatcher& dispatcher, McpAppHost& host);
 

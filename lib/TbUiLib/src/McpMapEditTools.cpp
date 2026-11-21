@@ -68,8 +68,11 @@
 #include <cmath>
 #include <limits>
 #include <set>
+#include <string>
 #include <tuple>
 #include <unordered_set>
+#include <utility>
+#include <vector>
 
 namespace tb::ui
 {
@@ -783,10 +786,16 @@ McpResult<QJsonObject> setEntityProperties(
       "operation_failed", "the entities could not be selected for editing");
   }
 
-  auto entitiesBefore = std::vector<mdl::Entity>{};
+  // Only the properties are kept, not the entities: an Entity holds a reference to its
+  // entity definition, and changing worldspawn's wad, _tb_def or _tb_mod reloads the
+  // definitions, which would leave a copied Entity with a dangling reference.
+  using EntityProperties =
+    std::pair<std::vector<mdl::EntityProperty>, std::vector<std::string>>;
+  auto entitiesBefore = std::vector<EntityProperties>{};
   for (const auto* entityNode : targets.entities)
   {
-    entitiesBefore.push_back(entityNode->entity());
+    const auto& entity = entityNode->entity();
+    entitiesBefore.emplace_back(entity.properties(), entity.protectedProperties());
   }
 
   for (const auto& [oldKey, newKey] : renames)
@@ -818,8 +827,10 @@ McpResult<QJsonObject> setEntityProperties(
   }
 
   if (std::ranges::equal(
-        targets.entities, entitiesBefore, [](const auto* entityNode, const auto& entity) {
-          return entityNode->entity() == entity;
+        targets.entities, entitiesBefore, [](const auto* entityNode, const auto& before) {
+          const auto& entity = entityNode->entity();
+          return entity.properties() == before.first
+                 && entity.protectedProperties() == before.second;
         }))
   {
     context.nothingChanged = true;

@@ -354,6 +354,7 @@ McpResult<QJsonObject> validateMap(McpCallContext& context, const QJsonObject& a
       {
         json["property"] = toUnicode(map, propertyIssue->propertyKey());
       }
+      addExpectedIssueFields(json, map, allValidators, *issue);
 
       const auto indexIt = validatorIndex.find(issue->type());
       items.push_back(Item{
@@ -372,17 +373,31 @@ McpResult<QJsonObject> validateMap(McpCallContext& context, const QJsonObject& a
   });
 
   auto byType = std::map<QString, qint64>{};
+  auto expectedCount = qint64(0);
   auto itemsJson = QJsonArray{};
   for (const auto& item : items)
   {
     ++byType[item.json.value("type").toString()];
+    if (item.json.value("expected_for_new_map").toBool())
+    {
+      ++expectedCount;
+    }
     itemsJson.append(item.json);
   }
 
   auto result = QJsonObject{
     {"by_type", countsObject(byType)},
     {"validators", validatorsJson},
+    {"expected_count", expectedCount},
   };
+  if (expectedCount > 0)
+  {
+    result["note"] =
+      QString{
+        "%1 of the issues are marked expected_for_new_map: they appear in every new map "
+        "of this game and are harmless (see expected_reason), so they need no fix"}
+        .arg(expectedCount);
+  }
   result["items"] = page(itemsJson, args, result);
   return result;
 }
@@ -412,7 +427,11 @@ McpToolDef validateMapTool()
       "Runs TrenchBroom's map validators (the issue browser) and lists the issues in "
       "node order, e.g. missing classnames, non-integer vertices or empty groups. Use "
       "this after edits to verify the map is clean. Each item has the node id and the "
-      "line in the map file (null for nodes that were not saved or loaded yet).",
+      "line in the map file (null for nodes that were not saved or loaded yet). Issues "
+      "that every new map of the game has and that are harmless have "
+      "expected_for_new_map: true and an expected_reason (the empty 'wad' of a Quake "
+      "worldspawn, and classnames such as light in game Generic, which has no "
+      "definitions for them); expected_count counts them. Fix all other issues.",
     .inputSchema = schema::object(properties),
     .kind = McpToolKind::Read,
     .annotations = ReadOnly,

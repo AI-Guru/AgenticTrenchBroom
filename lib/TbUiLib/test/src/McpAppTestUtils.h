@@ -46,7 +46,8 @@ inline const auto McpTestGameName = std::string{"Test"};
  */
 struct McpAppFixture
 {
-  McpAppFixture();
+  /** moreGames may write the configs of further games. */
+  explicit McpAppFixture(const GameManagerInitializer& moreGames = {});
   ~McpAppFixture();
 
   McpAppFixture(const McpAppFixture&) = delete;

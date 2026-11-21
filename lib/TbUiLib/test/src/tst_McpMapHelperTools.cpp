@@ -1255,33 +1255,6 @@ TEST_CASE("McpMapHelperTools")
     }
   }
 
-  SECTION("get_conventions")
-  {
-    const auto result = f.ok("get_conventions");
-    CHECK(result.value("up_axis") == QJsonValue{"+z"});
-    CHECK(result.value("handedness") == QJsonValue{"right"});
-    CHECK(result.value("grid_size") == QJsonValue{canon(f.map.grid().actualSize())});
-    CHECK(result.value("world_bounds") == QJsonValue{toJson(f.map.worldBounds())});
-    CHECK(
-      result.value("player").toObject()
-      == QJsonObject{
-        {"width", 32},
-        {"height", 56},
-        {"eye_height", 22},
-        {"step_height", 18},
-        {"jump_height", 45},
-        {"source", "default"}});
-    CHECK(
-      result.value("common_dimensions").toObject().value("door")
-      == QJsonValue{QJsonObject{{"width", 64}, {"height", 96}}});
-    CHECK(result.value("map_format") == QJsonValue{"Valve"});
-    CHECK(result.contains("soft_map_bounds"));
-    CHECK(result.contains("material_default"));
-    // deterministic
-    CHECK(f.ok("get_conventions") == result);
-    CHECK(f.err("get_conventions", R"({"x":1})") == "invalid_argument");
-  }
-
   SECTION("describe_region")
   {
     const auto scene = populateTestScene(f);

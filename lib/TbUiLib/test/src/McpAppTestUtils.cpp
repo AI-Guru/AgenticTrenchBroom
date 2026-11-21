@@ -72,9 +72,13 @@ const auto GameConfig = R"({
 
 } // namespace
 
-McpAppFixture::McpAppFixture()
-  : appControllerFixture{[](const auto& writeGameConfig) {
+McpAppFixture::McpAppFixture(const GameManagerInitializer& moreGames)
+  : appControllerFixture{[&](const auto& writeGameConfig) {
     writeGameConfig(McpTestGameName, GameConfig, std::nullopt, std::nullopt);
+    if (moreGames)
+    {
+      moreGames(writeGameConfig);
+    }
   }}
   , appController{appControllerFixture.appController()}
   , controller{appController}

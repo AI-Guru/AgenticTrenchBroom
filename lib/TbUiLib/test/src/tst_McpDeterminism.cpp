@@ -188,7 +188,6 @@ TEST_CASE("McpDeterminism")
     Call{"get_scene_tree", R"({"include_brushes":true})"},
     Call{"get_log", "{}"},
     // agent helper tools
-    Call{"get_conventions", "{}"},
     Call{"checkpoint_create", R"({"name":"helpers"})"},
     Call{
       "create_room",

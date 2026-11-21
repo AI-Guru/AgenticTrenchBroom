@@ -290,6 +290,7 @@ QJsonObject issuesJson(const McpDocumentState& doc, const std::vector<mdl::Node*
       {
         item["property"] = toUnicode(map, propertyIssue->propertyKey());
       }
+      addExpectedIssueFields(item, map, validators, *issue);
       items.append(item);
     }
   }

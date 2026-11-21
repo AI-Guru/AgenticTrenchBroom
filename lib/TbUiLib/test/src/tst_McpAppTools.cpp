@@ -18,6 +18,7 @@
  */
 
 #include <QApplication>
+#include <QDialog>
 #include <QDir>
 #include <QEventLoop>
 #include <QFile>
@@ -29,7 +30,13 @@
 #include "McpAppTestUtils.h"
 #include "McpTestUtils.h"
 #include "gl/PerspectiveCamera.h"
+#include "mdl/EntityDefinitionFileSpec.h"
+#include "mdl/GameConfig.h"
+#include "mdl/GameInfo.h"
+#include "mdl/GameManager.h"
+#include "mdl/Grid.h"
 #include "mdl/Map.h"
+#include "mdl/Map_Assets.h"
 #include "ui/AppController.h"
 #include "ui/CompilationDialog.h"
 #include "ui/MapDocument.h"
@@ -38,6 +45,7 @@
 #include "ui/McpToolDispatcher.h"
 
 #include <algorithm>
+#include <fstream>
 #include <memory>
 
 #include <catch2/catch_test_macros.hpp>
@@ -583,6 +591,444 @@ TEST_CASE("McpAppTools")
     }
   }
 
+  CHECK(watchdog.modalCount() == 0);
+}
+
+namespace
+{
+
+// like the Generic game shipped with TrenchBroom: one definition file, new maps
+// have a starter brush
+const auto GenericGameConfig = R"({
+    "version": 9,
+    "name": "Generic",
+    "icon": "Icon.png",
+    "fileformats": [
+        { "format": "Standard" },
+        { "format": "Valve" }
+    ],
+    "filesystem": {
+        "searchpath": ".",
+        "packageformat": { "extension": ".pak", "format": "idpak" }
+    },
+    "materials": {
+        "root": "textures",
+        "format": { "extensions": [".png"], "format": "image" }
+    },
+    "entities": {
+        "definitions": [ "Generic.fgd" ],
+        "defaultcolor": "0.6 0.6 0.6 1.0"
+    },
+    "tags": {
+        "brush": [],
+        "brushface": []
+    }
+})";
+
+// like Quake: a wad property, a soft map bounds, two definition files of which only the
+// first one exists
+const auto QuakeLikeGameConfig = R"({
+    "version": 9,
+    "name": "QuakeLike",
+    "icon": "Icon.png",
+    "fileformats": [
+        { "format": "Valve" },
+        { "format": "Standard" }
+    ],
+    "filesystem": {
+        "searchpath": "id1",
+        "packageformat": { "extension": ".pak", "format": "idpak" }
+    },
+    "materials": {
+        "root": "textures",
+        "extensions": [".D"],
+        "palette": "gfx/palette.lmp",
+        "attribute": "wad"
+    },
+    "entities": {
+        "definitions": [ "QuakeLike.fgd", "Missing.fgd" ],
+        "defaultcolor": "0.6 0.6 0.6 1.0"
+    },
+    "softMapBounds": "-4096 -4096 -4096 4096 4096 4096",
+    "tags": {
+        "brush": [],
+        "brushface": []
+    }
+})";
+
+const auto GenericFgd = R"(@SolidClass = worldspawn : "World entity" []
+@PointClass size(-16 -16 -24, 16 16 32) = info_player_start : "Player 1 start" []
+)";
+
+const auto QuakeLikeFgd = R"(@SolidClass = worldspawn : "World entity" []
+@PointClass size(-16 -16 -24, 16 16 32) = info_player_start : "Player 1 start" []
+@PointClass size(-8 -8 -8, 8 8 8) = light : "Light" [ light(integer) : "Brightness" : 300 ]
+)";
+
+void writeDefinitionFile(
+  AppController& appController,
+  const std::string& game,
+  const std::string& file,
+  const char* contents)
+{
+  const auto* gameInfo = appController.gameManager().gameInfo(game);
+  REQUIRE(gameInfo != nullptr);
+  auto stream = std::ofstream{gameInfo->gameConfig.findConfigFile(file)};
+  REQUIRE(stream.good());
+  stream << contents;
+}
+
+QJsonObject findItem(const QJsonObject& validation, const QString& description)
+{
+  for (const auto& item : validation.value("items").toArray())
+  {
+    if (item.toObject().value("description").toString() == description)
+    {
+      return item.toObject();
+    }
+  }
+  return {};
+}
+
+} // namespace
+
+TEST_CASE("McpAppTools get_conventions")
+{
+  auto f = McpAppFixture{[](const auto& writeGameConfig) {
+    writeGameConfig("Generic", GenericGameConfig, std::nullopt, std::nullopt);
+    writeGameConfig("QuakeLike", QuakeLikeGameConfig, std::nullopt, std::nullopt);
+  }};
+  writeDefinitionFile(f.appController, "Generic", "Generic.fgd", GenericFgd);
+  writeDefinitionFile(f.appController, "QuakeLike", "QuakeLike.fgd", QuakeLikeFgd);
+
+  f.appController.showWelcomeWindow();
+  auto watchdog = ModalWatchdog{};
+
+  const auto games = f.ok("list_games").value("games");
+  REQUIRE(games.toArray().size() == 3);
+
+  SECTION("works without a document")
+  {
+    const auto result = f.ok("get_conventions");
+
+    // game independent conventions
+    CHECK(result.value("up_axis") == "+z");
+    CHECK(result.value("handedness") == "right");
+    CHECK(result.value("units").toString().contains("inch"));
+    CHECK(
+      result.value("player").toObject()
+      == QJsonObject{
+        {"width", 32},
+        {"height", 56},
+        {"eye_height", 22},
+        {"step_height", 18},
+        {"jump_height", 45},
+        {"source", "default"}});
+    CHECK(
+      result.value("common_dimensions").toObject().value("door")
+      == QJsonValue{QJsonObject{{"width", 64}, {"height", 96}}});
+    CHECK(result.value("entity_definitions_note").toString().contains("Generic"));
+    CHECK(result.value("entity_definitions_note").toString().contains("Quake"));
+
+    // the games, as list_games lists them
+    CHECK(result.value("games") == games);
+
+    // no document fields, and a pointer to new_map
+    CHECK(result.value("document").isNull());
+    CHECK(result.value("next_step").toString().contains("new_map"));
+    for (const auto* key :
+         {"grid_size",
+          "world_bounds",
+          "soft_map_bounds",
+          "material_default",
+          "map_format",
+          "game"})
+    {
+      CHECK_FALSE(result.contains(key));
+    }
+
+    // nothing was opened
+    CHECK(f.appController.mapWindowManager().allMapWindowsClosed());
+    CHECK(isWelcomeWindowVisible());
+
+    // deterministic
+    CHECK(f.ok("get_conventions") == result);
+  }
+
+  SECTION("describes a game without a document")
+  {
+    SECTION("Generic")
+    {
+      const auto result = f.ok("get_conventions", R"({"game":"Generic"})");
+      CHECK(result.value("document").isNull());
+      const auto game = result.value("game").toObject();
+      CHECK(game.value("name") == "Generic");
+      CHECK(stringList(game.value("formats")) == QStringList{"Standard", "Valve"});
+      CHECK(game.value("default_format") == "Standard");
+      CHECK(game.value("material_default") == "__TB_empty");
+      CHECK(game.value("material_property").isNull());
+      CHECK(game.value("soft_map_bounds").isNull());
+      CHECK(game.value("experimental") == false);
+      CHECK(game.value("game_path_configured") == false);
+      CHECK(
+        game.value("entity_definitions").toObject()
+        == QJsonObject{
+          {"files",
+           QJsonArray{QJsonObject{{"file", "Generic.fgd"}, {"available", true}}}},
+          {"default", "Generic.fgd"},
+          {"default_available", true},
+        });
+      // the note says that light has no definition and suggests Quake
+      const auto note = game.value("note").toString();
+      CHECK(note.contains("light"));
+      CHECK(note.contains("Quake"));
+      CHECK(note == result.value("entity_definitions_note").toString());
+    }
+
+    SECTION("a game with a material property and a missing definition file")
+    {
+      const auto game =
+        f.ok("get_conventions", R"({"game":"QuakeLike"})").value("game").toObject();
+      CHECK(game.value("default_format") == "Valve");
+      CHECK(game.value("material_property") == "wad");
+      CHECK(
+        game.value("soft_map_bounds")
+        == QJsonValue{toJson(vm::bbox3d{{-4096, -4096, -4096}, {4096, 4096, 4096}})});
+      CHECK(
+        game.value("entity_definitions").toObject()
+        == QJsonObject{
+          {"files",
+           QJsonArray{
+             QJsonObject{{"file", "QuakeLike.fgd"}, {"available", true}},
+             QJsonObject{{"file", "Missing.fgd"}, {"available", false}},
+           }},
+          {"default", "QuakeLike.fgd"},
+          {"default_available", true},
+        });
+      CHECK_FALSE(game.contains("note"));
+    }
+
+    SECTION("a game without definition files")
+    {
+      const auto game =
+        f.ok("get_conventions", R"({"game":"Test"})").value("game").toObject();
+      CHECK(
+        game.value("entity_definitions").toObject()
+        == QJsonObject{
+          {"files", QJsonArray{}},
+          {"default", QJsonValue{}},
+          {"default_available", false},
+        });
+    }
+
+    SECTION("an unknown game")
+    {
+      const auto error = f.error("get_conventions", R"({"game":"Nope"})");
+      CHECK(error.value("code") == "unknown_game");
+      CHECK(
+        stringList(error.value("details").toObject().value("available"))
+        == QStringList{"Generic", "QuakeLike", "Test"});
+    }
+
+    SECTION("schema errors")
+    {
+      CHECK(f.err("get_conventions", R"({"game":""})") == "invalid_argument");
+      CHECK(f.err("get_conventions", R"({"game":1})") == "invalid_argument");
+      CHECK(f.err("get_conventions", R"({"x":1})") == "invalid_argument");
+    }
+  }
+
+  SECTION("with a document")
+  {
+    f.ok("new_map", R"({"game":"QuakeLike","format":"Valve"})");
+    auto* window = f.appController.mapWindowManager().topMapWindow();
+    REQUIRE(window != nullptr);
+    auto& map = window->document().map();
+    const auto before = snapshot(map);
+
+    const auto result = f.ok("get_conventions");
+    CHECK(result.value("document") == "d1");
+    CHECK_FALSE(result.contains("next_step"));
+
+    // the document fields, as before
+    CHECK(result.value("grid_size") == QJsonValue{canon(map.grid().actualSize())});
+    CHECK(result.value("world_bounds") == QJsonValue{toJson(map.worldBounds())});
+    CHECK(
+      result.value("soft_map_bounds")
+      == QJsonObject{
+        {"source", "game"},
+        {"bounds", toJson(vm::bbox3d{{-4096, -4096, -4096}, {4096, 4096, 4096}})}});
+    CHECK(
+      result.value("material_default")
+      == QJsonValue{QString::fromStdString(map.currentMaterialName())});
+    CHECK(result.value("map_format") == "Valve");
+
+    // and the game independent ones
+    CHECK(result.value("up_axis") == "+z");
+    CHECK(result.value("player").toObject().value("step_height") == 18);
+    CHECK(result.value("games") == games);
+
+    // game describes the map's game unless another one is given
+    CHECK(result.value("game").toObject().value("name") == "QuakeLike");
+    CHECK(
+      f.ok("get_conventions", R"({"game":"Generic"})")
+        .value("game")
+        .toObject()
+        .value("name")
+      == "Generic");
+    CHECK(f.err("get_conventions", R"({"game":"Nope"})") == "unknown_game");
+
+    // read only and deterministic
+    CHECK(f.ok("get_conventions") == result);
+    CHECK(snapshot(map) == before);
+
+    // the busy gate applies with a document
+    {
+      auto dialog = QDialog{};
+      dialog.setModal(true);
+      dialog.open();
+      REQUIRE(QApplication::activeModalWidget() == &dialog);
+      const auto error = f.error("get_conventions");
+      CHECK(error.value("code") == "editor_busy");
+      dialog.close();
+    }
+
+    // an app tool cannot be used in a batch
+    CHECK(
+      f.err("batch", R"({"operations":[{"tool":"get_conventions","arguments":{}}]})")
+      == "invalid_argument");
+
+    // after closing the map it works without a document again
+    f.closeAllMapWindows();
+    CHECK(f.ok("get_conventions").value("document").isNull());
+  }
+
+  SECTION("validate_map marks the issues of a new map as expected")
+  {
+    SECTION("the empty wad of worldspawn")
+    {
+      f.ok("new_map", R"({"game":"QuakeLike"})");
+      auto validation = f.ok("validate_map");
+      const auto wad =
+        findItem(validation, "Property 'wad' of worldspawn has an empty value.");
+      REQUIRE_FALSE(wad.isEmpty());
+      CHECK(wad.value("node") == "world");
+      CHECK(wad.value("property") == "wad");
+      CHECK(wad.value("expected_for_new_map") == true);
+      CHECK(wad.value("expected_reason").toString().contains("wad"));
+      CHECK(validation.value("expected_count") == 1);
+      CHECK(validation.value("note").toString().contains("expected_for_new_map"));
+
+      // a light has a definition in this game, so nothing else is reported
+      f.ok("create_entity", R"({"classname":"light","origin":[0,0,64]})");
+      validation = f.ok("validate_map");
+      CHECK(validation.value("total") == 1);
+      CHECK(validation.value("expected_count") == 1);
+
+      // other empty properties are not expected
+      f.ok("set_entity_properties", R"({"ids":["world"],"set":{"message":""}})");
+      validation = f.ok("validate_map");
+      const auto message =
+        findItem(validation, "Property 'message' of worldspawn has an empty value.");
+      REQUIRE_FALSE(message.isEmpty());
+      CHECK_FALSE(message.contains("expected_for_new_map"));
+      CHECK_FALSE(message.contains("expected_reason"));
+      CHECK(validation.value("expected_count") == 1);
+
+      // once the wad is set, the issue is gone; setting it reloads the entity
+      // definitions, which used to crash set_entity_properties (it kept copies of the
+      // entities, and with them references to the old definitions)
+      f.ok(
+        "set_entity_properties",
+        R"({"ids":["world"],"set":{"wad":"base.wad"},"remove":["message"]})");
+      validation = f.ok("validate_map");
+      CHECK(validation.value("total") == 0);
+      CHECK(validation.value("expected_count") == 0);
+      CHECK_FALSE(validation.contains("note"));
+    }
+
+    SECTION("light in game Generic")
+    {
+      f.ok("new_map", R"({"game":"Generic"})");
+      CHECK(f.ok("validate_map").value("total") == 0);
+
+      const auto light =
+        f.ok("create_entity", R"({"classname":"light","origin":[0,0,64]})");
+      const auto lightId = light.value("id").toString();
+      f.ok("create_entity", R"({"classname":"info_player_start","origin":[0,64,24]})");
+
+      // the envelope of the mutating call marks the issue too
+      const auto issues = light.value("issues").toObject().value("items").toArray();
+      REQUIRE(issues.size() == 1);
+      CHECK(issues[0].toObject().value("expected_for_new_map") == true);
+
+      const auto validation = f.ok("validate_map");
+      CHECK(validation.value("total") == 1);
+      const auto item = findItem(validation, "light not found in entity definitions");
+      REQUIRE_FALSE(item.isEmpty());
+      CHECK(item.value("node") == lightId);
+      CHECK(item.value("type") == "Missing entity definition");
+      CHECK(item.value("expected_for_new_map") == true);
+      CHECK(item.value("expected_reason").toString().contains("Quake"));
+      CHECK(validation.value("expected_count") == 1);
+
+      // deterministic
+      CHECK(f.ok("validate_map") == validation);
+    }
+
+    SECTION("a missing definition in another game is not expected")
+    {
+      f.ok("new_map", R"({"game":"QuakeLike"})");
+      f.ok("create_entity", R"({"classname":"monster_nope","origin":[0,0,64]})");
+      const auto validation = f.ok("validate_map");
+      const auto item =
+        findItem(validation, "monster_nope not found in entity definitions");
+      REQUIRE_FALSE(item.isEmpty());
+      CHECK_FALSE(item.contains("expected_for_new_map"));
+      CHECK(validation.value("expected_count") == 1);
+    }
+
+    SECTION("game Generic with an external definition file is not expected")
+    {
+      f.ok("new_map", R"({"game":"Generic"})");
+      auto* window = f.appController.mapWindowManager().topMapWindow();
+      REQUIRE(window != nullptr);
+      auto& map = window->document().map();
+      // as if the user chose the file in the entity definition file chooser
+      mdl::setEntityDefinitionFile(
+        map,
+        mdl::EntityDefinitionFileSpec::makeExternal(
+          map.gameInfo().gameConfig.findConfigFile("Generic.fgd")));
+      f.ok("create_entity", R"({"classname":"light","origin":[0,0,64]})");
+      const auto item =
+        findItem(f.ok("validate_map"), "light not found in entity definitions");
+      REQUIRE_FALSE(item.isEmpty());
+      CHECK_FALSE(item.contains("expected_for_new_map"));
+    }
+
+    SECTION("game Generic with another builtin definition file is not expected")
+    {
+      f.ok("new_map", R"({"game":"Generic"})");
+      auto* window = f.appController.mapWindowManager().topMapWindow();
+      REQUIRE(window != nullptr);
+      auto& map = window->document().map();
+      // a file that does not exist, so not even worldspawn has a definition
+      mdl::setEntityDefinitionFile(
+        map, mdl::EntityDefinitionFileSpec::makeBuiltin("Missing.fgd"));
+      f.ok("create_entity", R"({"classname":"light","origin":[0,0,64]})");
+      const auto validation = f.ok("validate_map");
+      const auto light = findItem(validation, "light not found in entity definitions");
+      REQUIRE_FALSE(light.isEmpty());
+      CHECK_FALSE(light.contains("expected_for_new_map"));
+      const auto world =
+        findItem(validation, "worldspawn not found in entity definitions");
+      REQUIRE_FALSE(world.isEmpty());
+      CHECK_FALSE(world.contains("expected_for_new_map"));
+      CHECK(validation.value("expected_count") == 0);
+    }
+  }
+
+  f.closeAllMapWindows();
   CHECK(watchdog.modalCount() == 0);
 }
 

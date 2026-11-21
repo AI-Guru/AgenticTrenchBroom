@@ -149,6 +149,94 @@ QJsonArray jsonVec(const double x, const double y, const double z)
 }
 } // namespace
 
+TEST_CASE("McpMapEvalTools validate_map expected issues")
+{
+  SECTION("the empty material property of a new Quake map")
+  {
+    auto config = mdl::QuakeFixtureConfig;
+    // like a real new map: worldspawn gets an empty wad and there is a starter brush
+    config.gameInfo.gameConfig.forceEmptyNewMap = false;
+    auto f = McpMapToolsFixture{config};
+    REQUIRE(f.map.worldNode().entity().property("wad") != nullptr);
+
+    const auto result = f.ok("validate_map");
+    auto expected = QJsonArray{};
+    auto other = QJsonArray{};
+    for (const auto& item : result.value("items").toArray())
+    {
+      (item.toObject().value("expected_for_new_map").toBool() ? expected : other)
+        .append(item);
+    }
+    REQUIRE(expected.size() == 1);
+    const auto wad = expected[0].toObject();
+    CHECK(wad.value("node") == "world");
+    CHECK(wad.value("type") == "Empty property value");
+    CHECK(wad.value("property") == "wad");
+    CHECK(wad.value("expected_reason").toString().contains("'wad'"));
+    CHECK(result.value("expected_count") == 1);
+    CHECK(result.value("note").toString().startsWith("1 of the issues"));
+
+    // expected_count counts all issues, not only the page
+    const auto page = f.ok("validate_map", R"({"limit":1,"offset":1})");
+    CHECK(page.value("items").toArray().size() == 1);
+    CHECK(page.value("items")[0] == result.value("items")[1]);
+    CHECK(page.value("expected_count") == 1);
+
+    // the world's missing definition is not expected in game Quake (no definitions
+    // are loaded headless)
+    REQUIRE(other.size() == 1);
+    CHECK(other[0].toObject().value("type") == "Missing entity definition");
+    CHECK_FALSE(other[0].toObject().contains("expected_reason"));
+
+    // an empty wad of another entity is not expected
+    auto entity = mdl::Entity{};
+    entity.addOrUpdateProperty("classname", "info_null");
+    entity.addOrUpdateProperty("origin", "8 8 8");
+    entity.addOrUpdateProperty("wad", "");
+    auto* entityNode = mdl::addNode(
+      f.map,
+      mdl::parentForNodes(f.map),
+      std::make_unique<mdl::EntityNode>(std::move(entity)));
+    REQUIRE(entityNode != nullptr);
+    const auto entityItems =
+      f.ok("validate_map", QJsonObject{{"under", QJsonArray{f.id(*entityNode)}}})
+        .value("items")
+        .toArray();
+    const auto entityWad = std::ranges::find_if(entityItems, [](const auto& item) {
+      return item.toObject().value("property") == "wad";
+    });
+    REQUIRE(entityWad != entityItems.end());
+    CHECK((*entityWad).toObject().value("type") == "Empty property value");
+    CHECK_FALSE((*entityWad).toObject().contains("expected_for_new_map"));
+    CHECK(f.ok("validate_map").value("expected_count") == 1);
+  }
+
+  SECTION("missing definitions in game Generic")
+  {
+    auto config = mdl::QuakeFixtureConfig;
+    config.gameInfo.gameConfig.name = "Generic";
+    config.gameInfo.gameConfig.materialConfig.property = std::nullopt;
+    config.gameInfo.gameConfig.entityConfig.defFilePaths = {"Generic.fgd"};
+    auto f = McpMapToolsFixture{config};
+
+    auto* light = addPointEntity(f.map, "light", {0, 0, 64});
+    const auto result = f.ok("validate_map");
+    const auto items = result.value("items").toArray();
+    // headless, no definitions are loaded, so even the world has none: the issues are
+    // real and not marked (tst_McpAppTools covers Generic with its definition file)
+    REQUIRE(items.size() == 2);
+    for (const auto& item : items)
+    {
+      CHECK(item.toObject().value("type") == "Missing entity definition");
+      CHECK_FALSE(item.toObject().contains("expected_for_new_map"));
+      CHECK_FALSE(item.toObject().contains("expected_reason"));
+    }
+    CHECK(items[1].toObject().value("node") == QJsonValue{f.id(*light)});
+    CHECK(result.value("expected_count") == 0);
+    CHECK_FALSE(result.contains("note"));
+  }
+}
+
 TEST_CASE("McpMapEvalTools")
 {
   auto f = McpMapToolsFixture{};

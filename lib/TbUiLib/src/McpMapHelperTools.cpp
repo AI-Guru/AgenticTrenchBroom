@@ -32,11 +32,9 @@
 #include "mdl/EntityNode.h"
 #include "mdl/GameConfig.h"
 #include "mdl/GameInfo.h"
-#include "mdl/Grid.h"
 #include "mdl/GroupNode.h"
 #include "mdl/LayerNode.h"
 #include "mdl/Map.h"
-#include "mdl/MapFormat.h"
 #include "mdl/Map_Geometry.h"
 #include "mdl/Map_Groups.h"
 #include "mdl/Map_Nodes.h"
@@ -2652,67 +2650,6 @@ McpToolDef alignNodesTool()
   };
 }
 
-// get_conventions
-
-McpResult<QJsonObject> getConventions(McpCallContext& context, const QJsonObject&)
-{
-  const auto& map = context.doc.map;
-  const auto softBounds = mdl::softMapBounds(map);
-  return QJsonObject{
-    {"units", "1 unit is about 1 inch (Quake scale)"},
-    {"up_axis", "+z"},
-    {"handedness", "right"},
-    {"angles", "entity 'angle' is the yaw in degrees around +z; 0 = +x, 90 = +y"},
-    {"grid_size", canon(map.grid().actualSize())},
-    {"world_bounds", toJson(map.worldBounds())},
-    {"soft_map_bounds",
-     QJsonObject{
-       {"source", softBounds.source == mdl::SoftMapBoundsType::Game ? "game" : "map"},
-       {"bounds",
-        softBounds.bounds ? QJsonValue{toJson(*softBounds.bounds)} : QJsonValue{}},
-     }},
-    {"player",
-     QJsonObject{
-       {"width", 32},
-       {"height", 56},
-       {"eye_height", 22},
-       {"step_height", 18},
-       {"jump_height", 45},
-       {"source", "default"},
-     }},
-    {"common_dimensions",
-     QJsonObject{
-       {"door", QJsonObject{{"width", 64}, {"height", 96}}},
-       {"corridor_min_width", 64},
-       {"room_height_typical", QJsonArray{128, 256}},
-       {"wall_thickness_typical", QJsonArray{8, 16}},
-       {"stair_step", QJsonObject{{"height", 8}, {"depth", 16}}},
-     }},
-    {"material_default", toUnicode(map, map.currentMaterialName())},
-    {"map_format", QString::fromStdString(mdl::formatName(map.worldNode().mapFormat()))},
-    {"note",
-     "guidance for building playable spaces; player sizes are Quake defaults, not read "
-     "from the game configuration"},
-  };
-}
-
-McpToolDef getConventionsTool()
-{
-  return {
-    .name = "get_conventions",
-    .title = "Get Conventions",
-    .description =
-      "Returns the coordinate conventions, the grid and world bounds, and typical sizes "
-      "(player, doors, corridors, stairs) to build playable spaces. Needs an open map: "
-      "call it after new_map or open_map.",
-    .inputSchema = schema::object({}),
-    .kind = McpToolKind::Read,
-    .annotations = ReadOnly,
-    .allowedInBatch = true,
-    .run = getConventions,
-  };
-}
-
 // describe_region
 
 constexpr auto DefaultMaxItems = 100;
@@ -2970,7 +2907,6 @@ McpToolDef describeRegionTool()
 
 void registerMcpMapHelperTools(McpToolDispatcher& dispatcher)
 {
-  dispatcher.add(getConventionsTool());
   dispatcher.add(describeRegionTool());
   dispatcher.add(createRoomTool());
   dispatcher.add(createOpeningTool());

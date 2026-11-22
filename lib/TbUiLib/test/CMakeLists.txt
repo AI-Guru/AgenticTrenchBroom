@@ -43,6 +43,7 @@ target_sources(TbUiLibTest
     ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_McpMapStructureTools.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_McpNodeRegistry.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_McpPreconditions.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_McpPreferencePane.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_McpSchemas.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_McpSelectionGuard.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_McpToolDispatcher.cpp

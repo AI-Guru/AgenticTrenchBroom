@@ -24,6 +24,8 @@
 
 #include "kd/dynamic_bitset.h"
 
+#include <unordered_set>
+
 namespace tb::mdl
 {
 struct EntityDefinition;
@@ -49,6 +51,8 @@ private:
   bool m_showPatches = true;
 
   bool m_blockSelection = false;
+
+  std::unordered_set<const Node*> m_temporarilyHiddenNodes;
 
   LayerNode* m_currentLayer = nullptr;
   GroupNode* m_currentGroup = nullptr;
@@ -82,6 +86,16 @@ public:
 
   bool blockSelection() const;
   void setBlockSelection(bool blockSelection);
+
+  /**
+   * Nodes that are hidden regardless of their visibility state and even if they are
+   * selected, for example while a cutaway screenshot is rendered. Unlike hiding nodes,
+   * this is not an undoable change, is not saved and does not change the nodes. Only
+   * the given nodes themselves are hidden, not their children. A group or entity is
+   * also hidden if all of its children are hidden.
+   */
+  const std::unordered_set<const Node*>& temporarilyHiddenNodes() const;
+  void setTemporarilyHiddenNodes(std::unordered_set<const Node*> nodes);
 
 public:
   LayerNode* currentLayer() const;

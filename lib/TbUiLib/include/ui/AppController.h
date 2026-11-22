@@ -23,6 +23,7 @@
 #include <QtSystemDetection>
 
 #include "base/Result.h"
+#include "mdl/MapFormat.h"
 
 #include <filesystem>
 #include <memory>
@@ -56,6 +57,7 @@ namespace mdl
 {
 class GameManager;
 struct EnvironmentConfig;
+struct GameInfo;
 } // namespace mdl
 
 namespace ui
@@ -63,6 +65,7 @@ namespace ui
 class AboutDialog;
 class ActionManager;
 class MapWindowManager;
+class McpController;
 class RecentDocuments;
 class WelcomeWindow;
 
@@ -94,6 +97,8 @@ private:
 
   QTemporaryFile* m_manualRedirectFile = nullptr;
 
+  McpController* m_mcpController = nullptr;
+
 public:
   AppController(
     std::unique_ptr<kdl::task_manager> taskManager,
@@ -121,12 +126,56 @@ public:
 
   ActionManager& actionManager();
 
+  /**
+   * The MCP controller of this application, or nullptr if there is none. The MCP
+   * controller registers itself here when it is created and unregisters when it is
+   * destroyed.
+   */
+  McpController* mcpController();
+  void setMcpController(McpController* mcpController);
+
   void askForAutoUpdates();
   void triggerAutoUpdateCheck();
 
+  /**
+   * Asks the user for a game and map format and creates a new document. Errors are
+   * reported in a message box.
+   *
+   * Returns true if a document was created.
+   */
   bool newDocument();
+
+  /**
+   * Asks the user for a map file and opens it.
+   */
   void openDocument();
+
+  /**
+   * Opens the map file at the given path. If the game or the map format cannot be
+   * detected, the user is asked for them. Errors are reported in a message box.
+   *
+   * Returns true if the document was loaded.
+   */
   bool openDocument(const std::filesystem::path& path);
+
+  /**
+   * Creates a new document in a new map window and closes the welcome window.
+   * MapFormat::Unknown results in an error.
+   *
+   * Never shows a dialog; errors are returned instead.
+   */
+  Result<void> createDocument(const mdl::GameInfo& gameInfo, mdl::MapFormat mapFormat);
+
+  /**
+   * Loads the map file at the given absolute path into a new map window and closes the
+   * welcome window. A relative path results in an error.
+   *
+   * Never shows a dialog; errors are returned instead.
+   */
+  Result<void> loadDocument(
+    const mdl::GameInfo& gameInfo,
+    mdl::MapFormat mapFormat,
+    std::filesystem::path absPath);
 
   void showWelcomeWindow();
 

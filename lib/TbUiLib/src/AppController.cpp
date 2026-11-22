@@ -39,6 +39,7 @@
 #include "gl/ResourceManager.h"
 #include "gl/VboManager.h"
 #include "mdl/EnvironmentConfig.h"
+#include "mdl/GameInfo.h"
 #include "mdl/GameManager.h"
 #include "mdl/MapHeader.h"
 #include "prefs/Preferences.h"
@@ -307,6 +308,16 @@ ActionManager& AppController::actionManager()
   return *m_actionManager;
 }
 
+McpController* AppController::mcpController()
+{
+  return m_mcpController;
+}
+
+void AppController::setMcpController(McpController* mcpController)
+{
+  m_mcpController = mcpController;
+}
+
 void AppController::askForAutoUpdates()
 {
   if (pref(Preferences::AskForAutoUpdates))
@@ -348,12 +359,7 @@ bool AppController::newDocument()
   const auto* gameInfo = gameManager().gameInfo(gameName);
   contract_assert(gameInfo != nullptr);
 
-  return m_mapWindowManager->createDocument(
-           *gameInfo, mapFormat, MapDocument::DefaultWorldBounds)
-         | kdl::transform([&]() {
-             m_welcomeWindow->close();
-             return true;
-           })
+  return createDocument(*gameInfo, mapFormat) | kdl::transform([]() { return true; })
          | kdl::transform_error([&](const auto& e) {
              QMessageBox::critical(
                nullptr, "TrenchBroom", e.msg.c_str(), QMessageBox::Ok);
@@ -405,15 +411,8 @@ bool AppController::openDocument(const std::filesystem::path& path)
              const auto* gameInfo = gameManager().gameInfo(gameName);
              contract_assert(gameInfo != nullptr);
 
-             return m_mapWindowManager->loadDocument(
-                      *gameInfo,
-                      mapFormat,
-                      MapDocument::DefaultWorldBounds,
-                      std::move(absPath))
-                    | kdl::transform([&]() {
-                        m_welcomeWindow->close();
-                        return true;
-                      });
+             return loadDocument(*gameInfo, mapFormat, std::move(absPath))
+                    | kdl::transform([]() { return true; });
            })
          | kdl::transform_error([&](const auto& e) {
              QMessageBox::critical(
@@ -421,6 +420,30 @@ bool AppController::openDocument(const std::filesystem::path& path)
              return false;
            })
          | kdl::value();
+}
+
+Result<void> AppController::createDocument(
+  const mdl::GameInfo& gameInfo, const mdl::MapFormat mapFormat)
+{
+  if (mapFormat == mdl::MapFormat::Unknown)
+  {
+    // A world with an unknown format violates contracts later, e.g. when pasting
+    return Error{"Cannot create a document with an unknown map format"};
+  }
+
+  return m_mapWindowManager->createDocument(
+           gameInfo, mapFormat, MapDocument::DefaultWorldBounds)
+         | kdl::transform([&]() { m_welcomeWindow->close(); });
+}
+
+Result<void> AppController::loadDocument(
+  const mdl::GameInfo& gameInfo,
+  const mdl::MapFormat mapFormat,
+  std::filesystem::path absPath)
+{
+  return m_mapWindowManager->loadDocument(
+           gameInfo, mapFormat, MapDocument::DefaultWorldBounds, std::move(absPath))
+         | kdl::transform([&]() { m_welcomeWindow->close(); });
 }
 
 void AppController::showWelcomeWindow()

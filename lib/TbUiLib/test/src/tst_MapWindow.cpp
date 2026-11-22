@@ -19,7 +19,11 @@
 
 #include <QApplication>
 #include <QComboBox>
+#include <QCoreApplication>
+#include <QEvent>
+#include <QPointer>
 
+#include "AppTestUtils.h"
 #include "TestEnvironment.h"
 #include "base/Result.h"
 #include "gl/GlManager.h"
@@ -37,6 +41,8 @@
 #include "ui/MapDocumentFixture.h"
 #include "ui/MapWindow.h"
 
+#include "kd/invoke.h"
+
 #include <catch2/catch_test_macros.hpp>
 
 namespace tb::ui
@@ -47,6 +53,28 @@ struct TestResource
 {
   void upload(gl::Gl&) const {}
   void drop(gl::Gl&) const {}
+};
+
+/** Ignores every close event of the objects it filters. */
+class CloseEventRefuser : public QObject
+{
+public:
+  int count() const { return m_count; }
+
+protected:
+  bool eventFilter(QObject* watched, QEvent* event) override
+  {
+    if (event->type() == QEvent::Close)
+    {
+      ++m_count;
+      event->ignore();
+      return true;
+    }
+    return QObject::eventFilter(watched, event);
+  }
+
+private:
+  int m_count = 0;
 };
 
 TEST_CASE("MapWindow")
@@ -120,6 +148,89 @@ TEST_CASE("MapWindow")
 
     REQUIRE(!appController.glManager().resourceManager().needsProcessing());
     CHECK(window.canReloadAssets());
+  }
+
+  SECTION("closeDocumentDiscardingChanges")
+  {
+    // MapWindow uses Qt::WA_DeleteOnClose, so closing must not happen on a stack object
+    auto closingWindow = QPointer<MapWindow>{new MapWindow{
+      appController,
+      MapDocument::createDocument(
+        appController.environmentConfig(),
+        mdl::QuakeGameInfo,
+        mdl::MapFormat::Valve,
+        vm::bbox3d{8192.0},
+        appController.taskManager(),
+        appController.glManager().resourceManager())
+        | kdl::value()}};
+    auto deleteWindow = kdl::invoke_later{[&]() { delete closingWindow.data(); }};
+
+    const auto flushDeferredDelete = []() {
+      QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+    };
+
+    const auto watchdog = ModalWatchdog{};
+
+    SECTION("closes a modified window without asking")
+    {
+      closingWindow->document().map().incModificationCount();
+      REQUIRE(closingWindow->document().map().modified());
+
+      CHECK(closingWindow->closeDocumentDiscardingChanges());
+      CHECK(watchdog.modalCount() == 0);
+
+      flushDeferredDelete();
+      CHECK(closingWindow.isNull());
+    }
+
+    SECTION("closes an unmodified window")
+    {
+      REQUIRE(!closingWindow->document().map().modified());
+
+      CHECK(closingWindow->closeDocumentDiscardingChanges());
+      CHECK(watchdog.modalCount() == 0);
+
+      flushDeferredDelete();
+      CHECK(closingWindow.isNull());
+    }
+
+    SECTION("close still asks to save a modified window")
+    {
+      closingWindow->document().map().incModificationCount();
+
+      // The watchdog closes the question, which cancels the close
+      CHECK(!closingWindow->close());
+      CHECK(watchdog.modalCount() == 1);
+      flushDeferredDelete();
+      REQUIRE(!closingWindow.isNull());
+      CHECK(closingWindow->document().map().modified());
+
+      CHECK(closingWindow->closeDocumentDiscardingChanges());
+      CHECK(watchdog.modalCount() == 1);
+      flushDeferredDelete();
+      CHECK(closingWindow.isNull());
+    }
+
+    SECTION("only skips the prompt during the call")
+    {
+      closingWindow->document().map().incModificationCount();
+
+      // Refuse the close before MapWindow::closeEvent is called
+      auto refuseClose = CloseEventRefuser{};
+      closingWindow->installEventFilter(&refuseClose);
+
+      CHECK(!closingWindow->closeDocumentDiscardingChanges());
+      CHECK(refuseClose.count() == 1);
+      CHECK(watchdog.modalCount() == 0);
+
+      closingWindow->removeEventFilter(&refuseClose);
+
+      // A later close asks again
+      CHECK(!closingWindow->close());
+      CHECK(watchdog.modalCount() == 1);
+      flushDeferredDelete();
+      CHECK(!closingWindow.isNull());
+    }
   }
 }
 

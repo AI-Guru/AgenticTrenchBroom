@@ -118,6 +118,7 @@
 #include "kd/k.h"
 #include "kd/overload.h"
 #include "kd/ranges/to.h"
+#include "kd/set_temp.h"
 #include "kd/string_format.h"
 #include "kd/string_utils.h"
 
@@ -1132,13 +1133,19 @@ bool MapWindow::exportDocument(const mdl::ExportOptions& options)
          | kdl::value();
 }
 
+bool MapWindow::closeDocumentDiscardingChanges()
+{
+  const auto discardChanges = kdl::set_temp{m_discardChangesOnClose};
+  return close();
+}
+
 /**
  * Returns whether the window should close.
  */
 bool MapWindow::confirmOrDiscardChanges()
 {
   const auto& map = m_document->map();
-  if (!map.modified())
+  if (m_discardChangesOnClose || !map.modified())
   {
     return true;
   }

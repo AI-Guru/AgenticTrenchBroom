@@ -3,10 +3,14 @@ EMBED_UTF8_MANIFEST(TbUiLibTest)
 
 target_sources(TbUiLibTest
   PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/AppTestUtils.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/McpAppTestUtils.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/McpTestUtils.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/RunAllTests.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_ActionContext.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_ActionInfo.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_Actions.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_AppController.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_CompilationDialog.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_CompilationProfileManager.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_CompilationRunner.cpp
@@ -22,6 +26,28 @@ target_sources(TbUiLibTest
     ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_LayerListBox.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_MapViewBar.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_MapWindow.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_McpAppTools.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_McpCheckpoints.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_McpController.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_McpDeterminism.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_McpDocumentState.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_McpFaceFilter.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_McpJson.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_McpLogCapture.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_McpMapCreateTools.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_McpMapEditTools.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_McpMapEvalTools.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_McpMapHelperTools.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_McpMapHistoryTools.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_McpMapReadTools.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_McpMapStructureTools.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_McpNodeRegistry.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_McpPreconditions.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_McpSchemas.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_McpSelectionGuard.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_McpToolDispatcher.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_McpToolFuzz.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_McpViewTools.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_MultiCompletionLineEdit.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_QPathUtils.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/tst_QPreferenceStore.cpp
@@ -59,6 +85,7 @@ target_link_libraries(TbUiLibTest PRIVATE
   TbElLib
   TbElTestUtilsLib
   TbFsTestUtilsLib
+  TbMcpLib
   TbMdlTestUtilsLib
   TbPreferencesLib
   TbRenderLib
@@ -84,6 +111,9 @@ add_custom_command(TARGET TbUiLibTest POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_directory "${TB_RESOURCE_DIR}/games" "${TEST_FIXTURE_DEST_DIR}/games"
   COMMAND ${CMAKE_COMMAND} -E copy_directory "${TB_RESOURCE_DIR}/games-testing" "${TEST_FIXTURE_DEST_DIR}/games"
   COMMAND ${CMAKE_COMMAND} -E copy_directory "${TB_RESOURCE_DIR}/graphics/images" "$<TARGET_FILE_DIR:TbUiLibTest>/images"
+  # tests that show map windows initialize OpenGL, which loads shaders and fonts
+  COMMAND ${CMAKE_COMMAND} -E copy_directory "${TB_RESOURCE_DIR}/shader" "$<TARGET_FILE_DIR:TbUiLibTest>/shader"
+  COMMAND ${CMAKE_COMMAND} -E copy_directory "${TB_RESOURCE_DIR}/fonts" "$<TARGET_FILE_DIR:TbUiLibTest>/fonts"
 )
 
 include(Catch)

@@ -43,6 +43,11 @@ inline auto EnableDraftReleaseUpdates = Preference<bool>{
 inline auto IncludeDraftReleaseUpdates = Preference<bool>{
   "updater/Include draft releases", false, PreferencePersistencePolicy::Transient};
 
+// The MCP server lets AI agents control TrenchBroom over HTTP on 127.0.0.1. It is off by
+// default; the --mcp-port command line option starts it without changing these.
+inline auto McpServerEnabled = Preference<bool>{"MCP/Server enabled", false};
+inline auto McpServerPort = Preference<int>{"MCP/Server port", 6767};
+
 inline auto MapViewLayout = Preference<int>{"Views/Map view layout", 0};
 
 inline const auto SystemTheme = std::string{"System"};

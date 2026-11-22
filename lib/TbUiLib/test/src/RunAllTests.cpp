@@ -20,6 +20,7 @@
 #define CATCH_CONFIG_RUNNER
 
 #include <QApplication>
+#include <QSurfaceFormat>
 
 #include "TestPreferenceStore.h"
 #include "base/PreferenceManager.h"
@@ -49,6 +50,18 @@ void contractViolated(
 int main(int argc, char** argv)
 {
   kd::set_contract_violation_handler(contractViolated);
+
+  // Use the core OpenGL context settings of TrenchBroom's main function (version,
+  // profile, depth buffer, shared contexts) so that tests which show map windows render
+  // like the application. Multisampling and the alpha buffer hint are left out on
+  // purpose; the tests do not depend on them.
+  auto format = QSurfaceFormat{};
+  format.setRenderableType(QSurfaceFormat::OpenGL);
+  format.setVersion(2, 1);
+  format.setProfile(QSurfaceFormat::CompatibilityProfile);
+  format.setDepthBufferSize(24);
+  QSurfaceFormat::setDefaultFormat(format);
+  QApplication::setAttribute(Qt::AA_ShareOpenGLContexts);
 
   // Needs to be set for the QSettings instance used by RecentDocuments
   QApplication::setApplicationName("TrenchBroom");
